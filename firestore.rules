@@ -1,0 +1,227 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // 0. Global Safety Net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // --- Collection Group Security Rules ---
+    // (Required for collectionGroup queries to function on nested paths under clinics)
+    match /{path=**}/members/{memberId} {
+      allow read: if isSignedIn();
+    }
+
+    match /{path=**}/education_students/{studentId} {
+      allow read: if isSignedIn();
+    }
+
+    // Needed for the Super Admin panel's cross-clinic AI usage rollup
+    // (collectionGroup('ai_usage_logs')). A rule nested only under
+    // clinics/{clinicId}/ai_usage_logs does NOT enable a collectionGroup
+    // list query across all clinics — Firestore requires this exact
+    // {path=**} prefix form for that, same as members/education_students
+    // above. isPlatformAdmin() is defined below, but rule functions in this
+    // file can be referenced before their definition.
+    match /{path=**}/ai_usage_logs/{logId} {
+      allow read: if isPlatformAdmin();
+    }
+
+    // --- Helpers ---
+    
+    function isSignedIn() {
+      return request.auth != null;
+    }
+    
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+    
+    function getMember(clinicId, userId) {
+      return get(/databases/$(database)/documents/clinics/$(clinicId)/members/$(userId));
+    }
+
+    function isClinicMember(clinicId) {
+      return isSignedIn() && 
+             exists(/databases/$(database)/documents/clinics/$(clinicId)/members/$(request.auth.uid)) && (
+               getMember(clinicId, request.auth.uid).data.get('active', false) == true ||
+               getMember(clinicId, request.auth.uid).data.get('status', '') in ['active', 'owner', 'ativo', 'dono']
+             );
+    }
+    
+    function isClinicAdmin(clinicId) {
+      let member = getMember(clinicId, request.auth.uid);
+      let role = member.data.get('role', '');
+      let status = member.data.get('status', '');
+      return isClinicMember(clinicId) && 
+             (status in ['active', 'owner', 'ativo', 'dono']) &&
+             (role in ['owner', 'admin', 'administrator', 'gestor', 'manager', 'dono', 'administrador', 'profissional']);
+    }
+
+    function isClinicOwner(clinicId) {
+      return isSignedIn() && 
+             exists(/databases/$(database)/documents/clinics/$(clinicId)) &&
+             get(/databases/$(database)/documents/clinics/$(clinicId)).data.get('ownerId', '') == request.auth.uid;
+    }
+
+    function isPlatformAdmin() {
+      return isSignedIn() && (
+        request.auth.uid == 'PnEUUeLkWIVyIdIbcynwqBa6Wv72' || (
+          exists(/databases/$(database)/documents/platform_admins/$(request.auth.uid)) &&
+          get(/databases/$(database)/documents/platform_admins/$(request.auth.uid)).data.get('active', false) == true
+        )
+      );
+    }
+
+    function isStudentOfClinic(clinicId) {
+      return isSignedIn() && (
+        exists(/databases/$(database)/documents/clinics/$(clinicId)/education_students/$(request.auth.uid)) ||
+        (exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+         get(/databases/$(database)/documents/users/$(request.auth.uid)).data.get('role', '') in ['aluno', 'student'] && 
+         get(/databases/$(database)/documents/users/$(request.auth.uid)).data.get('defaultClinicId', '') == clinicId)
+      );
+    }
+
+    // --- Collections ---
+
+    // Platform Administration
+    match /platform_admins/{adminId} {
+      allow read: if isSignedIn() && (request.auth.uid == adminId || isPlatformAdmin());
+      // The email OR clause lets the two hardcoded super-admin accounts
+      // self-heal their OWN platform_admins doc on first login (see
+      // AuthContext.tsx) — without it, isPlatformAdmin() below can never
+      // become true for them in the first place, since it reads this same
+      // collection: a chicken-and-egg gap for any account that isn't the
+      // one hardcoded prod UID.
+      allow write: if isPlatformAdmin()
+        || (isSignedIn() && request.auth.uid == 'PnEUUeLkWIVyIdIbcynwqBa6Wv72')
+        || (isSignedIn() && request.auth.uid == adminId && request.auth.token.email in ['janioteixeiracd@gmail.com', 'juninhoteixeiraofc@gmail.com']);
+    }
+
+    match /platform_metrics/{id} { allow read, write: if isPlatformAdmin(); }
+    match /platform_audit_logs/{id} { allow read, write: if isPlatformAdmin(); }
+    match /platform_clinics/{id} { allow read, write: if isPlatformAdmin(); }
+    match /platform_users/{id} { allow read, write: if isPlatformAdmin(); }
+    match /platform_plans/{id} { allow read, write: if isPlatformAdmin(); }
+
+    // Support for Legacy Patients under root collection for clinical continuity
+    match /patients/{patientId} {
+      allow read, write: if isSignedIn();
+      
+      match /{subcollection=**} {
+        allow read, write: if isSignedIn();
+      }
+    }
+
+    // Users
+    match /users/{userId} {
+      allow read: if isOwner(userId) || isPlatformAdmin() || isSignedIn();
+      allow create, update: if isOwner(userId) || isPlatformAdmin() || (isSignedIn() && (
+        request.resource.data.role == 'aluno' ||
+        request.resource.data.get('role', '') == 'aluno' ||
+        request.resource.data.role == 'student' ||
+        request.resource.data.get('role', '') == 'student' ||
+        request.resource.data.get('userType', '') == 'education_student' ||
+        isClinicMember(request.resource.data.get('defaultClinicId', '')) ||
+        isClinicAdmin(request.resource.data.get('defaultClinicId', '')) ||
+        isClinicMember(resource.data.get('defaultClinicId', '')) ||
+        isClinicAdmin(resource.data.get('defaultClinicId', ''))
+      ));
+      allow delete: if isPlatformAdmin();
+    }
+
+    // Clinics
+    match /clinics/{clinicId} {
+      allow get: if isSignedIn();
+      allow list: if isPlatformAdmin();
+      
+      allow create: if isSignedIn();
+      allow update: if isClinicOwner(clinicId) || isClinicAdmin(clinicId) || isPlatformAdmin();
+
+      match /members/{memberId} {
+        allow read: if (isSignedIn() && request.auth.uid == memberId) || isClinicMember(clinicId) || isClinicAdmin(clinicId) || isPlatformAdmin();
+        allow create: if isClinicAdmin(clinicId) || isClinicOwner(clinicId) || isPlatformAdmin();
+        allow update: if isClinicAdmin(clinicId) || isClinicOwner(clinicId) || request.auth.uid == memberId || isPlatformAdmin();
+        allow delete: if isClinicAdmin(clinicId) || isClinicOwner(clinicId) || isPlatformAdmin();
+      }
+
+      match /invites/{inviteId} {
+        allow read: if isClinicAdmin(clinicId) || isClinicOwner(clinicId) || isPlatformAdmin();
+        allow create: if isClinicAdmin(clinicId) || isClinicOwner(clinicId) || isPlatformAdmin();
+        allow update: if isClinicAdmin(clinicId) || isClinicOwner(clinicId) || isPlatformAdmin();
+        allow delete: if isClinicAdmin(clinicId) || isClinicOwner(clinicId) || isPlatformAdmin();
+      }
+
+      match /notifications/{notificationId} {
+        allow read: if isClinicMember(clinicId);
+        allow create, update: if isClinicMember(clinicId);
+        allow delete: if isClinicAdmin(clinicId) || isPlatformAdmin();
+      }
+
+      match /pending_items/{pendingId} {
+        allow read: if isClinicMember(clinicId);
+        allow create, update: if isClinicMember(clinicId);
+        allow delete: if isClinicAdmin(clinicId) || isPlatformAdmin();
+      }
+
+      match /treatment_catalog/{treatmentId} {
+        allow read: if isClinicMember(clinicId) || isPlatformAdmin();
+        allow write: if isClinicAdmin(clinicId) || isClinicOwner(clinicId) || isPlatformAdmin();
+      }
+
+      // --- Student/Education Access Rules ---
+      match /education_courses/{courseId} {
+        allow read: if isClinicMember(clinicId) || isStudentOfClinic(clinicId) || isPlatformAdmin();
+        allow write: if isClinicAdmin(clinicId) || isPlatformAdmin();
+      }
+
+      match /education_modules/{moduleId} {
+        allow read: if isClinicMember(clinicId) || isStudentOfClinic(clinicId) || isPlatformAdmin();
+        allow write: if isClinicAdmin(clinicId) || isPlatformAdmin();
+      }
+
+      match /education_procedures/{procId} {
+        allow read: if isClinicMember(clinicId) || isStudentOfClinic(clinicId) || isPlatformAdmin();
+        allow write: if isClinicAdmin(clinicId) || isPlatformAdmin();
+      }
+
+      match /education_patients/{patientId} {
+        allow read: if isClinicMember(clinicId) || isStudentOfClinic(clinicId) || isPlatformAdmin();
+        allow write: if isClinicAdmin(clinicId) || isPlatformAdmin();
+      }
+
+      match /education_students/{studentId} {
+        allow read: if (isSignedIn() && request.auth.uid == studentId) || isClinicMember(clinicId) || isPlatformAdmin();
+        allow create: if isClinicAdmin(clinicId) || isPlatformAdmin() || (isSignedIn() && (request.auth.uid == studentId || request.resource.data.authUid == request.auth.uid || request.resource.data.emailLowercase == request.auth.token.email));
+        allow update: if (isSignedIn() && (request.auth.uid == studentId || resource.data.authUid == request.auth.uid)) || isClinicAdmin(clinicId) || isPlatformAdmin();
+        allow delete: if isClinicAdmin(clinicId) || isPlatformAdmin() || (isSignedIn() && (resource.data.id == request.auth.uid || resource.data.authUid == request.auth.uid || resource.data.emailLowercase == request.auth.token.email));
+      }
+
+      match /education_student_cases/{caseId} {
+        allow read: if isClinicMember(clinicId) || (isSignedIn() && (resource.data.studentId == request.auth.uid || resource.data.studentEmail == request.auth.token.email)) || isPlatformAdmin();
+        allow create: if isClinicMember(clinicId) || (isSignedIn() && request.resource.data.studentId == request.auth.uid) || isPlatformAdmin();
+        allow update: if isClinicMember(clinicId) || (isSignedIn() && resource.data.studentId == request.auth.uid) || isPlatformAdmin();
+        allow delete: if isClinicAdmin(clinicId) || isPlatformAdmin();
+      }
+
+      match /education_logs/{logId} {
+        allow read, write: if isClinicMember(clinicId) || isStudentOfClinic(clinicId) || isPlatformAdmin();
+      }
+
+      // Explicit match (not the generic {subcollection=**} wildcard below):
+      // Firestore's recursive wildcard doesn't grant collectionGroup 'list'
+      // queries, so the Super Admin panel's cross-clinic AI usage rollup
+      // needs this named rule to actually work. Writes only ever happen via
+      // server.ts's Admin SDK, which bypasses rules entirely — so this is
+      // read-only from the client's perspective.
+      match /ai_usage_logs/{logId} {
+        allow read: if isClinicMember(clinicId) || isClinicOwner(clinicId) || isPlatformAdmin();
+      }
+
+      match /{subcollection=**} {
+        allow read, write: if isClinicMember(clinicId) || isClinicOwner(clinicId) || isPlatformAdmin();
+      }
+    }
+  }
+}

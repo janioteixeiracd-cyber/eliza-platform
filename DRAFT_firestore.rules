@@ -1,0 +1,105 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // 0. Global Safety Net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // --- Helpers ---
+    
+    function isSignedIn() {
+      return request.auth != null;
+    }
+    
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+    
+    function isValidId(id) {
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+    
+    function incoming() {
+      return request.resource.data;
+    }
+    
+    function existing() {
+      return resource.data;
+    }
+    
+    // Check if user is a member of the clinic
+    function isClinicMember(clinicId) {
+      return isSignedIn() && exists(/databases/$(database)/documents/clinics/$(clinicId)/members/$(request.auth.uid));
+    }
+    
+    // Check if user is the clinic owner (stored in the clinic doc)
+    function isClinicOwner(clinicId) {
+      return isSignedIn() && get(/databases/$(database)/documents/clinics/$(clinicId)).data.ownerId == request.auth.uid;
+    }
+
+    // --- Collections ---
+
+    // Users
+    match /users/{userId} {
+      allow get: if isOwner(userId);
+      allow create: if isOwner(userId) && isValidUserProfile(incoming());
+      allow update: if isOwner(userId) && (
+        incoming().diff(existing()).affectedKeys().hasOnly(['name', 'photoURL', 'defaultClinicId', 'updatedAt'])
+      ) && isValidUserProfile(incoming());
+      
+      function isValidUserProfile(data) {
+        return data.keys().hasAll(['uid', 'name', 'email']) &&
+               data.uid == request.auth.uid &&
+               data.name is string && data.name.size() > 0 &&
+               data.email is string && data.email.size() > 0;
+      }
+    }
+
+    // Clinics
+    match /clinics/{clinicId} {
+      allow get: if isSignedIn(); // Allow reading clinic info if signed in (to join or view)
+      allow list: if false; // Deny broad listing
+      
+      allow create: if isSignedIn() && isValidClinic(incoming()) && incoming().ownerId == request.auth.uid;
+      allow update: if (isClinicOwner(clinicId) || isClinicMember(clinicId)) && 
+                      isValidClinic(incoming()) && 
+                      incoming().ownerId == existing().ownerId;
+      
+      function isValidClinic(data) {
+        return data.keys().hasAll(['name', 'ownerId']) &&
+               data.name is string && data.name.size() > 0 &&
+               data.ownerId == request.auth.uid;
+      }
+
+      // Clinic Members
+      match /members/{memberId} {
+        allow read: if isClinicMember(clinicId) || isOwner(memberId);
+        allow write: if isClinicOwner(clinicId) || isOwner(memberId); // Owner can manage, user can leave
+      }
+
+      // Clinic Patients
+      match /patients/{patientId} {
+        allow read, write: if isClinicMember(clinicId);
+      }
+
+      // Clinic Financial Entries
+      match /financial_entries/{entryId} {
+        allow read, write: if isClinicMember(clinicId);
+      }
+
+      // Clinic Invites
+      match /invites/{inviteId} {
+        allow read: if isClinicMember(clinicId) || (isSignedIn() && incoming().email == request.auth.token.email);
+        allow create: if isClinicMember(clinicId); // Should ideally check if admin/owner
+        allow delete: if isClinicMember(clinicId);
+      }
+      
+      // Other subcollections: follow the same pattern
+      match /{subcollection}/{docId} {
+        allow read, write: if isClinicMember(clinicId);
+      }
+    }
+  }
+}

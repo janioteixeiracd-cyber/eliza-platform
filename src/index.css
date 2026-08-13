@@ -1,0 +1,97 @@
+@import "tailwindcss";
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+
+@theme {
+  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+  
+  --color-brand-primary: #0d9488; /* teal-600 */
+  --color-brand-secondary: #0f766e; /* teal-700 */
+  --color-surface-base: #f8fafc; /* slate-50 */
+  --color-surface-card: #ffffff;
+  --color-border-subtle: #e2e8f0; /* slate-200 */
+  --color-text-main: #1e293b; /* slate-800 */
+  --color-text-muted: #64748b; /* slate-500 */
+
+  /* ==========================================
+     ELIZA NEXT 2.0 - DESIGN SYSTEM TOKENS
+     ========================================== */
+  /* Paleta Oficial Dark Premium */
+  --color-next-bg-deep: #07050c;        /* Ultra-dark deep carbon (violet undertone) */
+  --color-next-bg-card: #0e0b16;        /* Card dark surface */
+  --color-next-bg-card-hover: #16111f;  /* Elevated surface state */
+  --color-next-border: #221c2e;         /* Sophisticated dark border */
+  --color-next-border-glow: #3a2e52;    /* Highlighted active border */
+
+  /* Cores de Destaque e IA — gradiente "Eliza Violet" (rebrand 2026) */
+  --color-next-purple-deep: #5b21b6;    /* Violeta profundo / stop inicial do gradiente */
+  --color-next-purple-neon: #8b5cf6;    /* Roxo Neon / IA Central */
+  --color-next-purple-mid: #a78bfa;     /* Roxo médio / hover states */
+  --color-next-purple-light: #ddd6fe;   /* Lilás Suave / Texto Display */
+  --color-next-purple-pale: #ede9fe;    /* Lilás quase branco / highlights sutis */
+  --color-next-ia-blue: #3b82f6;        /* Azul de Insights */
+  --color-next-ia-blue-light: #93c5fd;  /* Azul de Destaque Secundário */
+  --color-next-green-success: #10b981;  /* Verde Sucesso / Ativo */
+  --color-next-orange-insight: #f97316; /* Laranja Inteligência */
+  --color-next-red-alert: #ef4444;      /* Vermelho Alerta / Bloqueio */
+
+  /* Gradiente de marca (logo, CTAs primários, destaques de IA) */
+  --gradient-next-brand: linear-gradient(135deg, #5b21b6 0%, #8b5cf6 55%, #ddd6fe 100%);
+  --gradient-next-brand-subtle: linear-gradient(135deg, rgba(91,33,182,0.16) 0%, rgba(139,92,246,0.10) 100%);
+
+  /* Glows, Shadows & Radii */
+  --shadow-next-glow-purple: 0 0 24px rgba(139, 92, 246, 0.22);
+  --shadow-next-glow-purple-strong: 0 0 40px rgba(139, 92, 246, 0.35);
+  --shadow-next-glow-blue: 0 0 20px rgba(59, 130, 246, 0.15);
+  --shadow-next-glass: inset 0 1px 1px rgba(255, 255, 255, 0.04), 0 4px 24px rgba(0, 0, 0, 0.55);
+
+  --radius-next-xl: 14px;
+  --radius-next-2xl: 18px;
+}
+
+/* Utilitários de marca reutilizáveis em qualquer tela de src/next */
+.next-brand-gradient-text {
+  background: var(--gradient-next-brand);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+.next-brand-gradient-bg {
+  background: var(--gradient-next-brand);
+}
+.next-glass-panel {
+  background: var(--color-next-bg-card);
+  border: 1px solid var(--color-next-border);
+  box-shadow: var(--shadow-next-glass);
+}
+
+html, body {
+  height: 100%;
+  overflow: hidden;
+  overscroll-behavior-y: none;
+  -webkit-tap-highlight-color: transparent;
+}
+
+body {
+  @apply bg-surface-base text-text-main font-sans antialiased;
+  padding-top: env(safe-area-inset-top, 0);
+  padding-bottom: env(safe-area-inset-bottom, 0);
+}
+
+.premium-card {
+  @apply bg-surface-card border border-border-subtle shadow-sm rounded-2xl;
+}
+
+.label-tiny {
+  @apply text-[10px] font-black text-slate-400 uppercase tracking-widest;
+}
+
+/* Custom Scrollbar */
+.custom-scrollbar::-webkit-scrollbar {
+  width: 4px;
+}
+.custom-scrollbar::-webkit-scrollbar-track {
+  background: transparent;
+}
+.custom-scrollbar::-webkit-scrollbar-thumb {
+  @apply bg-slate-200 rounded-full;
+}

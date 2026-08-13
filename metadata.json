@@ -1,0 +1,8 @@
+{
+  "name": "Eliza - sua plataforma inteligente",
+  "description": "Plataforma inteligente que administra, organiza e impulsiona a clínica odontológica moderna com IA nativa.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

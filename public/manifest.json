@@ -1,0 +1,25 @@
+{
+  "name": "ELIZA — sua plataforma inteligente",
+  "short_name": "ELIZA",
+  "description": "Plataforma inteligente que administra, organiza e impulsiona a clínica odontológica moderna com IA nativa.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f8fafc",
+  "theme_color": "#0d9488",
+  "orientation": "portrait-primary",
+  "icons": [
+    {
+      "src": "/icon-192.png",
+      "type": "image/png",
+      "sizes": "192x192",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "/icon-512.png",
+      "type": "image/png",
+      "sizes": "512x512",
+      "purpose": "any maskable"
+    }
+  ],
+  "categories": ["medical", "business", "productivity"]
+}

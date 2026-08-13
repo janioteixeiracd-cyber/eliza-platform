@@ -1,0 +1,454 @@
+{
+  "entities": {
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "Perfil global do usuário autenticado.",
+      "type": "object",
+      "properties": {
+        "name": { "type": "string" },
+        "email": { "type": "string" },
+        "photoURL": { "type": "string" },
+        "defaultClinicId": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["email", "name"]
+    },
+    "Clinic": {
+      "title": "Clinic",
+      "description": "Dados da clínica.",
+      "type": "object",
+      "properties": {
+        "name": { "type": "string" },
+        "slug": { "type": "string" },
+        "cnpj": { "type": "string" },
+        "address": { "type": "string" },
+        "ownerId": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["name", "ownerId"]
+    },
+    "ClinicMember": {
+      "title": "ClinicMember",
+      "description": "Vínculo de um usuário com uma clínica.",
+      "type": "object",
+      "properties": {
+        "role": { "type": "string", "enum": ["owner", "admin", "dentist", "secretary"] },
+        "active": { "type": "boolean" },
+        "joinedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["role", "active"]
+    },
+    "Patient": {
+      "title": "Patient",
+      "description": "Dados completos do paciente.",
+      "type": "object",
+      "properties": {
+        "name": { "type": "string" },
+        "cpf": { "type": "string" },
+        "birthDate": { "type": "string", "format": "date" },
+        "phone": { "type": "string" },
+        "email": { "type": "string" },
+        "address": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["name", "phone"]
+    },
+    "Quotation": {
+      "title": "Quotation",
+      "description": "Orçamentos de tratamentos.",
+      "type": "object",
+      "properties": {
+        "patientId": { "type": "string" },
+        "title": { "type": "string" },
+        "items": { "type": "array" },
+        "status": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      }
+    },
+    "FinancialEntry": {
+      "title": "FinancialEntry",
+      "description": "Lançamentos financeiros detalhados.",
+      "type": "object",
+      "properties": {
+        "description": { "type": "string" },
+        "amount": { "type": "number" },
+        "type": { "type": "string", "enum": ["receita", "despesa", "outro"] },
+        "date": { "type": "string", "format": "date" },
+        "status": { "type": "string" },
+        "category": { "type": "string" },
+        "patientId": { "type": "string" },
+        "sale_responsible_id": { "type": "string" },
+        "collection_responsible_id": { "type": "string" },
+        "procedure_responsible_id": { "type": "string" },
+        "commission_generated": { "type": "boolean" },
+        "is_overdue_recovery": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      }
+    },
+    "TeamMember": {
+      "title": "TeamMember",
+      "description": "Colaboradores da clínica com regras de comissão.",
+      "type": "object",
+      "properties": {
+        "name": { "type": "string" },
+        "role": { "type": "string" },
+        "commission_enabled": { "type": "boolean" },
+        "active": { "type": "boolean" }
+      }
+    },
+    "CommissionRule": {
+      "title": "CommissionRule",
+      "description": "Regras para cálculo de comissões.",
+      "type": "object",
+      "properties": {
+        "name": { "type": "string" },
+        "commission_type": { "type": "string" },
+        "percentage": { "type": "number" },
+        "fixed_amount": { "type": "number" },
+        "active": { "type": "boolean" }
+      }
+    },
+    "Commission": {
+      "title": "Commission",
+      "description": "Comissões geradas para colaboradores.",
+      "type": "object",
+      "properties": {
+        "member_id": { "type": "string" },
+        "commission_amount": { "type": "number" },
+        "status": { "type": "string" },
+        "generated_at": { "type": "string", "format": "date-time" }
+      }
+    },
+    "ClinicPayable": {
+      "title": "ClinicPayable",
+      "description": "Contas a pagar da clínica.",
+      "type": "object",
+      "properties": {
+        "description": { "type": "string" },
+        "amount": { "type": "number" },
+        "due_date": { "type": "string", "format": "date" },
+        "status": { "type": "string" },
+        "priority": { "type": "string" }
+      }
+    },
+    "Invite": {
+      "title": "Invite",
+      "description": "Convite para novos membros.",
+      "type": "object",
+      "properties": {
+        "email": { "type": "string" },
+        "name": { "type": "string" },
+        "role": { "type": "string" },
+        "clinicId": { "type": "string" },
+        "clinicSlug": { "type": "string" },
+        "clinicName": { "type": "string" },
+        "status": { "type": "string", "enum": ["pending", "accepted", "expired", "cancelled"] },
+        "token": { "type": "string" },
+        "invitedByUid": { "type": "string" },
+        "invitedByName": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "expiresAt": { "type": "string", "format": "date-time" },
+        "acceptedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["email", "role", "token", "status"]
+    },
+    "DailyClosing": {
+      "title": "DailyClosing",
+      "description": "Fechamento de caixa diário da clínica.",
+      "type": "object",
+      "properties": {
+        "date": { "type": "string", "format": "date" },
+        "cashAmount": { "type": "number" },
+        "machineAmount": { "type": "number" },
+        "pixAmount": { "type": "number" },
+        "transferAmount": { "type": "number" },
+        "totalAmount": { "type": "number" },
+        "observations": { "type": "string" },
+        "evidences": { "type": "array", "items": { "type": "string" } },
+        "status": { "type": "string", "enum": ["balanced", "unbalanced"] },
+        "difference": { "type": "number" },
+        "closedBy": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["date", "totalAmount", "closedBy"]
+    },
+    "ClinicIssue": {
+       "title": "ClinicIssue",
+       "description": "Problemas ou desafios operacionais relatados pela equipe.",
+       "type": "object",
+       "properties": {
+         "title": { "type": "string" },
+         "description": { "type": "string" },
+         "category": { "type": "string" },
+         "priority": { "type": "string" },
+         "status": { "type": "string" },
+         "reportedBy": { "type": "string" },
+         "createdAt": { "type": "string", "format": "date-time" },
+         "aiDiagnosis": { "type": "string" },
+         "aiActionPlan": { "type": "string" }
+       },
+       "required": ["title", "reportedBy", "createdAt"]
+    },
+    "PendingItem": {
+      "title": "PendingItem",
+      "description": "Tarefas e prioridades pendentes da clínica.",
+      "type": "object",
+      "properties": {
+        "title": { "type": "string" },
+        "description": { "type": "string" },
+        "category": { "type": "string" },
+        "priority": { "type": "string" },
+        "responsibleUid": { "type": "string" },
+        "dueDate": { "type": "string", "format": "date" },
+        "status": { "type": "string" },
+        "impact": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["title", "status", "createdAt"]
+    },
+    "AIInsight": {
+       "title": "AIInsight",
+       "description": "Insights e análises geradas pela ELIZA.",
+       "type": "object",
+       "properties": {
+         "type": { "type": "string" },
+         "content": { "type": "string" },
+         "priority": { "type": "string" },
+         "createdAt": { "type": "string", "format": "date-time" },
+         "dismissed": { "type": "boolean" }
+       }
+    },
+    "InternalNote": {
+      "title": "InternalNote",
+      "description": "Recados internos da clínica.",
+      "type": "object",
+      "properties": {
+        "title": { "type": "string" },
+        "message": { "type": "string" },
+        "sector": { "type": "string", "enum": ["recepcao", "financeiro", "dentistas", "estoque", "pacientes", "agenda", "gestao", "outro"] },
+        "priority": { "type": "string", "enum": ["baixa", "media", "alta", "urgente"] },
+        "status": { "type": "string", "enum": ["pendente", "em_andamento", "resolvido", "arquivado"] },
+        "assigned_to_id": { "type": "string" },
+        "assigned_to_name": { "type": "string" },
+        "created_by_id": { "type": "string" },
+        "created_by_name": { "type": "string" },
+        "created_by_role": { "type": "string" },
+        "patient_id": { "type": "string" },
+        "patient_name": { "type": "string" },
+        "due_date": { "type": "string", "format": "date" },
+        "reminder_date": { "type": "string", "format": "date" },
+        "tags": { "type": "array", "items": { "type": "string" } },
+        "attachments": { "type": "array", "items": { "type": "string" } },
+        "is_pinned": { "type": "boolean" },
+        "is_private": { "type": "boolean" },
+        "resolved_at": { "type": "string", "format": "date-time" },
+        "resolved_by_id": { "type": "string" },
+        "resolved_by_name": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["title", "message", "sector", "priority", "status", "created_by_id", "createdAt"]
+    },
+    "InternalComment": {
+      "title": "InternalComment",
+      "description": "Comentários em recados internos.",
+      "type": "object",
+      "properties": {
+        "message": { "type": "string" },
+        "created_by_id": { "type": "string" },
+        "created_by_name": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["message", "created_by_id", "createdAt"]
+    },
+    "Notification": {
+      "title": "Notification",
+      "description": "Internal system notifications for clinic members",
+      "type": "object",
+      "properties": {
+        "title": { "type": "string" },
+        "message": { "type": "string" },
+        "type": { "type": "string", "enum": ["note_assigned", "note_commented", "status_changed"] },
+        "read": { "type": "boolean" },
+        "userId": { "type": "string" },
+        "link": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["title", "message", "type", "read", "userId", "createdAt"]
+    },
+    "PlatformAdmin": {
+      "title": "PlatformAdmin",
+      "description": "Administradores globais da plataforma ELIZA.",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string" },
+        "email": { "type": "string" },
+        "role": { "type": "string", "enum": ["super_admin", "admin", "support"] },
+        "active": { "type": "boolean" },
+        "name": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["uid", "email", "role", "active"]
+    },
+    "PlatformClinic": {
+      "title": "PlatformClinic",
+      "description": "Metadados globais de uma clínica para o admin.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "ownerEmail": { "type": "string" },
+        "planId": { "type": "string" },
+        "status": { "type": "string", "enum": ["active", "suspended", "trial", "cancelled"] },
+        "patientCount": { "type": "number" },
+        "userCount": { "type": "number" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "lastActivity": { "type": "string", "format": "date-time" }
+      }
+    },
+    "PlatformMetric": {
+      "title": "PlatformMetric",
+      "description": "Métricas globais da plataforma.",
+      "type": "object",
+      "properties": {
+        "date": { "type": "string", "format": "date" },
+        "mrr": { "type": "number" },
+        "activeClinics": { "type": "number" },
+        "activeUsers": { "type": "number" },
+        "newSignups": { "type": "number" },
+        "aiUsageCount": { "type": "number" }
+      }
+    },
+    "PlatformAuditLog": {
+      "title": "PlatformAuditLog",
+      "description": "Logs de auditoria global.",
+      "type": "object",
+      "properties": {
+        "adminId": { "type": "string" },
+        "action": { "type": "string" },
+        "targetId": { "type": "string" },
+        "targetType": { "type": "string" },
+        "details": { "type": "object" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      }
+    },
+    "AestheticProcedure": {
+      "title": "AestheticProcedure",
+      "description": "Procedimento estético de Harmonização Facial e ciclos de recall.",
+      "type": "object",
+      "properties": {
+        "patientId": { "type": "string" },
+        "patientName": { "type": "string" },
+        "procedureType": { "type": "string" },
+        "category": { "type": "string" },
+        "productUsed": { "type": "string" },
+        "brand": { "type": "string" },
+        "area": { "type": "string" },
+        "appliedAt": { "type": "string", "format": "date" },
+        "professionalId": { "type": "string" },
+        "professionalName": { "type": "string" },
+        "durationEstimateMonths": { "type": "number" },
+        "recommendedReturnDate": { "type": "string", "format": "date" },
+        "recallStatus": { "type": "string", "enum": ["active", "upcoming", "overdue", "completed", "cancelled"] },
+        "notes": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["patientId", "patientName", "procedureType", "appliedAt", "recallStatus"]
+    }
+  },
+  "firestore": {
+    "/platform_admins/{userId}": {
+      "schema": "PlatformAdmin",
+      "description": "Administradores globais do painel ELIZA."
+    },
+    "/platform_metrics/{metricId}": {
+      "schema": "PlatformMetric",
+      "description": "Histórico de métricas da plataforma."
+    },
+    "/platform_audit_logs/{logId}": {
+      "schema": "PlatformAuditLog",
+      "description": "Logs de auditoria de ações administrativas globais."
+    },
+    "/platform_clinics/{clinicId}": {
+      "schema": "PlatformClinic",
+      "description": "Espelho de metadados das clínicas para busca rápida."
+    },
+    "/users/{userId}": {
+      "schema": "UserProfile",
+      "description": "Perfis globais de usuários."
+    },
+    "/clinics/{clinicId}": {
+      "schema": "Clinic",
+      "description": "Dados principais da clínica."
+    },
+    "/clinics/{clinicId}/members/{userId}": {
+      "schema": "ClinicMember",
+      "description": "Equipe da clínica."
+    },
+    "/clinics/{clinicId}/invites/{inviteId}": {
+      "schema": "Invite",
+      "description": "Lista de convites pendentes e realizados."
+    },
+    "/clinics/{clinicId}/patients/{patientId}": {
+      "schema": "Patient",
+      "description": "Pacientes da clínica."
+    },
+    "/clinics/{clinicId}/financial_entries/{recordId}": {
+      "schema": "FinancialEntry",
+      "description": "Financeiro detalhado da clínica."
+    },
+    "/clinics/{clinicId}/team_members/{memberId}": {
+      "schema": "TeamMember",
+      "description": "Colaboradores e equipe."
+    },
+    "/clinics/{clinicId}/commission_rules/{ruleId}": {
+      "schema": "CommissionRule",
+      "description": "Regras de comissão."
+    },
+    "/clinics/{clinicId}/commissions/{commissionId}": {
+      "schema": "Commission",
+      "description": "Comissões calculadas."
+    },
+    "/clinics/{clinicId}/clinic_payables/{payableId}": {
+      "schema": "ClinicPayable",
+      "description": "Contas a pagar da clínica."
+    },
+    "/clinics/{clinicId}/appointments/{appointmentId}": {
+      "schema": "Appointment",
+      "description": "Agenda da clínica."
+    },
+    "/clinics/{clinicId}/templates/{templateId}": {
+      "schema": "Template",
+      "description": "Modelos de documentos."
+    },
+    "/clinics/{clinicId}/daily_closings/{closingId}": {
+      "schema": "DailyClosing",
+      "description": "Fechamentos de caixa diários."
+    },
+    "/clinics/{clinicId}/clinic_issues/{issueId}": {
+      "schema": "ClinicIssue",
+      "description": "Radar da clínica (problemas e diagnóstico)."
+    },
+    "/clinics/{clinicId}/pending_items/{pendingId}": {
+      "schema": "PendingItem",
+      "description": "Pendências e prioridades."
+    },
+    "/clinics/{clinicId}/ai_insights/{insightId}": {
+      "schema": "AIInsight",
+      "description": "Insights gerados pela IA."
+    },
+    "/clinics/{clinicId}/internal_notes/{noteId}": {
+      "schema": "InternalNote",
+      "description": "Recados internos da clínica."
+    },
+    "/clinics/{clinicId}/internal_notes/{noteId}/comments/{commentId}": {
+      "schema": "InternalComment",
+      "description": "Comentários nos recados."
+    },
+    "/clinics/{clinicId}/aesthetic_procedures/{procedureId}": {
+      "schema": "AestheticProcedure",
+      "description": "Procedimentos e recalls de Harmonização Facial."
+    }
+  }
+}
