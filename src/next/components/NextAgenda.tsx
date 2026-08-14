@@ -37,6 +37,8 @@ interface Appointment {
 interface PatientOption {
   id: string;
   name: string;
+  cpf?: string;
+  phone?: string;
 }
 
 const WEEKDAY_LONG = ['Domingo', 'Segunda-feira', 'Terça-feira', 'Quarta-feira', 'Quinta-feira', 'Sexta-feira', 'Sábado'];
@@ -77,6 +79,55 @@ const STATUS_CARD_STYLES: Record<string, { bg: string; border: string; text: str
   cancelado: { bg: 'bg-rose-500/15', border: 'border-rose-400/30', text: 'text-rose-200', avatar: 'bg-rose-500/30 text-rose-200', dot: 'bg-rose-400' },
   faltou: { bg: 'bg-amber-500/15', border: 'border-amber-400/30', text: 'text-amber-200', avatar: 'bg-amber-500/30 text-amber-200', dot: 'bg-amber-400' },
 };
+
+// Shared live-filtered dropdown for the "Paciente"/"Profissional" fields in
+// Novo Agendamento. Replaces native <input list>/<datalist>, whose browser
+// support for actually popping up and being visually legible is unreliable
+// — this renders our own styled list instead. onMouseDown (not onClick) on
+// each option fires before the input's onBlur closes the dropdown.
+function AutocompleteField<T>({
+  label, required, value, onChange, placeholder, suggestions, renderSuggestion, onSelect,
+}: {
+  label: string;
+  required?: boolean;
+  value: string;
+  onChange: (v: string) => void;
+  placeholder?: string;
+  suggestions: T[];
+  renderSuggestion: (item: T) => React.ReactNode;
+  onSelect: (item: T) => void;
+}) {
+  const [isFocused, setIsFocused] = useState(false);
+  const showDropdown = isFocused && suggestions.length > 0;
+  return (
+    <div className="relative">
+      <label className="text-[10px] font-mono text-slate-500 uppercase">{label}{required ? ' *' : ''}</label>
+      <input
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        onFocus={() => setIsFocused(true)}
+        onBlur={() => setTimeout(() => setIsFocused(false), 120)}
+        placeholder={placeholder}
+        autoComplete="off"
+        className="w-full bg-slate-900 border border-next-border rounded-lg text-xs text-slate-200 px-3 py-2.5 mt-1"
+      />
+      {showDropdown && (
+        <div className="absolute z-20 mt-1 w-full next-glass-panel rounded-lg max-h-48 overflow-y-auto custom-scrollbar">
+          {suggestions.map((item, i) => (
+            <button
+              type="button"
+              key={i}
+              onMouseDown={(e) => { e.preventDefault(); onSelect(item); }}
+              className="w-full text-left px-3 py-2 hover:bg-slate-800 border-b border-next-border last:border-b-0"
+            >
+              {renderSuggestion(item)}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
 
 function styleForStatus(status?: string) {
   return STATUS_CARD_STYLES[(status || 'pendente').toLowerCase()] || STATUS_CARD_STYLES.pendente;
@@ -222,8 +273,11 @@ export default function NextAgenda({ prefillPatientName, onPrefillConsumed, onOp
         setAppointments(list);
 
         const patientsRef = collection(db, 'clinics', clinic.id, 'patients');
-        const patSnap = await secureGetDocs(query(patientsRef, limit(50)), 'patients', { addAuditLog });
-        setPatients(patSnap.docs.map(d => ({ id: d.id, name: (d.data() as any).name || 'Paciente sem nome' })));
+        const patSnap = await secureGetDocs(query(patientsRef, limit(500)), 'patients', { addAuditLog });
+        setPatients(patSnap.docs.map(d => {
+          const data = d.data() as any;
+          return { id: d.id, name: data.name || 'Paciente sem nome', cpf: data.cpf || '', phone: data.phone || '' };
+        }));
 
         // Real staff roster (cadastrado no Painel Admin) — só quem está
         // marcado como "Atendimento Clínico" e ativo aparece para seleção
@@ -263,6 +317,32 @@ export default function NextAgenda({ prefillPatientName, onPrefillConsumed, onOp
     appointments.forEach(a => { if (a.dentistName) set.add(a.dentistName); });
     return Array.from(set).sort();
   }, [appointments, clinicalTeamNames]);
+
+  // Live suggestions for the "Novo agendamento" form — patient matches by
+  // name, CPF or phone (digits-only comparison so punctuation in either side
+  // doesn't matter); only kicks in once something's typed, since the real
+  // patient list can be large. Professional matches by name against the
+  // real clinical roster + historical appointment names, and shows the
+  // full (usually short) list as soon as the field is focused.
+  const patientSuggestions = useMemo(() => {
+    const q = newAppt.patientName.trim().toLowerCase();
+    if (!q) return [];
+    const qDigits = q.replace(/\D/g, '');
+    return patients.filter(p => {
+      if (p.name.toLowerCase().includes(q)) return true;
+      if (qDigits.length >= 3) {
+        if ((p.cpf || '').replace(/\D/g, '').includes(qDigits)) return true;
+        if ((p.phone || '').replace(/\D/g, '').includes(qDigits)) return true;
+      }
+      return false;
+    }).slice(0, 6);
+  }, [newAppt.patientName, patients]);
+
+  const professionalSuggestions = useMemo(() => {
+    const q = newAppt.dentistName.trim().toLowerCase();
+    const base = q ? professionals.filter(p => p.toLowerCase().includes(q)) : professionals;
+    return base.slice(0, 8);
+  }, [newAppt.dentistName, professionals]);
 
   const treatmentTypes = useMemo(() => {
     const set = new Set<string>();
@@ -1048,19 +1128,23 @@ export default function NextAgenda({ prefillPatientName, onPrefillConsumed, onOp
               </p>
 
               <form onSubmit={handleCreateAppointment} className="space-y-3">
-                <div>
-                  <label className="text-[10px] font-mono text-slate-500 uppercase">Paciente *</label>
-                  <input
-                    list="next-patients-list"
-                    value={newAppt.patientName}
-                    onChange={(e) => setNewAppt(v => ({ ...v, patientName: e.target.value }))}
-                    placeholder="Nome do paciente"
-                    className="w-full bg-slate-900 border border-next-border rounded-lg text-xs text-slate-200 px-3 py-2.5 mt-1"
-                  />
-                  <datalist id="next-patients-list">
-                    {patients.map(p => <option key={p.id} value={p.name} />)}
-                  </datalist>
-                </div>
+                <AutocompleteField
+                  label="Paciente"
+                  required
+                  value={newAppt.patientName}
+                  onChange={(v) => setNewAppt(x => ({ ...x, patientName: v }))}
+                  placeholder="Nome, CPF ou telefone"
+                  suggestions={patientSuggestions}
+                  onSelect={(p) => setNewAppt(x => ({ ...x, patientName: p.name }))}
+                  renderSuggestion={(p) => (
+                    <div>
+                      <p className="text-xs font-semibold text-slate-200">{p.name}</p>
+                      {(p.cpf || p.phone) && (
+                        <p className="text-[10px] text-slate-500 font-mono">{[p.cpf, p.phone].filter(Boolean).join(' • ')}</p>
+                      )}
+                    </div>
+                  )}
+                />
 
                 <div className="grid grid-cols-2 gap-3">
                   <div>
@@ -1073,13 +1157,15 @@ export default function NextAgenda({ prefillPatientName, onPrefillConsumed, onOp
                   </div>
                 </div>
 
-                <div>
-                  <label className="text-[10px] font-mono text-slate-500 uppercase">Profissional</label>
-                  <input list="next-professionals-list" value={newAppt.dentistName} onChange={(e) => setNewAppt(v => ({ ...v, dentistName: e.target.value }))} placeholder="Ex: Dra. Ana Demo" className="w-full bg-slate-900 border border-next-border rounded-lg text-xs text-slate-200 px-3 py-2.5 mt-1" />
-                  <datalist id="next-professionals-list">
-                    {professionals.map(p => <option key={p} value={p} />)}
-                  </datalist>
-                </div>
+                <AutocompleteField
+                  label="Profissional"
+                  value={newAppt.dentistName}
+                  onChange={(v) => setNewAppt(x => ({ ...x, dentistName: v }))}
+                  placeholder="Ex: Dra. Ana Demo"
+                  suggestions={professionalSuggestions}
+                  onSelect={(name) => setNewAppt(x => ({ ...x, dentistName: name }))}
+                  renderSuggestion={(name) => <p className="text-xs font-semibold text-slate-200">{name}</p>}
+                />
 
                 <div>
                   <label className="text-[10px] font-mono text-slate-500 uppercase">Procedimento</label>
