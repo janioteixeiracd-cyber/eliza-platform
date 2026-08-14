@@ -9,15 +9,9 @@
   "orientation": "portrait-primary",
   "icons": [
     {
-      "src": "/icon-192.png",
+      "src": "/brand/eliza-mark.png",
       "type": "image/png",
-      "sizes": "192x192",
-      "purpose": "any maskable"
-    },
-    {
-      "src": "/icon-512.png",
-      "type": "image/png",
-      "sizes": "512x512",
+      "sizes": "73x84",
       "purpose": "any maskable"
     }
   ],

@@ -455,7 +455,7 @@ function ElizaNextContent() {
         {/* Top bar */}
         <header className="h-16 border-b border-slate-800 px-6 flex items-center justify-end flex-shrink-0 bg-slate-900/40 backdrop-blur-md">
           <a
-            href="/"
+            href="/legado"
             className="text-xs font-semibold px-3.5 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-lg border border-slate-700/60 transition-all"
           >
             Voltar ao Legado

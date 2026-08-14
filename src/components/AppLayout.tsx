@@ -32,6 +32,7 @@ import { useAuth } from '../contexts/AuthContext';
 import { useAdmin } from '../contexts/AdminContext';
 import { ENABLE_PLATFORM_ADMIN } from '../config';
 import LoginView from './LoginView';
+import PublicLandingView from './PublicLandingView';
 import { db, auth } from '../lib/firebase';
 import { updatePassword } from 'firebase/auth';
 import { doc, getDoc, setDoc, serverTimestamp, collection, getDocs, updateDoc } from 'firebase/firestore';
@@ -460,7 +461,8 @@ export default function AppLayout() {
   }
 
   if (!user) {
-    return <LoginView />;
+    if (location.pathname === '/login') return <LoginView />;
+    return <PublicLandingView />;
   }
 
   // If user is a platform admin and hits / but has no clinic, redirect to /admin
@@ -530,6 +532,14 @@ export default function AppLayout() {
       );
     }
     return <OnboardingView />;
+  }
+
+  // Eliza Next is now the default experience after login. Both the bare
+  // root and the /login form route land here; "Voltar ao Legado" in
+  // ElizaNextLayout points at /legado specifically so it doesn't bounce
+  // straight back here.
+  if (location.pathname === '/' || location.pathname === '/login') {
+    return <Navigate to="/next" replace />;
   }
 
   const handlePatientSelect = (id: string) => {
