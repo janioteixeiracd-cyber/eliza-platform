@@ -9,7 +9,7 @@ import twilio from "twilio";
 import { initializeApp as initClientApp, getApps as getClientApps, getApp as getClientApp } from "firebase/app";
 import { getFirestore as getClientFirestore, doc, getDoc, setDoc, getDocs, collection, serverTimestamp, increment, addDoc } from "firebase/firestore";
 import { initializeApp, getApps, applicationDefault } from "firebase-admin/app";
-import { getFirestore, FieldValue } from "firebase-admin/firestore";
+import { getFirestore, FieldValue, FieldPath } from "firebase-admin/firestore";
 import { getAuth as getAdminAuth } from "firebase-admin/auth";
 
 // ELIZA Intelligence Layer
@@ -17,6 +17,13 @@ import { elizaIntelligence } from "./src/lib/elizaIntelligence";
 import { elizaAuthMiddleware } from "./src/lib/elizaAuthService";
 import { ElizaIntelligenceRequest, ElizaError } from "./src/types/eliza-intelligence";
 import * as authController from "./src/controllers/authController";
+
+// Simples Dental Bridge integration surface — read-only, Fase 1 (ver
+// SHADOW_MODE_READINESS.md no repositório da Bridge). Autenticação própria,
+// nunca sessão de usuário Firebase; a Bridge nunca recebe credencial do
+// Firestore.
+import { createBridgeAuthMiddleware } from "./src/lib/bridgeAuth";
+import { fetchBridgePatientState } from "./src/lib/bridgeState";
 
 const AdminFieldValue = FieldValue;
 
@@ -3218,6 +3225,35 @@ Versão polida por ELIZA:`,
   } catch (err) {
     console.error("[CASH_CLOSING_REALTIME_SETUP_ERROR]", err);
   }
+
+  // ============================================================================
+  // SIMPLES DENTAL BRIDGE INTEGRATION (read-only, Fase 1)
+  // ============================================================================
+  // GET /api/bridge/state/patients — minimal identity fields only, for the
+  // Bridge's local matching/reconciliation. No write endpoint exists yet
+  // and none of this touches the legacy import_batches/patient_import_review
+  // collections. Auth is bridgeAuth's own dedicated token
+  // (BRIDGE_INTEGRATION_TOKEN), scoped per-clinic via
+  // BRIDGE_ALLOWED_CLINIC_IDS — see src/lib/bridgeAuth.ts.
+  const bridgeAuth = createBridgeAuthMiddleware();
+
+  app.get("/api/bridge/state/patients", bridgeAuth, async (req: any, res) => {
+    try {
+      const clinicId: string = req.bridgeClinicId;
+      const patientsCollection = adminDb.collection(`clinics/${clinicId}/patients`);
+      const response = await fetchBridgePatientState(
+        patientsCollection as any,
+        FieldPath,
+        clinicId,
+        req.query?.pageSize,
+        typeof req.query?.pageToken === "string" ? req.query.pageToken : undefined
+      );
+      res.json(response);
+    } catch (err) {
+      console.error("[BRIDGE_STATE_PATIENTS_ERROR]", err instanceof Error ? err.message : err);
+      res.status(500).json({ error: "Erro interno ao consultar estado de pacientes." });
+    }
+  });
 
   // ============================================================================
   // AUTHENTICATION ROUTES
