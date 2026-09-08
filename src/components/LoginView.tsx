@@ -9,7 +9,6 @@ export default function LoginView() {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [isLoading, setIsLoading] = useState(false);
-  const [isStartingSignup, setIsStartingSignup] = useState(false);
   const [errorStatus, setErrorStatus] = useState<string | null>(null);
 
   const handleGoogleLogin = async () => {
@@ -41,24 +40,8 @@ export default function LoginView() {
     }
   };
 
-  // "Solicite acesso" reuses the same real signup path as the landing page's
-  // CTA (Google sign-in auto-creates the account; AppLayout then routes a
-  // clinic-less user into the real OnboardingView) — there is no separate
-  // email/password registration flow in this app.
-  const handleRequestAccess = async () => {
-    setIsStartingSignup(true);
-    setErrorStatus(null);
-    try {
-      await loginWithGoogle();
-    } catch (err: any) {
-      setErrorStatus(err.message || 'Falha ao iniciar cadastro');
-    } finally {
-      setIsStartingSignup(false);
-    }
-  };
-
   return (
-    <div className="min-h-screen bg-next-bg-deep flex items-center justify-center p-6 font-sans" style={{ background: 'var(--color-next-bg-deep)' }}>
+    <div className="h-dvh overflow-y-auto bg-next-bg-deep flex items-center justify-center p-6 font-sans" style={{ background: 'var(--color-next-bg-deep)', height: 'var(--app-vh, 100dvh)' }}>
       <div className="absolute top-0 left-1/2 -translate-x-1/2 w-[500px] h-[500px] rounded-full pointer-events-none" style={{ background: 'radial-gradient(circle, rgba(139,92,246,0.16) 0%, transparent 65%)' }} />
 
       <motion.div
@@ -72,7 +55,7 @@ export default function LoginView() {
             <span className="text-[10px] font-bold text-next-purple-light uppercase tracking-widest">Plataforma Dental AI-First</span>
           </Link>
           <div className="w-16 h-16 next-brand-gradient-bg rounded-3xl flex items-center justify-center text-white font-black text-3xl shadow-next-glow-purple-strong mx-auto mb-6">E</div>
-          <h2 className="text-2xl font-black text-white tracking-tight mb-1.5">Bem-vinda à ELIZA</h2>
+          <h2 className="text-2xl font-black text-white tracking-tight mb-1.5">Bem-vinda à Eliza Clínica Inteligente</h2>
           <p className="text-slate-400 text-sm font-medium">Acesse sua conta para gerenciar sua clínica.</p>
         </div>
 
@@ -146,9 +129,7 @@ export default function LoginView() {
         <div className="mt-8 text-center">
           <p className="text-xs text-slate-500 font-medium">
             Não tem uma conta?{' '}
-            <button onClick={handleRequestAccess} disabled={isStartingSignup} className="text-next-purple-light font-black uppercase tracking-tight hover:underline disabled:opacity-60">
-              {isStartingSignup ? 'Abrindo...' : 'Solicite acesso'}
-            </button>
+            <Link to="/register" className="text-next-purple-light font-black uppercase tracking-tight hover:underline">Cadastre-se</Link>
           </p>
         </div>
 
@@ -163,6 +144,8 @@ export default function LoginView() {
           <Link to="/privacy" className="hover:text-slate-300 transition-colors">Política de Privacidade</Link>
           <span className="text-slate-700 font-normal select-none">•</span>
           <Link to="/terms" className="hover:text-slate-300 transition-colors">Termos de Uso</Link>
+          <span className="text-slate-700 font-normal select-none">•</span>
+          <Link to="/data-deletion" className="hover:text-slate-300 transition-colors">Exclusão de Dados</Link>
         </div>
       </motion.div>
     </div>

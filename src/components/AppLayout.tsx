@@ -29,16 +29,19 @@ import {
 import firebaseConfig from '../../firebase-applet-config.json';
 import { Routes, Route, useLocation, Navigate, useNavigate, Link } from 'react-router-dom';
 import { useAuth } from '../contexts/AuthContext';
-import { useAdmin } from '../contexts/AdminContext';
 import { ENABLE_PLATFORM_ADMIN } from '../config';
 import LoginView from './LoginView';
+import RegisterView from './RegisterView';
 import PublicLandingView from './PublicLandingView';
+import CheckoutView from './CheckoutView';
 import { db, auth } from '../lib/firebase';
 import { updatePassword } from 'firebase/auth';
 import { doc, getDoc, setDoc, serverTimestamp, collection, getDocs, updateDoc } from 'firebase/firestore';
 import OnboardingView from './OnboardingView';
 import AcceptInviteView from './AcceptInviteView';
 import ChatInterface from './ChatInterface';
+import InstallElizaButton, { IosInstallSteps } from '../pwa/InstallElizaButton';
+import { useInstallPrompt } from '../pwa/useInstallPrompt';
 import DashboardView from './DashboardView';
 import PatientsList from './PatientsList';
 import CalendarView from './CalendarView';
@@ -62,19 +65,20 @@ import EducationView from './EducationView';
 type View = 'dashboard' | 'patients' | 'agenda' | 'chat' | 'crm' | 'medical_record' | 'financial' | 'inventory' | 'reports' | 'settings' | 'radar' | 'closing' | 'tasks' | 'import' | 'intelligent_finance' | 'notes' | 'recall_hof' | 'planning' | 'team_performance' | 'education';
 
 export default function AppLayout() {
-  const { 
-    user, 
-    profile, 
-    clinic: authClinic, 
-    isPlatformAdmin, 
-    loading, 
-    isQuotaExceeded, 
+  const {
+    user,
+    profile,
+    clinic,
+    signup,
+    isPlatformAdmin,
+    loading,
+    isQuotaExceeded,
     logout,
     bootstrapTime,
-    authError
+    authError,
+    supportMode,
+    exitSupportMode
   } = useAuth();
-  const { supportMode, exitSupportMode } = useAdmin();
-  const clinic = supportMode.active ? supportMode.clinicData : authClinic;
   const [activeView, setActiveView] = useState<View>('dashboard');
 
   // Student role auto-routing
@@ -158,6 +162,7 @@ export default function AppLayout() {
   const [isDesktopExpanded, setIsDesktopExpanded] = useState(false);
   const [selectedPatientId, setSelectedPatientId] = useState<string | null>(null);
   const [showPwaPrompt, setShowPwaPrompt] = useState(false);
+  const [showIosInstallSteps, setShowIosInstallSteps] = useState(false);
   const [showDebug, setShowDebug] = useState(false);
   const [accessError, setAccessError] = useState<string | null>(null);
   const [isAccessChecking, setIsAccessChecking] = useState(false);
@@ -200,18 +205,19 @@ export default function AppLayout() {
     }
   };
 
-  // Check if already in standalone mode
-  const isStandalone = window.matchMedia('(display-mode: standalone)').matches || (window.navigator as any).standalone === true;
+  const { capability: pwaCapability, promptInstall } = useInstallPrompt();
 
   React.useEffect(() => {
-    // Show PWA installation prompt after 3 seconds if not standalone
-    const timer = setTimeout(() => {
-      if (!isStandalone) {
-        setShowPwaPrompt(true);
-      }
-    }, 5000);
-    return () => clearTimeout(timer);
-  }, [isStandalone]);
+    // Surface the real install prompt a few seconds in, once the browser
+    // has actually told us it's installable (or, on iOS, once we know
+    // manual "Adicionar à Tela de Início" steps are the only path) —
+    // never shown if already installed or if the platform has no install
+    // path at all.
+    if (pwaCapability === 'native' || pwaCapability === 'ios-manual') {
+      const timer = setTimeout(() => setShowPwaPrompt(true), 5000);
+      return () => clearTimeout(timer);
+    }
+  }, [pwaCapability]);
 
   React.useEffect(() => {
     const searchParams = new URLSearchParams(location.search);
@@ -356,22 +362,23 @@ export default function AppLayout() {
 
   if (isQuotaExceeded) {
     return (
-      <div className="h-screen w-screen bg-slate-50 flex items-center justify-center p-6 text-center">
-        <div className="max-w-md bg-white p-12 rounded-[40px] shadow-2xl shadow-rose-200/50 border border-rose-100 flex flex-col items-center gap-6">
-          <div className="w-20 h-20 bg-rose-50 text-rose-600 rounded-[32px] flex items-center justify-center shadow-inner">
+      <div className="min-h-dvh w-screen flex items-center justify-center p-6 text-center relative overflow-hidden" style={{ background: 'var(--color-next-bg-deep)', minHeight: 'var(--app-vh, 100dvh)' }}>
+        <div className="absolute top-0 left-1/2 -translate-x-1/2 w-[500px] h-[500px] rounded-full pointer-events-none" style={{ background: 'radial-gradient(circle, rgba(239,68,68,0.14) 0%, transparent 65%)' }} />
+        <div className="relative next-glass-panel max-w-md p-12 rounded-next-2xl flex flex-col items-center gap-6">
+          <div className="w-20 h-20 bg-next-red-alert/10 text-next-red-alert rounded-[32px] flex items-center justify-center border border-next-red-alert/20">
             <Database className="w-10 h-10" />
           </div>
           <div>
-            <h2 className="text-2xl font-bold text-slate-900 tracking-tight mb-2">Limite de Uso Excedido</h2>
-            <p className="text-sm text-slate-500 font-medium leading-relaxed">
-              Infelizmente, o limite de uso diário do sistema gratuito foi atingido. 
+            <h2 className="text-2xl font-bold text-white tracking-tight mb-2">Limite de Uso Excedido</h2>
+            <p className="text-sm text-slate-400 font-medium leading-relaxed">
+              Infelizmente, o limite de uso diário do sistema gratuito foi atingido.
               <br /><br />
               Este é um limite do Google Cloud (Firestore) e será redefinido automaticamente amanhã.
             </p>
           </div>
-          <button 
+          <button
             onClick={() => window.location.reload()}
-            className="w-full py-4 bg-rose-600 text-white rounded-2xl font-bold text-sm shadow-lg shadow-rose-600/20 hover:scale-[1.02] active:scale-[0.98] transition-all"
+            className="w-full py-4 bg-next-red-alert text-white rounded-2xl font-bold text-sm shadow-lg shadow-next-red-alert/20 hover:scale-[1.02] active:scale-[0.98] transition-all"
           >
             Verificar Novamente
           </button>
@@ -385,10 +392,17 @@ export default function AppLayout() {
     const isError = bootstrapTime > 8 || !!authError;
 
     return (
-      <div className="h-screen w-screen bg-slate-50 flex items-center justify-center p-6">
-        <div className="flex flex-col items-center gap-8 max-w-sm w-full">
-          <div className="w-20 h-20 bg-teal-600 rounded-[2.5rem] flex items-center justify-center text-white font-bold text-4xl animate-bounce shadow-2xl shadow-teal-600/30">E</div>
-          
+      <div className="min-h-dvh w-screen flex items-center justify-center p-6 relative overflow-hidden" style={{ background: 'var(--color-next-bg-deep)', minHeight: 'var(--app-vh, 100dvh)' }}>
+        <div className="absolute top-0 left-1/2 -translate-x-1/2 w-[500px] h-[500px] rounded-full pointer-events-none" style={{ background: 'radial-gradient(circle, rgba(139,92,246,0.16) 0%, transparent 65%)' }} />
+        <div className="relative flex flex-col items-center gap-8 max-w-sm w-full">
+          <div className="relative flex items-center justify-center w-20 h-20">
+            <div
+              className="eliza-heartbeat-glow absolute inset-0 rounded-full"
+              style={{ background: 'radial-gradient(circle, rgba(139,92,246,0.45) 0%, transparent 70%)' }}
+            />
+            <img src="/brand/eliza-mark.png" alt="Eliza" className="eliza-heartbeat-mark relative w-12 h-12 object-contain drop-shadow-[0_0_14px_rgba(139,92,246,0.4)]" />
+          </div>
+
           <div className="flex flex-col items-center gap-3 w-full">
             <div className="flex items-center gap-2 text-slate-400 font-bold text-[10px] uppercase tracking-[0.3em]">
                <Loader2 className={`w-4 h-4 ${!isError ? 'animate-spin' : ''}`} />
@@ -396,54 +410,54 @@ export default function AppLayout() {
             </div>
 
             {(isSlow || isError) && (
-              <motion.div 
+              <motion.div
                 initial={{ opacity: 0, y: 10 }}
                 animate={{ opacity: 1, y: 0 }}
-                className="w-full bg-white p-8 rounded-[2.5rem] border border-slate-200 shadow-xl shadow-slate-200/50 flex flex-col items-center text-center gap-6"
+                className="w-full next-glass-panel p-8 rounded-next-2xl flex flex-col items-center text-center gap-6"
               >
-                <div className={`w-12 h-12 ${isError ? 'bg-rose-50 text-rose-600' : 'bg-amber-50 text-amber-600'} rounded-2xl flex items-center justify-center`}>
+                <div className={`w-12 h-12 ${isError ? 'bg-next-red-alert/10 text-next-red-alert border-next-red-alert/20' : 'bg-next-orange-insight/10 text-next-orange-insight border-next-orange-insight/20'} border rounded-2xl flex items-center justify-center`}>
                   {isError ? <ShieldAlert className="w-6 h-6" /> : <Activity className="w-6 h-6" />}
                 </div>
-                
+
                 <div>
-                  <p className="text-xs font-black text-slate-900 uppercase tracking-tight mb-1">
+                  <p className="text-xs font-black text-white uppercase tracking-tight mb-1">
                     {isError ? 'Falha na Inicialização' : 'Quase lá...'}
                   </p>
-                  <p className="text-[10px] text-slate-500 font-medium leading-relaxed">
+                  <p className="text-[10px] text-slate-400 font-medium leading-relaxed">
                     {authError || "Estamos tendo dificuldade para conectar com os servidores da ELIZA. Verifique sua conexão."}
                   </p>
                 </div>
 
                 <div className="w-full flex flex-col gap-2">
-                  <button 
+                  <button
                     onClick={() => window.location.reload()}
-                    className="w-full py-4 bg-slate-900 text-white rounded-2xl font-black text-[10px] uppercase tracking-widest hover:scale-[1.02] active:scale-[0.98] transition-all"
+                    className="w-full py-4 next-brand-gradient-bg text-white rounded-2xl font-black text-[10px] uppercase tracking-widest shadow-next-glow-purple hover:scale-[1.02] active:scale-[0.98] transition-all"
                   >
                     Tentar Novamente
                   </button>
-                  <button 
+                  <button
                     onClick={() => logout()}
-                    className="w-full py-4 bg-white text-slate-400 border border-slate-100 rounded-2xl font-black text-[10px] uppercase tracking-widest hover:text-rose-600 transition-all"
+                    className="w-full py-4 bg-slate-900 text-slate-400 border border-next-border rounded-2xl font-black text-[10px] uppercase tracking-widest hover:text-next-red-alert transition-all"
                   >
                     Sair da Conta
                   </button>
                 </div>
 
                 {/* Secret Debug Button */}
-                <button 
+                <button
                   onClick={() => setShowDebug(!showDebug)}
-                  className="text-[9px] font-bold text-slate-300 uppercase tracking-widest hover:text-slate-500"
+                  className="text-[9px] font-bold text-slate-600 uppercase tracking-widest hover:text-slate-400"
                 >
                   {showDebug ? 'Esconder Diagnóstico' : 'Ver Diagnóstico'}
                 </button>
 
                 {showDebug && (
-                  <div className="w-full text-[9px] font-mono text-slate-400 bg-slate-50 p-4 rounded-2xl text-left border border-slate-100 flex flex-col gap-2 overflow-x-auto">
-                    <div className="flex justify-between border-b border-slate-200/50 pb-1"><span>UID:</span> <span className="text-slate-600">{user?.uid || 'NONE'}</span></div>
-                    <div className="flex justify-between border-b border-slate-200/50 pb-1"><span>Email:</span> <span className="text-slate-600">{user?.email || 'NONE'}</span></div>
-                    <div className="flex justify-between border-b border-slate-200/50 pb-1"><span>CID:</span> <span className="text-slate-600">{profile?.defaultClinicId || 'NONE'}</span></div>
-                    <div className="flex justify-between border-b border-slate-200/50 pb-1"><span>Boot:</span> <span className="text-slate-600">{bootstrapTime}s</span></div>
-                    <div className="flex justify-between border-b border-slate-200/50 pb-1"><span>Admin:</span> <span className={isPlatformAdmin ? 'text-teal-600' : ''}>{isPlatformAdmin ? 'YES' : 'NO'}</span></div>
+                  <div className="w-full text-[9px] font-mono text-slate-400 bg-slate-900 p-4 rounded-2xl text-left border border-next-border flex flex-col gap-2 overflow-x-auto">
+                    <div className="flex justify-between border-b border-next-border pb-1"><span>UID:</span> <span className="text-slate-300">{user?.uid || 'NONE'}</span></div>
+                    <div className="flex justify-between border-b border-next-border pb-1"><span>Email:</span> <span className="text-slate-300">{user?.email || 'NONE'}</span></div>
+                    <div className="flex justify-between border-b border-next-border pb-1"><span>CID:</span> <span className="text-slate-300">{profile?.defaultClinicId || 'NONE'}</span></div>
+                    <div className="flex justify-between border-b border-next-border pb-1"><span>Boot:</span> <span className="text-slate-300">{bootstrapTime}s</span></div>
+                    <div className="flex justify-between border-b border-next-border pb-1"><span>Admin:</span> <span className={isPlatformAdmin ? 'text-next-purple-light' : ''}>{isPlatformAdmin ? 'YES' : 'NO'}</span></div>
                     <div className="flex justify-between"><span>Method:</span> <span>{user?.providerData?.[0]?.providerId || 'password'}</span></div>
                   </div>
                 )}
@@ -462,69 +476,87 @@ export default function AppLayout() {
 
   if (!user) {
     if (location.pathname === '/login') return <LoginView />;
+    if (location.pathname === '/register') return <RegisterView />;
     return <PublicLandingView />;
   }
 
-  // If user is a platform admin and hits / but has no clinic, redirect to /admin
-  if (isPlatformAdmin && !clinic && location.pathname === '/') {
+  // If a platform admin has no clinic of their own at all (no defaultClinicId
+  // ever set), send them straight to /admin. But if they DO have a
+  // defaultClinicId and `clinic` is still null, that's the transient
+  // "resolution failed" case (e.g. a flaky Firestore read on PWA cold
+  // start) — falling through to the "Acesso Restrito" screen below (which
+  // has a real retry button) is correct there; auto-redirecting to /admin
+  // would silently strand a clinic-owning admin in the wrong panel.
+  if (isPlatformAdmin && !clinic && !profile?.defaultClinicId && location.pathname === '/') {
     return <Navigate to="/admin" />;
+  }
+
+  // Cadastro → Checkout (Asaas): a user with no clinic yet who hasn't paid
+  // gets routed to checkout, never straight into the onboarding wizard below.
+  // Platform admins are exempt (they run the product, they don't buy it) —
+  // same carve-out already used for the /admin redirect above. Anyone with
+  // an existing `clinic` already resolved skips this block entirely, so
+  // clinics created before this system existed are unaffected.
+  if (!clinic && !isPlatformAdmin && (!signup || signup.status === 'pending_payment' || signup.status === 'payment_processing')) {
+    return <CheckoutView />;
   }
 
   if (!clinic) {
     // If user has a specific clinic ID but association failed (and it's not onboarding)
     if (profile?.defaultClinicId && profile.defaultClinicId !== 'onboarding') {
       return (
-        <div className="h-screen w-screen bg-slate-50 flex items-center justify-center p-6 bg-[radial-gradient(circle_at_top_right,_var(--tw-gradient-stops))] from-slate-100 via-slate-50 to-white">
-          <div className="max-w-md w-full bg-white p-12 rounded-[3.5rem] shadow-2xl border border-slate-100 flex flex-col items-center text-center gap-8 relative overflow-hidden group">
-            <div className="absolute top-0 left-0 right-0 h-2 bg-teal-500" />
-            <div className="w-24 h-24 bg-slate-50 rounded-[2.5rem] flex items-center justify-center relative shadow-inner">
-               <ShieldAlert className="w-10 h-10 text-slate-300" />
-               <motion.div 
+        <div className="min-h-dvh w-screen flex items-center justify-center p-6 relative overflow-hidden" style={{ background: 'var(--color-next-bg-deep)', minHeight: 'var(--app-vh, 100dvh)' }}>
+          <div className="absolute top-0 left-1/2 -translate-x-1/2 w-[500px] h-[500px] rounded-full pointer-events-none" style={{ background: 'radial-gradient(circle, rgba(139,92,246,0.16) 0%, transparent 65%)' }} />
+          <div className="relative max-w-md w-full next-glass-panel p-12 rounded-next-2xl flex flex-col items-center text-center gap-8 overflow-hidden">
+            <div className="absolute top-0 left-0 right-0 h-1 next-brand-gradient-bg" />
+            <div className="w-24 h-24 bg-slate-900 border border-next-border rounded-[2.5rem] flex items-center justify-center relative">
+               <ShieldAlert className="w-10 h-10 text-next-purple-mid" />
+               <motion.div
                  animate={{ scale: [1, 1.2, 1], opacity: [0.5, 1, 0.5] }}
                  transition={{ repeat: Infinity, duration: 3 }}
-                 className="absolute inset-0 bg-teal-500/5 rounded-[2.5rem]" 
+                 className="absolute inset-0 bg-next-purple-neon/10 rounded-[2.5rem]"
                />
             </div>
-            
+
             <div className="space-y-4">
-              <h2 className="text-2xl font-black text-slate-900 tracking-tight uppercase tracking-widest">Acesso Restrito</h2>
-              <p className="text-sm text-slate-500 font-medium leading-relaxed">
+              <h2 className="text-2xl font-black text-white tracking-tight uppercase tracking-widest">Acesso Restrito</h2>
+              <p className="text-sm text-slate-400 font-medium leading-relaxed">
                 Seu acesso ainda não foi vinculado a uma clínica ou está aguardando ativação pelo administrador.
               </p>
-              <div className="p-4 bg-emerald-50 border border-emerald-100 rounded-3xl">
-                <p className="text-[10px] font-black text-emerald-600 uppercase tracking-widest">ID de Destino: {profile.defaultClinicId}</p>
+              <div className="p-4 bg-next-green-success/10 border border-next-green-success/25 rounded-3xl">
+                <p className="text-[10px] font-black text-next-green-success uppercase tracking-widest">ID de Destino: {profile.defaultClinicId}</p>
               </div>
             </div>
 
             {accessError && (
-              <div className="p-4 bg-rose-50 border border-rose-100 rounded-2xl text-[10px] font-bold text-rose-600 tracking-normal uppercase">
+              <div className="p-4 bg-next-red-alert/10 border border-next-red-alert/25 rounded-2xl text-[10px] font-bold text-next-red-alert tracking-normal uppercase">
                 {accessError}
               </div>
             )}
 
             <div className="w-full flex flex-col gap-3">
-              <button 
+              <button
                 onClick={() => handleAccessCheck(profile.defaultClinicId!)}
                 disabled={isAccessChecking}
-                className="w-full py-4 bg-teal-600 text-white rounded-2xl font-black text-[10px] uppercase tracking-widest shadow-xl shadow-teal-600/20 hover:scale-[1.02] active:scale-[0.98] transition-all flex items-center justify-center gap-2 disabled:opacity-50"
+                className="w-full py-4 next-brand-gradient-bg text-white rounded-2xl font-black text-[10px] uppercase tracking-widest shadow-next-glow-purple hover:scale-[1.02] active:scale-[0.98] transition-all flex items-center justify-center gap-2 disabled:opacity-50"
               >
                 {isAccessChecking ? 'Verificando...' : `Acessar clínica ${profile.defaultClinicId}`}
               </button>
-              <button 
+              <button
                 onClick={() => window.location.reload()}
-                className="w-full py-4 bg-slate-900 text-white rounded-2xl font-black text-[10px] uppercase tracking-widest shadow-xl shadow-slate-900/20 hover:scale-[1.02] active:scale-[0.98] transition-all"
+                className="w-full py-4 bg-slate-900 text-white border border-next-border rounded-2xl font-black text-[10px] uppercase tracking-widest hover:bg-slate-800 transition-all"
               >
                 Verificar Novamente
               </button>
-              <button 
+              <button
                 onClick={() => logout()}
-                className="w-full py-4 bg-white text-slate-400 border border-slate-100 rounded-2xl font-black text-[10px] uppercase tracking-widest hover:text-rose-600 hover:border-rose-100 transition-all"
+                className="w-full py-4 bg-transparent text-slate-500 border border-next-border rounded-2xl font-black text-[10px] uppercase tracking-widest hover:text-next-red-alert hover:border-next-red-alert/30 transition-all"
               >
                 Sair da Conta
               </button>
             </div>
 
-            <p className="text-[10px] font-black text-slate-300 uppercase tracking-widest italic">
+            <p className="text-[10px] font-black text-slate-600 uppercase tracking-widest italic">
               Se você é um novo administrador, fale com o suporte ELIZA.
             </p>
           </div>
@@ -601,7 +633,7 @@ export default function AppLayout() {
       ];
 
   return (
-    <div className="flex h-screen bg-slate-50 font-sans text-slate-800 overflow-hidden">
+    <div className="flex h-dvh bg-slate-50 font-sans text-slate-800 overflow-hidden" style={{ height: 'var(--app-vh, 100dvh)' }}>
       {/* Mobile Menu Overlay */}
       {isSidebarOpen && (
         <div 
@@ -626,10 +658,9 @@ export default function AppLayout() {
         >
           {isDesktopExpanded ? (
             <>
-              <div className="w-10 h-10 bg-teal-600 rounded-xl flex items-center justify-center text-white font-bold text-xl shadow-lg shadow-teal-600/20 ring-4 ring-teal-50 shrink-0 select-none">E</div>
-              <div className="ml-4 flex-1 min-w-0">
-                <h1 className="text-xl font-bold tracking-tighter text-slate-900 truncate">ELIZA</h1>
-                <p className="text-[10px] text-teal-600 font-bold uppercase tracking-widest mt-0.5 truncate">Dental Platform</p>
+              <img src="/brand/eliza-wordmark-dark.png" alt="Eliza" className="h-8 w-auto object-contain shrink-0 select-none" />
+              <div className="ml-3 flex-1 min-w-0">
+                <p className="text-[10px] text-teal-600 font-bold uppercase tracking-widest truncate">Plataforma de Gestão Odontológica</p>
               </div>
               <button onClick={() => setIsSidebarOpen(false)} className="ml-auto lg:hidden">
                 <X className="w-6 h-6 text-slate-400" />
@@ -647,7 +678,7 @@ export default function AppLayout() {
             </>
           ) : (
             <div className="flex items-center justify-center w-full relative group">
-              <div className="w-10 h-10 bg-teal-600 rounded-xl flex items-center justify-center text-white font-bold text-xl shadow-lg shadow-teal-600/20 ring-4 ring-teal-50 shrink-0 group-hover:scale-105 transition-all">E</div>
+              <img src="/brand/eliza-mark.png" alt="Eliza" className="w-10 h-10 object-contain shrink-0 group-hover:scale-105 transition-all" />
               <div className="absolute inset-x-0 mx-auto w-10 h-10 flex items-center justify-center bg-teal-700/90 rounded-xl opacity-0 group-hover:opacity-100 transition-all duration-200 cursor-pointer shadow-lg shadow-teal-600/30">
                 <Menu className="w-5 h-5 text-white animate-pulse" />
               </div>
@@ -753,7 +784,14 @@ export default function AppLayout() {
             </button>
           )}
 
-          <button 
+          {isDesktopExpanded && (
+            <InstallElizaButton
+              variant="full"
+              className="w-full mb-2 inline-flex items-center justify-center gap-2 rounded-xl bg-teal-50 border border-teal-100 shadow-sm font-bold text-[10px] uppercase tracking-widest text-teal-700 hover:bg-teal-100 transition-colors px-4 py-3"
+            />
+          )}
+
+          <button
             onClick={() => logout()}
             className={`
               w-full flex items-center rounded-xl bg-white border border-slate-100 shadow-sm font-bold text-[10px] uppercase tracking-widest text-slate-400 hover:text-red-500 transition-colors
@@ -778,6 +816,10 @@ export default function AppLayout() {
               <Link to="/terms" className="hover:text-teal-600 transition-colors whitespace-nowrap" title="Termos de Uso">
                 {isDesktopExpanded ? 'Termos de Uso' : 'Termos'}
               </Link>
+              <span className={`text-slate-200 select-none ${isDesktopExpanded ? 'inline' : 'lg:hidden'}`}>•</span>
+              <Link to="/data-deletion" className="hover:text-teal-600 transition-colors whitespace-nowrap" title="Exclusão de Dados">
+                {isDesktopExpanded ? 'Exclusão de Dados' : 'Exclusão'}
+              </Link>
             </div>
           </div>
         </div>
@@ -786,7 +828,10 @@ export default function AppLayout() {
       {/* Main Content Area */}
       <div className="flex-1 flex flex-col overflow-hidden relative">
         {/* Mobile Navbar - Premium App Style */}
-        <header className="h-16 lg:hidden bg-white/80 backdrop-blur-md border-b border-slate-200 flex items-center justify-between px-6 shrink-0 sticky top-0 z-30">
+        <header
+          className="h-16 lg:hidden bg-white/80 backdrop-blur-md border-b border-slate-200 flex items-center justify-between px-6 shrink-0 sticky top-0 z-30"
+          style={{ height: 'calc(4rem + env(safe-area-inset-top))', paddingTop: 'env(safe-area-inset-top)' }}
+        >
           <div className="flex items-center gap-3">
              <div className="w-8 h-8 bg-teal-600 rounded-xl flex items-center justify-center text-white font-bold text-sm shadow-lg shadow-teal-600/20">E</div>
              <div className="flex flex-col">
@@ -917,7 +962,10 @@ export default function AppLayout() {
         </main>
 
         {/* Mobile Bottom Navigation - iOS Style */}
-        <nav className="lg:hidden fixed bottom-0 left-0 right-0 h-20 bg-white/95 backdrop-blur-xl border-t border-slate-200 px-6 flex items-center justify-between z-40 pb-5">
+        <nav
+          className="lg:hidden fixed bottom-0 left-0 right-0 bg-white/95 backdrop-blur-xl border-t border-slate-200 px-6 flex items-center justify-between z-40"
+          style={{ height: 'calc(5rem + env(safe-area-inset-bottom))', paddingBottom: 'calc(1.25rem + env(safe-area-inset-bottom))' }}
+        >
            {mobileTabs.map((tab) => {
              const Icon = tab.icon;
              const isActive = activeView === tab.id;
@@ -950,13 +998,21 @@ export default function AppLayout() {
            })}
         </nav>
 
-        {/* PWA Install Prompt */}
+        {/* PWA Install Prompt — real install, not decorative: taps the
+            native beforeinstallprompt on Android/desktop Chrome, or opens
+            the iOS manual steps modal on Safari. */}
         {showPwaPrompt && (
-          <div className="lg:hidden fixed bottom-24 left-4 right-4 z-50">
-            <motion.div 
+          <div className="lg:hidden fixed z-50 left-4 right-4" style={{ bottom: 'calc(6rem + env(safe-area-inset-bottom))' }}>
+            <motion.button
+              type="button"
+              onClick={() => {
+                setShowPwaPrompt(false);
+                if (pwaCapability === 'native') promptInstall();
+                else setShowIosInstallSteps(true);
+              }}
               initial={{ opacity: 0, y: 50, scale: 0.9 }}
               animate={{ opacity: 1, y: 0, scale: 1 }}
-              className="bg-slate-900 text-white p-6 rounded-[2.5rem] shadow-2xl shadow-teal-900/40 flex items-center gap-4 border border-slate-700/50"
+              className="w-full bg-slate-900 text-white p-6 rounded-[2.5rem] shadow-2xl shadow-teal-900/40 flex items-center gap-4 border border-slate-700/50 text-left"
             >
               <div className="w-12 h-12 bg-teal-600 rounded-2xl flex items-center justify-center shrink-0 shadow-lg shadow-teal-600/30">
                  <UploadCloud className="w-6 h-6 text-white" />
@@ -965,15 +1021,17 @@ export default function AppLayout() {
                  <p className="text-[10px] font-black uppercase tracking-widest text-teal-400 mb-1">Instalar ELIZA</p>
                  <p className="text-xs font-medium text-slate-300 leading-tight">Adicione à tela inicial para uma experiência de aplicativo.</p>
               </div>
-              <button 
-                onClick={() => setShowPwaPrompt(false)}
-                className="w-10 h-10 flex items-center justify-center rounded-full bg-slate-800 text-slate-400"
+              <span
+                role="button"
+                onClick={(e) => { e.stopPropagation(); setShowPwaPrompt(false); }}
+                className="w-10 h-10 flex items-center justify-center rounded-full bg-slate-800 text-slate-400 shrink-0"
               >
                 <X className="w-5 h-5" />
-              </button>
-            </motion.div>
+              </span>
+            </motion.button>
           </div>
         )}
+        {showIosInstallSteps && <IosInstallSteps onClose={() => setShowIosInstallSteps(false)} />}
 
         {/* Change password modal popup */}
         {isChangingPasswordModalOpen && (

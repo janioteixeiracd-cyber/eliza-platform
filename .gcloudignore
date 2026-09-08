@@ -1,0 +1,16 @@
+# Espelha .gitignore, com UMA exceção deliberada: .env.production É
+# enviado ao Cloud Build (item 4, Etapa B1) — contém só os 2 IDs públicos
+# do app Meta (App ID/Config ID), nunca segredo. .env (dev local, com
+# chaves reais) e qualquer outro .env* continuam excluídos, igual antes.
+.gcloudignore
+.git
+.gitignore
+node_modules/
+build/
+dist/
+coverage/
+.DS_Store
+*.log
+.env*
+!.env.example
+!.env.production

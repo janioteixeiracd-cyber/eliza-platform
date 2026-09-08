@@ -4,18 +4,27 @@ import {
   GraduationCap, BookOpen, Users, Wallet, LayoutDashboard, Plus, Save, X, Trash2,
   Loader2, Search, ChevronUp, ChevronDown, Sparkles, AlertTriangle, ShieldAlert,
   Lock, Eye, EyeOff, CalendarDays, ListChecks, UserPlus, RefreshCw, Check, Wand2,
-  FileText, ThumbsUp, ThumbsDown, PenTool, Printer, Award, Image as ImageIcon
+  FileText, ThumbsUp, ThumbsDown, PenTool, Printer, Award, Image as ImageIcon,
+  Pencil, Copy, UserCog, KeyRound, Upload,
 } from 'lucide-react';
 import { useAuth } from '../../contexts/AuthContext';
 import { useNextReadOnly } from '../context/NextReadOnlyContext';
 import { secureGetDocs } from '../services/next-db';
-import { collection, query, where, limit, doc as fsDoc, setDoc, addDoc, updateDoc, deleteDoc, serverTimestamp } from 'firebase/firestore';
+import { collection, query, where, limit, doc as fsDoc, getDoc, setDoc, addDoc, updateDoc, deleteDoc, serverTimestamp } from 'firebase/firestore';
 import { db } from '../../lib/firebase';
 import { getGenAI } from '../../lib/gemini';
 import { InviteService } from '../../services/inviteService';
 import AcademyPlanningCanvas from './AcademyPlanningCanvas';
+import ClinicalFichaPanel, { type WorkspacePoint, type PointRecord } from './ClinicalFichaPanel';
+import DoseColorLegend from './DoseColorLegend';
+import NextStudentPortal from './NextStudentPortal';
+import { AcademyEnrollmentService } from '../../services/academyEnrollmentService';
+import { AcademyActivityService } from '../../services/academyActivityService';
+import { PLANNING_TEMPLATES, getTemplateForId } from '../../lib/planningTemplates';
+import { DEFAULT_DOSE_COLOR_PREFS, colorForDose, prefillPointRecord, type ToxinaWorkspacePrefs } from '../../lib/doseColorPrefs';
+import type { EducationTurma, EducationActivity, StudentAttempt, TutorPolicy, TurmaStaffRole } from '../../types/education';
 
-type AcademyTab = 'dashboard' | 'cursos' | 'pacientes' | 'alunos' | 'casos' | 'documentos' | 'financeiro';
+type AcademyTab = 'dashboard' | 'cursos' | 'pacientes' | 'alunos' | 'atividades' | 'casos' | 'documentos' | 'financeiro' | 'professores';
 
 // A real Firebase Auth account is created with this password (see
 // InviteService.createEducationStudent below) — must not be a fixed,
@@ -103,7 +112,29 @@ interface Student {
   certificateCode?: string;
   certificateIssuedAt?: any;
   createdAt?: any;
+  // Persisted plaintext copy of the last password set for this login — the
+  // real Firebase Auth password itself is never retrievable, only resettable
+  // (see the reset-student-password server endpoint).
+  tempPassword?: string;
+  mustChangePassword?: boolean;
 }
+
+interface Professor {
+  id: string;
+  name: string;
+  email?: string;
+  role: string;
+  courseRole?: string;
+  accessCourses?: boolean;
+  active?: boolean;
+  createdAt?: any;
+}
+
+const COURSE_ROLE_LABELS: Record<string, string> = {
+  admin_curso: 'Administrador do curso',
+  professor: 'Professor',
+  auxiliar: 'Monitor / Auxiliar',
+};
 
 interface StudentCase {
   id: string;
@@ -250,11 +281,20 @@ function formatCurrency(v: number): string {
 }
 function newId(prefix: string) { return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`; }
 
+const ATTEMPT_STATUS_LABELS: Record<string, { label: string; classes: string }> = {
+  draft: { label: 'Rascunho', classes: 'bg-slate-800 border-next-border text-slate-400' },
+  submitted: { label: 'Enviado', classes: 'bg-next-purple-neon/10 border-next-purple-neon/20 text-next-purple-neon' },
+  revision_requested: { label: 'Revisão solicitada', classes: 'bg-next-orange-insight/10 border-next-orange-insight/20 text-next-orange-insight' },
+  approved: { label: 'Aprovado', classes: 'bg-next-green-success/10 border-next-green-success/20 text-next-green-success' },
+};
+
 const TABS: { id: AcademyTab; label: string; icon: any }[] = [
   { id: 'dashboard', label: 'Dashboard', icon: LayoutDashboard },
   { id: 'cursos', label: 'Cursos & Aulas', icon: BookOpen },
   { id: 'pacientes', label: 'Pacientes-Modelo', icon: Users },
   { id: 'alunos', label: 'Alunos', icon: GraduationCap },
+  { id: 'professores', label: 'Professores', icon: UserCog },
+  { id: 'atividades', label: 'Atividades', icon: ListChecks },
   { id: 'casos', label: 'Casos de Alunos', icon: ListChecks },
   { id: 'documentos', label: 'Documentos', icon: FileText },
   { id: 'financeiro', label: 'Financeiro', icon: Wallet },
@@ -305,6 +345,226 @@ export default function NextAcademy() {
     }
   };
   useEffect(() => { fetchAll(); }, [clinic?.id]);
+
+  // --- Atividades (Slice 2B mínimo) ----------------------------------------
+
+  const [activitiesCourseId, setActivitiesCourseId] = useState<string>('');
+  const [turmas, setTurmas] = useState<EducationTurma[]>([]);
+  const [activitiesTurmaId, setActivitiesTurmaId] = useState<string>('');
+  const [turmaActivities, setTurmaActivities] = useState<EducationActivity[]>([]);
+  const [isNewActivityOpen, setIsNewActivityOpen] = useState(false);
+  const [newActivityForm, setNewActivityForm] = useState({ title: '', description: '', educationalObjectives: '', instructions: '', templateId: 'toxina_botulinica' as 'toxina_botulinica' | 'preenchimento_facial' });
+  const [savingActivity, setSavingActivity] = useState(false);
+  const [reviewingActivity, setReviewingActivity] = useState<EducationActivity | null>(null);
+  const [activityAttempts, setActivityAttempts] = useState<StudentAttempt[]>([]);
+  const [reviewTarget, setReviewTarget] = useState<StudentAttempt | null>(null);
+  const [reviewComments, setReviewComments] = useState('');
+  const [savingReview, setSavingReview] = useState(false);
+
+  // Clinical Learning Workspace (2026-08-29) — correção do professor com
+  // camadas: "aluna" (somente leitura, o que ela enviou), "referencia"
+  // (marcação própria do professor, opcional, editável) e "comparacao"
+  // (ficha da aluna somente leitura + camada de referência sobreposta).
+  // Nunca mescla as duas camadas num único conjunto de dados.
+  const [reviewLayer, setReviewLayer] = useState<'aluna' | 'referencia' | 'comparacao'>('aluna');
+  const [studentPoints, setStudentPoints] = useState<WorkspacePoint[]>([]);
+  const [studentSelectedPointId, setStudentSelectedPointId] = useState<string | null>(null);
+  const [professorPoints, setProfessorPoints] = useState<WorkspacePoint[]>([]);
+  const [professorPointRecords, setProfessorPointRecords] = useState<Record<string, PointRecord>>({});
+  const [professorSelectedPointId, setProfessorSelectedPointId] = useState<string | null>(null);
+  const [professorDeleteRequestId, setProfessorDeleteRequestId] = useState<string | null>(null);
+  const [professorStrokesJson, setProfessorStrokesJson] = useState<string | null>(null);
+
+  // Pure preview of the ficha template — professor/admin sees exactly what
+  // a student will see (same anatomical asset, same fixed muscle catalog or
+  // free-text região) without needing a real student attempt to exist yet.
+  // Interactive but never persisted — nothing here is written to Firestore.
+  const [previewingActivity, setPreviewingActivity] = useState<EducationActivity | null>(null);
+  const [previewPoints, setPreviewPoints] = useState<WorkspacePoint[]>([]);
+  const [previewPointRecords, setPreviewPointRecords] = useState<Record<string, PointRecord>>({});
+  const [previewSelectedPointId, setPreviewSelectedPointId] = useState<string | null>(null);
+  const [previewDeleteRequestId, setPreviewDeleteRequestId] = useState<string | null>(null);
+  const [previewStrokesJson, setPreviewStrokesJson] = useState<string | null>(null);
+  // Foto real opcional pra pré-visualização (2026-08-31, pedido pelo
+  // usuário) — o professor pode trocar a imagem fixa de referência por uma
+  // foto de verdade só pra testar/demonstrar a ficha. Puramente local
+  // (object URL), nunca sobe pro Firestore — some ao fechar o modal, igual
+  // ao resto do estado de pré-visualização.
+  const [previewCustomImageUrl, setPreviewCustomImageUrl] = useState<string | null>(null);
+  const previewImageInputRef = useRef<HTMLInputElement>(null);
+  const openWorkspacePreview = (activity: EducationActivity) => {
+    setPreviewingActivity(activity);
+    setPreviewPoints([]); setPreviewPointRecords({}); setPreviewSelectedPointId(null); setPreviewStrokesJson(null); setPreviewCustomImageUrl(null);
+  };
+  const handlePreviewImageSelected = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file) return;
+    setPreviewCustomImageUrl((prev) => { if (prev) URL.revokeObjectURL(prev); return URL.createObjectURL(file); });
+  };
+  const handlePreviewPointsChange = (points: WorkspacePoint[]) => {
+    setPreviewPoints(points);
+    setPreviewPointRecords((v) => {
+      const next: Record<string, PointRecord> = {};
+      const zones = previewingActivity ? getTemplateForId(previewingActivity.templateId).clinicalWorkspace?.muscleZones : undefined;
+      for (const p of points) {
+        if (v[p.id]) { next[p.id] = v[p.id]; continue; }
+        const prefill = prefillPointRecord(p, zones, workspacePrefs.muscleDefaults);
+        next[p.id] = { muscle: prefill?.muscle || '', unidades: prefill?.unidades || '', observacao: '' };
+      }
+      return next;
+    });
+  };
+
+  // Cor-por-dose + zonas de músculo (2026-08-30) — mesma preferência de
+  // clínica usada em Planejamento IA/Execução (ver doseColorPrefs.ts),
+  // compartilhada entre a pré-visualização do professor e a correção.
+  const [workspacePrefs, setWorkspacePrefs] = useState<ToxinaWorkspacePrefs>(DEFAULT_DOSE_COLOR_PREFS);
+  useEffect(() => {
+    if (!clinic?.id) return;
+    (async () => {
+      try {
+        const snap = await getDoc(fsDoc(db, 'clinics', clinic.id, 'settings', 'toxinaWorkspacePrefs'));
+        if (snap.exists()) {
+          const data = snap.data() as Partial<ToxinaWorkspacePrefs>;
+          setWorkspacePrefs({
+            colorRules: data.colorRules || DEFAULT_DOSE_COLOR_PREFS.colorRules,
+            muscleDefaults: data.muscleDefaults || DEFAULT_DOSE_COLOR_PREFS.muscleDefaults,
+          });
+        }
+      } catch (e) { console.error('Failed to load toxinaWorkspacePrefs:', e); }
+    })();
+  }, [clinic?.id]);
+  const handleWorkspaceColorRulesChange = async (colorRules: ToxinaWorkspacePrefs['colorRules']) => {
+    setWorkspacePrefs((v) => ({ ...v, colorRules }));
+    if (!clinic?.id) return;
+    try {
+      await setDoc(fsDoc(db, 'clinics', clinic.id, 'settings', 'toxinaWorkspacePrefs'), { colorRules }, { merge: true });
+    } catch (e) { console.error('Failed to save toxinaWorkspacePrefs:', e); }
+  };
+  const previewPointColorFor = (pointId: string) => colorForDose(previewPointRecords[pointId]?.unidades, workspacePrefs.colorRules);
+  const professorPointColorFor = (pointId: string) => colorForDose(professorPointRecords[pointId]?.unidades, workspacePrefs.colorRules);
+  const studentPointColorFor = (pointId: string, studentPointRecords: Record<string, PointRecord>) => colorForDose(studentPointRecords[pointId]?.unidades, workspacePrefs.colorRules);
+
+  const openReviewTarget = (att: StudentAttempt) => {
+    setReviewTarget(att);
+    setReviewComments('');
+    setReviewLayer('aluna');
+    setStudentPoints([]);
+    setStudentSelectedPointId(null);
+    setProfessorSelectedPointId(null);
+    setProfessorDeleteRequestId(null);
+    // A previous review's own reference (if the professor is revisiting an
+    // already-reviewed attempt) is preserved — never starts blank over real
+    // prior work.
+    const priorRef = att.professorReview?.referencePointRecords || {};
+    setProfessorPointRecords(priorRef);
+    setProfessorPoints(Object.keys(priorRef).map((id, i) => ({ id, x: 0, y: 0, order: i + 1 })));
+    setProfessorStrokesJson(att.professorReview?.drawingsJson || null);
+  };
+
+  const handleProfessorPointsChange = (points: WorkspacePoint[]) => {
+    setProfessorPoints(points);
+    setProfessorPointRecords((prev) => {
+      const next: Record<string, PointRecord> = {};
+      const zones = reviewTarget ? getTemplateForId(reviewTarget.templateId).clinicalWorkspace?.muscleZones : undefined;
+      for (const p of points) {
+        if (prev[p.id]) { next[p.id] = prev[p.id]; continue; }
+        const prefill = prefillPointRecord(p, zones, workspacePrefs.muscleDefaults);
+        next[p.id] = { muscle: prefill?.muscle || '', unidades: prefill?.unidades || '', observacao: '' };
+      }
+      return next;
+    });
+  };
+
+  useEffect(() => {
+    if (!clinic?.id || !activitiesCourseId) { setTurmas([]); return; }
+    AcademyEnrollmentService.listTurmasForCourse(clinic.id, activitiesCourseId)
+      .then(setTurmas)
+      .catch((e) => console.warn('Failed to load real turmas:', e));
+  }, [clinic?.id, activitiesCourseId]);
+
+  const fetchTurmaActivities = async () => {
+    if (!clinic?.id || !activitiesTurmaId) { setTurmaActivities([]); return; }
+    try {
+      const acts = await AcademyActivityService.listActivitiesForTurma(clinic.id, activitiesTurmaId);
+      setTurmaActivities(acts);
+    } catch (e) { console.warn('Failed to load real activities:', e); }
+  };
+  useEffect(() => { fetchTurmaActivities(); }, [clinic?.id, activitiesTurmaId]);
+
+  const handleCreateActivity = async () => {
+    if (!clinic?.id || !activitiesTurmaId || !activitiesCourseId || !user?.uid) return;
+    if (!newActivityForm.title.trim()) { showMessage('Informe um título.'); return; }
+    setSavingActivity(true);
+    try {
+      const tutorPolicy: TutorPolicy = { allowExplainBeforeSubmit: true, allowAnalyzeOwnContent: true, revealReferenceAfterReview: true };
+      await AcademyActivityService.createActivity(clinic.id, {
+        turmaId: activitiesTurmaId, courseId: activitiesCourseId, templateId: newActivityForm.templateId,
+        title: newActivityForm.title.trim(), description: newActivityForm.description,
+        educationalObjectives: newActivityForm.educationalObjectives, instructions: newActivityForm.instructions,
+        modelPatientId: null, requiredFieldKeys: [], tutorPolicy, required: true,
+        professorId: user.uid, professorName: profile?.name || null,
+      }, user.uid);
+      addAuditLog({ collection: 'education_activities', action: 'WRITE', status: 'SUCCESS', details: `Atividade "${newActivityForm.title}" (${newActivityForm.templateId}) criada (escrita real).` });
+      showMessage('Atividade criada como rascunho — publique quando estiver pronta.');
+      setNewActivityForm({ title: '', description: '', educationalObjectives: '', instructions: '', templateId: 'toxina_botulinica' });
+      setIsNewActivityOpen(false);
+      fetchTurmaActivities();
+    } catch (err: any) {
+      showMessage(`Falha ao criar: ${err?.message || err}`);
+    } finally {
+      setSavingActivity(false);
+    }
+  };
+
+  const handlePublishActivity = async (activity: EducationActivity) => {
+    if (!clinic?.id) return;
+    try {
+      await AcademyActivityService.publishActivity(clinic.id, activity.id);
+      addAuditLog({ collection: 'education_activities', action: 'WRITE', status: 'SUCCESS', details: `Atividade "${activity.title}" publicada (escrita real).` });
+      showMessage('Publicada — as alunas matriculadas nesta turma já podem ver.');
+      fetchTurmaActivities();
+    } catch (err: any) {
+      showMessage(`Falha ao publicar: ${err?.message || err}`);
+    }
+  };
+
+  const openReviewActivity = async (activity: EducationActivity) => {
+    if (!clinic?.id) return;
+    setReviewingActivity(activity);
+    try {
+      const attempts = await AcademyActivityService.listAttemptsForActivity(clinic.id, activity.id);
+      setActivityAttempts(attempts);
+    } catch (e) { console.warn('Failed to load real attempts:', e); }
+  };
+
+  const handleReview = async (decision: 'approved' | 'revision_requested') => {
+    if (!clinic?.id || !reviewingActivity || !reviewTarget || !user?.uid) return;
+    setSavingReview(true);
+    try {
+      // Reference layer is entirely optional — a professor who only wrote
+      // comments (never touched the "Referência" tab) submits with both
+      // null, exactly like before this feature existed.
+      const hasReferencePoints = Object.keys(professorPointRecords).length > 0;
+      await AcademyActivityService.reviewAttempt(clinic.id, reviewingActivity.id, reviewTarget.id, {
+        decision, comments: reviewComments.trim(),
+        drawingsJson: professorStrokesJson,
+        referencePointRecords: hasReferencePoints ? professorPointRecords : null,
+        reviewedBy: user.uid, reviewedByName: profile?.name || 'Professor',
+      });
+      addAuditLog({ collection: 'education_activities', action: 'WRITE', status: 'SUCCESS', details: `Tentativa de "${reviewTarget.studentName}" ${decision === 'approved' ? 'aprovada' : 'com revisão solicitada'} (escrita real).` });
+      showMessage(decision === 'approved' ? 'Tentativa aprovada.' : 'Revisão solicitada à aluna.');
+      setReviewTarget(null);
+      setReviewComments('');
+      const attempts = await AcademyActivityService.listAttemptsForActivity(clinic.id, reviewingActivity.id);
+      setActivityAttempts(attempts);
+    } catch (err: any) {
+      showMessage(`Falha ao registrar revisão: ${err?.message || err}`);
+    } finally {
+      setSavingReview(false);
+    }
+  };
 
   // --- Dashboard ----------------------------------------------------------
   const todayStr = new Date().toISOString().split('T')[0];
@@ -678,7 +938,7 @@ Gere exatamente ${moduleCount} módulos, cada um com 2 a 5 aulas, em ordem pedag
     if (!clinic?.id || !importSearchTerm.trim()) return;
     setSearchingImport(true);
     try {
-      const snap = await secureGetDocs<RealPatientOption>(query(collection(db, 'clinics', clinic.id, 'patients'), limit(300)), 'patients', { addAuditLog });
+      const snap = await secureGetDocs<RealPatientOption>(query(collection(db, 'clinics', clinic.id, 'patients'), limit(8000)), 'patients', { addAuditLog });
       const term = importSearchTerm.trim().toLowerCase();
       const results = snap.docs.map(d => ({ id: d.id, ...d.data() } as RealPatientOption)).filter(p => (p.name || '').toLowerCase().includes(term));
       setImportResults(results.slice(0, 8));
@@ -761,7 +1021,7 @@ Gere exatamente ${moduleCount} módulos, cada um com 2 a 5 aulas, em ordem pedag
       await InviteService.createEducationStudent(clinic.id, {
         email: email.trim(), name: name.trim(), password: password.trim(),
         courseId: courseId || undefined, batchName: batchName.trim() || undefined,
-        accessExpirationDate: accessExpirationDate || null, permissions: perms,
+        accessExpirationDate: accessExpirationDate || null, permissions: perms as Record<string, boolean>,
       });
       addAuditLog({ collection: 'education_students', action: 'WRITE', status: 'SUCCESS', details: `Login real de aluno criado para "${name.trim()}" (escrita real).` });
       setLastCreatedStudentCredentials({ name: name.trim(), email: email.trim(), password: password.trim() });
@@ -789,6 +1049,179 @@ Gere exatamente ${moduleCount} módulos, cada um com 2 a 5 aulas, em ordem pedag
     } finally {
       setUpdatingStudentId(null);
       setPendingDeleteStudentId(null);
+    }
+  };
+
+  // Editar dados cadastrais + ver/redefinir senha temporária -----------------
+
+  const [editingStudent, setEditingStudent] = useState<Student | null>(null);
+  const [editStudentForm, setEditStudentForm] = useState({ name: '', batchName: '', courseId: '', accessExpirationDate: '', status: 'ativo', ...DEFAULT_STUDENT_PERMS });
+  const [savingStudentEdit, setSavingStudentEdit] = useState(false);
+  const [revealStudentPassword, setRevealStudentPassword] = useState(false);
+  const [resettingStudentPassword, setResettingStudentPassword] = useState(false);
+  const [previewStudentId, setPreviewStudentId] = useState<string | null>(null);
+
+  const openEditStudent = (s: Student) => {
+    setEditingStudent(s);
+    setRevealStudentPassword(false);
+    setEditStudentForm({
+      name: s.name || '', batchName: s.batchName || '', courseId: s.courseId || '',
+      accessExpirationDate: s.accessExpirationDate || '', status: s.status || 'ativo',
+      permViewSchedule: s.permViewSchedule !== false, permViewPatients: s.permViewPatients !== false,
+      permEditPatientRecords: !!s.permEditPatientRecords, permAttachPhotos: s.permAttachPhotos !== false,
+      permWriteEvolution: s.permWriteEvolution !== false, permViewMaterials: s.permViewMaterials !== false,
+      permViewPlannedProcedures: s.permViewPlannedProcedures !== false, permDownloadCertificate: s.permDownloadCertificate !== false,
+      permAccessAfterEnd: !!s.permAccessAfterEnd,
+    });
+  };
+
+  const handleSaveStudentEdit = async () => {
+    if (!clinic?.id || !editingStudent) return;
+    if (!editStudentForm.name.trim()) { showMessage('Nome é obrigatório.'); return; }
+    setSavingStudentEdit(true);
+    try {
+      const { name, batchName, courseId, accessExpirationDate, status, ...perms } = editStudentForm;
+      const patch = {
+        name: name.trim(), batchName: batchName.trim() || null, courseId: courseId || null,
+        accessExpirationDate: accessExpirationDate || null, status, ...perms,
+      };
+      await updateDoc(fsDoc(db, 'clinics', clinic.id, 'education_students', editingStudent.id), { ...patch, updatedAt: serverTimestamp() });
+      setStudents(prev => prev.map(x => x.id === editingStudent.id ? { ...x, ...patch } as Student : x));
+      addAuditLog({ collection: 'education_students', action: 'WRITE', status: 'SUCCESS', details: `Dados cadastrais de "${name.trim()}" atualizados (escrita real).` });
+      showMessage('Dados do aluno salvos de verdade.');
+      setEditingStudent(null);
+    } catch (err: any) {
+      showMessage(`Falha ao gravar: ${err?.message || err}`);
+    } finally {
+      setSavingStudentEdit(false);
+    }
+  };
+
+  const handleResetStudentPassword = async () => {
+    if (!clinic?.id || !editingStudent || !user) return;
+    setResettingStudentPassword(true);
+    try {
+      const idToken = await user.getIdToken();
+      const res = await fetch('/api/eliza/academy-reset-student-password', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${idToken}` },
+        body: JSON.stringify({ clinicId: clinic.id, studentUid: editingStudent.id }),
+      });
+      const data = await res.json();
+      if (!res.ok || !data.success) throw new Error(data.error || 'Falha ao redefinir a senha.');
+      setEditingStudent(prev => prev ? { ...prev, tempPassword: data.password, mustChangePassword: true } : prev);
+      setStudents(prev => prev.map(x => x.id === editingStudent.id ? { ...x, tempPassword: data.password, mustChangePassword: true } : x));
+      setRevealStudentPassword(true);
+      addAuditLog({ collection: 'education_students', action: 'WRITE', status: 'SUCCESS', details: `Senha temporária de "${editingStudent.name}" redefinida (escrita real via Admin SDK).` });
+      showMessage('Nova senha temporária gerada de verdade.');
+    } catch (err: any) {
+      showMessage(`Falha ao redefinir senha: ${err?.message || err}`);
+    } finally {
+      setResettingStudentPassword(false);
+    }
+  };
+
+  // --- Professores / Monitores (login real, Academy + plataforma Eliza) -----
+  // A professor/monitor is just a regular clinic staff member (members/{uid})
+  // — that alone already gives full Eliza platform login, exactly like any
+  // other team member created from Painel Admin → Equipe. accessCourses:true
+  // makes the Academy tab visible; courseRole is informational plus the one
+  // value ('admin_curso') firestore.rules checks for full cross-turma access.
+  // Per-turma grading/activity rights come from education_turmas/{turmaId}/
+  // staff/{uid} (AcademyEnrollmentService.assignTurmaStaff, already built and
+  // rule-enforced in Slice 2A — just never wired to any UI until now).
+
+  const [professors, setProfessors] = useState<Professor[]>([]);
+  const [loadingProfessors, setLoadingProfessors] = useState(false);
+  const [isAddProfessorOpen, setIsAddProfessorOpen] = useState(false);
+  const [newProfessor, setNewProfessor] = useState({
+    name: '', email: '', password: generateTempPassword(), courseRole: 'professor' as 'professor' | 'auxiliar' | 'admin_curso',
+    turmaCourseId: '', selectedTurmaIds: [] as string[],
+  });
+  const [professorFormTurmas, setProfessorFormTurmas] = useState<EducationTurma[]>([]);
+  const [showProfessorPassword, setShowProfessorPassword] = useState(false);
+  const [creatingProfessor, setCreatingProfessor] = useState(false);
+  const [createProfessorError, setCreateProfessorError] = useState<string | null>(null);
+  const [lastCreatedProfessorCredentials, setLastCreatedProfessorCredentials] = useState<{ name: string; email: string; password: string } | null>(null);
+  const [pendingRevokeProfessorId, setPendingRevokeProfessorId] = useState<string | null>(null);
+  const [updatingProfessorId, setUpdatingProfessorId] = useState<string | null>(null);
+
+  const fetchProfessors = async () => {
+    if (!clinic?.id) return;
+    setLoadingProfessors(true);
+    try {
+      const snap = await secureGetDocs<Professor>(query(collection(db, 'clinics', clinic.id, 'members'), where('accessCourses', '==', true), limit(100)), 'members', { addAuditLog });
+      setProfessors(snap.docs.map(d => ({ id: d.id, ...d.data() } as Professor)));
+    } catch (err) {
+      console.warn('Failed to load real academy staff:', err);
+    } finally {
+      setLoadingProfessors(false);
+    }
+  };
+  useEffect(() => { fetchProfessors(); }, [clinic?.id]);
+
+  useEffect(() => {
+    if (!clinic?.id || !newProfessor.turmaCourseId) { setProfessorFormTurmas([]); return; }
+    AcademyEnrollmentService.listTurmasForCourse(clinic.id, newProfessor.turmaCourseId)
+      .then(setProfessorFormTurmas)
+      .catch((e) => console.warn('Failed to load real turmas for professor form:', e));
+  }, [clinic?.id, newProfessor.turmaCourseId]);
+
+  const handleCreateProfessor = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!clinic?.id || !user) return;
+    if (!newProfessor.name.trim() || !newProfessor.email.trim() || !newProfessor.password.trim()) {
+      setCreateProfessorError('Nome, e-mail e senha temporária são obrigatórios.');
+      return;
+    }
+    if (newProfessor.password.trim().length < 6) {
+      setCreateProfessorError('A senha temporária precisa ter no mínimo 6 caracteres.');
+      return;
+    }
+    setCreatingProfessor(true);
+    setCreateProfessorError(null);
+    try {
+      const result = await InviteService.createStaffMember(clinic.id, {
+        email: newProfessor.email.trim(), name: newProfessor.name.trim(), role: 'Professor',
+        password: newProfessor.password.trim(), isClinicalProvider: false,
+      });
+      if (result?.uid) {
+        await updateDoc(fsDoc(db, 'clinics', clinic.id, 'members', result.uid), {
+          accessCourses: true, courseRole: newProfessor.courseRole,
+        });
+        if (newProfessor.courseRole !== 'admin_curso' && newProfessor.selectedTurmaIds.length > 0) {
+          const turmaRole: TurmaStaffRole = newProfessor.courseRole === 'auxiliar' ? 'auxiliar' : 'professor';
+          await Promise.all(newProfessor.selectedTurmaIds.map(turmaId =>
+            AcademyEnrollmentService.assignTurmaStaff(clinic.id, turmaId, result.uid, turmaRole, user.uid)
+          ));
+        }
+      }
+      addAuditLog({ collection: 'members', action: 'WRITE', status: 'SUCCESS', details: `Login real criado para "${newProfessor.name.trim()}" (${COURSE_ROLE_LABELS[newProfessor.courseRole]}) no Academy — acesso também à plataforma Eliza (escrita real).` });
+      setLastCreatedProfessorCredentials({ name: newProfessor.name.trim(), email: newProfessor.email.trim(), password: newProfessor.password.trim() });
+      setNewProfessor({ name: '', email: '', password: generateTempPassword(), courseRole: 'professor', turmaCourseId: '', selectedTurmaIds: [] });
+      setIsAddProfessorOpen(false);
+      showMessage('Login real criado — acessa o Academy e a plataforma Eliza com a mesma senha.');
+      await fetchProfessors();
+    } catch (err: any) {
+      setCreateProfessorError(err?.message || 'Falha ao criar o professor/monitor.');
+    } finally {
+      setCreatingProfessor(false);
+    }
+  };
+
+  const handleRevokeProfessorAcademyAccess = async (p: Professor) => {
+    if (!clinic?.id) return;
+    setUpdatingProfessorId(p.id);
+    try {
+      await updateDoc(fsDoc(db, 'clinics', clinic.id, 'members', p.id), { accessCourses: false, courseRole: null });
+      setProfessors(prev => prev.filter(x => x.id !== p.id));
+      addAuditLog({ collection: 'members', action: 'WRITE', status: 'SUCCESS', details: `Acesso ao Academy de "${p.name}" revogado (escrita real). O login na plataforma Eliza continua ativo.` });
+      showMessage(`Acesso de "${p.name}" ao Academy removido (o login na Eliza continua).`);
+    } catch (err: any) {
+      showMessage(`Falha ao revogar: ${err?.message || err}`);
+    } finally {
+      setUpdatingProfessorId(null);
+      setPendingRevokeProfessorId(null);
     }
   };
 
@@ -1192,6 +1625,8 @@ Gere exatamente ${moduleCount} módulos, cada um com 2 a 5 aulas, em ordem pedag
                         </div>
                         <div className="flex items-center gap-1.5 flex-shrink-0">
                           <span className="text-[9px] font-black uppercase px-1.5 py-0.5 rounded-md border bg-slate-800 border-next-border text-slate-400">{s.status}</span>
+                          <button onClick={() => setPreviewStudentId(s.id)} title="Visualizar como este aluno" className="p-1.5 rounded-lg bg-slate-800 border border-next-border text-slate-400 hover:text-slate-200"><Eye className="w-3.5 h-3.5" /></button>
+                          <button onClick={() => openEditStudent(s)} title="Editar dados / senha" className="p-1.5 rounded-lg bg-slate-800 border border-next-border text-slate-400 hover:text-slate-200"><Pencil className="w-3.5 h-3.5" /></button>
                           {pendingDeleteStudentId === s.id ? (
                             <div className="flex items-center gap-1">
                               <button onClick={() => handleDeleteStudent(s)} disabled={updatingStudentId === s.id} className="text-[9px] font-bold text-white bg-next-red-alert px-1.5 py-1 rounded whitespace-nowrap">Confirmar</button>
@@ -1212,6 +1647,58 @@ Gere exatamente ${moduleCount} módulos, cada um com 2 a 5 aulas, em ordem pedag
                   <p className="text-xs font-bold text-next-purple-light flex items-center gap-1.5"><Lock className="w-3.5 h-3.5" /> Credenciais de "{lastCreatedStudentCredentials.name}" (conta real criada)</p>
                   <p className="text-[11px] text-slate-300 font-mono">E-mail: {lastCreatedStudentCredentials.email}</p>
                   <p className="text-[11px] text-slate-300 font-mono">Senha temporária: {lastCreatedStudentCredentials.password}</p>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* PROFESSORES / MONITORES */}
+          {activeTab === 'professores' && (
+            <div className="space-y-4">
+              <div className="next-glass-panel rounded-next-2xl p-5 space-y-3">
+                <div className="flex items-center justify-between">
+                  <h3 className="text-xs font-bold text-slate-200 flex items-center gap-2"><UserCog className="w-4 h-4 text-next-purple-neon" /> Professores & Monitores ({professors.length})</h3>
+                  <div className="flex items-center gap-2">
+                    <button onClick={fetchProfessors} className="p-2 bg-slate-900/70 border border-next-border rounded-lg text-slate-400 hover:text-slate-200"><RefreshCw className="w-3.5 h-3.5" /></button>
+                    <button onClick={() => { setCreateProfessorError(null); setIsAddProfessorOpen(true); }} className="inline-flex items-center gap-1.5 px-3 py-2 next-brand-gradient-bg text-white font-bold text-[11px] rounded-lg shadow-next-glow-purple"><UserPlus className="w-3.5 h-3.5" /> Adicionar professor/monitor</button>
+                  </div>
+                </div>
+                <p className="text-[11px] text-slate-500">Login único: quem é cadastrado aqui acessa tanto o Eliza Academy quanto a plataforma Eliza (equipe da clínica), com a mesma senha.</p>
+                {loadingProfessors ? (
+                  <p className="text-xs text-slate-500 text-center py-8">Carregando...</p>
+                ) : professors.length === 0 ? (
+                  <p className="text-xs text-slate-500 text-center py-8">Nenhum professor/monitor cadastrado ainda.</p>
+                ) : (
+                  <div className="space-y-1.5">
+                    {professors.map(p => (
+                      <div key={p.id} className="flex items-center justify-between gap-3 bg-slate-900/40 border border-next-border rounded-lg p-3">
+                        <div className="min-w-0">
+                          <p className="text-xs font-bold text-slate-200 truncate">{p.name}</p>
+                          <p className="text-[10px] text-slate-500 font-mono truncate">{p.email}</p>
+                        </div>
+                        <div className="flex items-center gap-1.5 flex-shrink-0">
+                          <span className="text-[9px] font-black uppercase px-1.5 py-0.5 rounded-md border bg-next-purple-neon/10 border-next-purple-neon/20 text-next-purple-light">{COURSE_ROLE_LABELS[p.courseRole || 'professor'] || p.courseRole}</span>
+                          {pendingRevokeProfessorId === p.id ? (
+                            <div className="flex items-center gap-1">
+                              <button onClick={() => handleRevokeProfessorAcademyAccess(p)} disabled={updatingProfessorId === p.id} className="text-[9px] font-bold text-white bg-next-red-alert px-1.5 py-1 rounded whitespace-nowrap">Confirmar</button>
+                              <button onClick={() => setPendingRevokeProfessorId(null)} className="text-slate-500"><X className="w-3.5 h-3.5" /></button>
+                            </div>
+                          ) : (
+                            <button onClick={() => setPendingRevokeProfessorId(p.id)} title="Remover acesso ao Academy (mantém login na Eliza)" className="p-1.5 rounded-lg bg-next-red-alert/10 border border-next-red-alert/20 text-next-red-alert"><Trash2 className="w-3.5 h-3.5" /></button>
+                          )}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              {lastCreatedProfessorCredentials && (
+                <div className="next-glass-panel rounded-next-2xl p-4 border-next-purple-neon/30 space-y-1.5">
+                  <p className="text-xs font-bold text-next-purple-light flex items-center gap-1.5"><Lock className="w-3.5 h-3.5" /> Credenciais de "{lastCreatedProfessorCredentials.name}" (conta real criada)</p>
+                  <p className="text-[11px] text-slate-300 font-mono">E-mail: {lastCreatedProfessorCredentials.email}</p>
+                  <p className="text-[11px] text-slate-300 font-mono">Senha temporária: {lastCreatedProfessorCredentials.password}</p>
+                  <p className="text-[10px] text-slate-500">Mesma senha para entrar tanto no Academy quanto na plataforma Eliza.</p>
                 </div>
               )}
             </div>
@@ -1299,6 +1786,197 @@ Gere exatamente ${moduleCount} módulos, cada um com 2 a 5 aulas, em ordem pedag
                   </motion.div>
                 )}
               </AnimatePresence>
+            </div>
+          )}
+
+          {/* ATIVIDADES */}
+          {activeTab === 'atividades' && (
+            <div className="space-y-4">
+              {!reviewingActivity ? (
+                <>
+                  <div className="next-glass-panel rounded-next-2xl p-4 flex flex-wrap gap-3 items-end">
+                    <div>
+                      <label className="text-[10px] font-bold text-slate-500 uppercase">Curso</label>
+                      <select value={activitiesCourseId} onChange={e => { setActivitiesCourseId(e.target.value); setActivitiesTurmaId(''); }} className="mt-1 bg-slate-900 border border-next-border rounded-lg text-xs text-slate-200 px-3 py-2 min-w-[220px]">
+                        <option value="">Selecione um curso</option>
+                        {courses.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
+                      </select>
+                    </div>
+                    <div>
+                      <label className="text-[10px] font-bold text-slate-500 uppercase">Turma</label>
+                      <select value={activitiesTurmaId} onChange={e => setActivitiesTurmaId(e.target.value)} disabled={!activitiesCourseId} className="mt-1 bg-slate-900 border border-next-border rounded-lg text-xs text-slate-200 px-3 py-2 min-w-[180px] disabled:opacity-50">
+                        <option value="">Selecione uma turma</option>
+                        {turmas.map(t => <option key={t.id} value={t.id}>{t.name}</option>)}
+                      </select>
+                    </div>
+                    {activitiesTurmaId && (
+                      <button onClick={() => setIsNewActivityOpen(true)} className="flex items-center gap-1.5 next-brand-gradient-bg text-white text-xs font-bold px-4 py-2 rounded-lg">
+                        <Plus className="w-3.5 h-3.5" /> Nova atividade
+                      </button>
+                    )}
+                  </div>
+
+                  {isNewActivityOpen && (
+                    <div className="next-glass-panel rounded-next-2xl p-5 space-y-3">
+                      <p className="text-xs font-bold text-slate-200">Nova atividade</p>
+                      <div>
+                        <label className="text-[10px] font-mono text-slate-500 uppercase">Procedimento</label>
+                        <select value={newActivityForm.templateId} onChange={e => setNewActivityForm(v => ({ ...v, templateId: e.target.value as typeof v.templateId }))} className="w-full bg-slate-900 border border-next-border rounded-lg text-xs text-slate-200 px-3 py-2 mt-1">
+                          <option value="toxina_botulinica">Toxina Botulínica</option>
+                          <option value="preenchimento_facial">Preenchimento Facial</option>
+                        </select>
+                      </div>
+                      <input value={newActivityForm.title} onChange={e => setNewActivityForm(v => ({ ...v, title: e.target.value }))} placeholder="Título (ex: Caso 1 — Toxina)" className="w-full bg-slate-900 border border-next-border rounded-lg text-xs text-slate-200 px-3 py-2" />
+                      <textarea value={newActivityForm.description} onChange={e => setNewActivityForm(v => ({ ...v, description: e.target.value }))} placeholder="Descrição" rows={2} className="w-full bg-slate-900 border border-next-border rounded-lg text-xs text-slate-200 px-3 py-2" />
+                      <textarea value={newActivityForm.educationalObjectives} onChange={e => setNewActivityForm(v => ({ ...v, educationalObjectives: e.target.value }))} placeholder="Objetivos educacionais" rows={2} className="w-full bg-slate-900 border border-next-border rounded-lg text-xs text-slate-200 px-3 py-2" />
+                      <textarea value={newActivityForm.instructions} onChange={e => setNewActivityForm(v => ({ ...v, instructions: e.target.value }))} placeholder="Instruções para a aluna" rows={2} className="w-full bg-slate-900 border border-next-border rounded-lg text-xs text-slate-200 px-3 py-2" />
+                      <div className="flex gap-2">
+                        <button onClick={() => setIsNewActivityOpen(false)} className="flex-1 bg-slate-800 text-slate-300 text-xs font-bold py-2 rounded-lg">Cancelar</button>
+                        <button onClick={handleCreateActivity} disabled={savingActivity} className="flex-1 next-brand-gradient-bg text-white text-xs font-bold py-2 rounded-lg disabled:opacity-50">{savingActivity ? 'Salvando...' : 'Criar (rascunho)'}</button>
+                      </div>
+                    </div>
+                  )}
+
+                  {activitiesTurmaId && (
+                    <div className="space-y-2">
+                      {turmaActivities.length === 0 ? (
+                        <p className="text-xs text-slate-500">Nenhuma atividade criada ainda para esta turma.</p>
+                      ) : turmaActivities.map(a => (
+                        <div key={a.id} className="next-glass-panel rounded-xl p-4 flex items-center justify-between gap-3">
+                          <div>
+                            <p className="text-xs font-bold text-slate-200">{a.title}</p>
+                            <p className="text-[10px] text-slate-500 mt-0.5">{a.status === 'draft' ? 'Rascunho — só você vê' : a.status === 'published' ? 'Publicada' : 'Encerrada'}</p>
+                          </div>
+                          <div className="flex gap-2">
+                            {getTemplateForId(a.templateId).clinicalWorkspace && (
+                              <button onClick={() => openWorkspacePreview(a)} className="text-[11px] font-bold text-next-purple-light">Pré-visualizar ficha</button>
+                            )}
+                            {a.status === 'draft' && <button onClick={() => handlePublishActivity(a)} className="text-[11px] font-bold text-next-purple-neon">Publicar</button>}
+                            <button onClick={() => openReviewActivity(a)} className="text-[11px] font-bold text-slate-300">Ver tentativas →</button>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </>
+              ) : (
+                <>
+                  <button onClick={() => { setReviewingActivity(null); setActivityAttempts([]); }} className="text-[11px] text-slate-400 hover:text-slate-200 font-semibold">← Voltar às atividades</button>
+                  <div className="next-glass-panel rounded-next-2xl p-4">
+                    <p className="text-sm font-extrabold text-slate-100">{reviewingActivity.title}</p>
+                  </div>
+                  {activityAttempts.length === 0 ? (
+                    <p className="text-xs text-slate-500">Nenhuma aluna enviou tentativa ainda.</p>
+                  ) : activityAttempts.map(att => (
+                    <div key={att.id} className="next-glass-panel rounded-xl p-4 space-y-2">
+                      <div className="flex items-center justify-between">
+                        <p className="text-xs font-bold text-slate-200">{att.studentName} — Tentativa {att.attemptNumber}</p>
+                        <span className={`px-2 py-0.5 rounded-full text-[9px] font-bold border ${ATTEMPT_STATUS_LABELS[att.status]?.classes}`}>{ATTEMPT_STATUS_LABELS[att.status]?.label}</span>
+                      </div>
+                      {att.images?.principal && <img src={att.overlayThumbnailBase64 || att.images.principal} className="w-40 rounded-lg border border-next-border" />}
+                      <p className="text-[11px] text-slate-400"><span className="font-bold text-slate-300">Análise:</span> {att.studentAnalysis || '(vazio)'}</p>
+                      <p className="text-[11px] text-slate-400"><span className="font-bold text-slate-300">Justificativa:</span> {att.justification || '(vazio)'}</p>
+                      {Object.entries(att.structuredFields || {}).length > 0 && (
+                        <div className="text-[11px] text-slate-400">
+                          {Object.entries(att.structuredFields).map(([k, v]) => <p key={k}><span className="font-bold text-slate-300">{k}:</span> {String(v)}</p>)}
+                        </div>
+                      )}
+                      {att.professorReview && (
+                        <div className="bg-slate-900/50 border border-next-border rounded-lg p-2">
+                          <p className="text-[10px] font-bold text-slate-400">Sua correção anterior</p>
+                          <p className="text-[11px] text-slate-300 mt-1">{att.professorReview.comments}</p>
+                        </div>
+                      )}
+                      {att.status === 'submitted' && (
+                        reviewTarget?.id === att.id ? (
+                          getTemplateForId(att.templateId).clinicalWorkspace ? (() => {
+                            const template = getTemplateForId(att.templateId);
+                            const ws = template.clinicalWorkspace!;
+                            const studentPointRecords = att.pointRecords || {};
+                            return (
+                              <div className="space-y-3">
+                                <div className="flex gap-1 bg-slate-950 border border-next-border rounded-lg p-1">
+                                  {(['aluna', 'referencia', 'comparacao'] as const).map((layer) => (
+                                    <button key={layer} onClick={() => setReviewLayer(layer)}
+                                      className={`flex-1 text-[10.5px] font-bold py-1.5 rounded-md capitalize ${reviewLayer === layer ? 'next-brand-gradient-bg text-white' : 'text-slate-400'}`}>
+                                      {layer === 'aluna' ? 'Aluna' : layer === 'referencia' ? 'Referência do Professor' : 'Comparação'}
+                                    </button>
+                                  ))}
+                                </div>
+
+                                <DoseColorLegend rules={workspacePrefs.colorRules} onChange={handleWorkspaceColorRulesChange} pointValueLabel={ws.pointValueLabel} />
+
+                                {reviewLayer === 'comparacao' ? (
+                                  <ClinicalFichaPanel
+                                    template={template} readOnly
+                                    caseLabel={`${att.studentName} — Tentativa ${att.attemptNumber}`}
+                                    dateLabel="" professionalLabel={att.studentName}
+                                    headerFieldValues={att.structuredFields || {}}
+                                    points={Object.keys(studentPointRecords).map((id, i) => ({ id, x: 0, y: 0, order: i + 1 }))}
+                                    pointRecords={studentPointRecords}
+                                    selectedPointId={null} onSelectPoint={() => {}}
+                                    observations={att.observations || ''}
+                                    compareLayer={{ label: 'Referência do professor', points: professorPoints, pointRecords: professorPointRecords }}
+                                  />
+                                ) : (
+                                  <div className="grid grid-cols-1 lg:grid-cols-2 gap-3 items-start">
+                                    <ClinicalFichaPanel
+                                      template={template}
+                                      readOnly={reviewLayer === 'aluna'}
+                                      caseLabel={`${att.studentName} — Tentativa ${att.attemptNumber}`}
+                                      dateLabel="" professionalLabel={reviewLayer === 'aluna' ? att.studentName : (profile?.name || 'Professor')}
+                                      headerFieldValues={reviewLayer === 'aluna' ? (att.structuredFields || {}) : {}}
+                                      points={reviewLayer === 'aluna' ? studentPoints : professorPoints}
+                                      pointRecords={reviewLayer === 'aluna' ? studentPointRecords : professorPointRecords}
+                                      onPointRecordChange={reviewLayer === 'referencia' ? (id, patch) => setProfessorPointRecords(prev => ({ ...prev, [id]: { ...(prev[id] || { muscle: '', unidades: '', observacao: '' }), ...patch } })) : undefined}
+                                      onDeletePoint={reviewLayer === 'referencia' ? (id) => setProfessorDeleteRequestId(id) : undefined}
+                                      selectedPointId={reviewLayer === 'aluna' ? studentSelectedPointId : professorSelectedPointId}
+                                      onSelectPoint={reviewLayer === 'aluna' ? setStudentSelectedPointId : setProfessorSelectedPointId}
+                                      observations={reviewLayer === 'aluna' ? (att.observations || '') : ''}
+                                    />
+                                    <div className="next-glass-panel rounded-next-2xl p-4">
+                                      <p className="text-[10px] font-bold text-slate-500 uppercase mb-2">{reviewLayer === 'aluna' ? 'Mapa da aluna — somente leitura' : 'Sua marcação de referência (opcional)'}</p>
+                                      <AcademyPlanningCanvas
+                                        key={reviewLayer}
+                                        imageUrl={ws.anatomicalAssetUrl}
+                                        initialDrawingsJson={(reviewLayer === 'aluna' ? att.strokesJson : professorStrokesJson) || undefined}
+                                        enabledTools={template.executionCanvasTools}
+                                        readOnly={reviewLayer === 'aluna'}
+                                        onPointsChange={reviewLayer === 'aluna' ? setStudentPoints : handleProfessorPointsChange}
+                                        selectedPointId={reviewLayer === 'aluna' ? studentSelectedPointId : professorSelectedPointId}
+                                        onSelectPoint={reviewLayer === 'aluna' ? setStudentSelectedPointId : setProfessorSelectedPointId}
+                                        deleteRequestedPointId={reviewLayer === 'referencia' ? professorDeleteRequestId : undefined}
+                                        onSavePlanning={(drawingsJson) => setProfessorStrokesJson(drawingsJson)}
+                                        pointColorFor={reviewLayer === 'aluna' ? (id) => studentPointColorFor(id, studentPointRecords) : professorPointColorFor}
+                                      />
+                                    </div>
+                                  </div>
+                                )}
+
+                                <textarea value={reviewComments} onChange={e => setReviewComments(e.target.value)} placeholder="Comentários / correção" rows={3} className="w-full bg-slate-900 border border-next-border rounded-lg text-xs text-slate-200 px-3 py-2" />
+                                <div className="flex gap-2">
+                                  <button onClick={() => handleReview('revision_requested')} disabled={savingReview} className="flex-1 bg-next-orange-insight/20 text-next-orange-insight text-[11px] font-bold py-2 rounded-lg disabled:opacity-50 flex items-center justify-center gap-1"><ThumbsDown className="w-3.5 h-3.5" /> Solicitar revisão</button>
+                                  <button onClick={() => handleReview('approved')} disabled={savingReview} className="flex-1 bg-next-green-success/20 text-next-green-success text-[11px] font-bold py-2 rounded-lg disabled:opacity-50 flex items-center justify-center gap-1"><ThumbsUp className="w-3.5 h-3.5" /> Aprovar</button>
+                                </div>
+                              </div>
+                            );
+                          })() : (
+                            <div className="space-y-2">
+                              <textarea value={reviewComments} onChange={e => setReviewComments(e.target.value)} placeholder="Comentários / correção" rows={3} className="w-full bg-slate-900 border border-next-border rounded-lg text-xs text-slate-200 px-3 py-2" />
+                              <div className="flex gap-2">
+                                <button onClick={() => handleReview('revision_requested')} disabled={savingReview} className="flex-1 bg-next-orange-insight/20 text-next-orange-insight text-[11px] font-bold py-2 rounded-lg disabled:opacity-50 flex items-center justify-center gap-1"><ThumbsDown className="w-3.5 h-3.5" /> Solicitar revisão</button>
+                                <button onClick={() => handleReview('approved')} disabled={savingReview} className="flex-1 bg-next-green-success/20 text-next-green-success text-[11px] font-bold py-2 rounded-lg disabled:opacity-50 flex items-center justify-center gap-1"><ThumbsUp className="w-3.5 h-3.5" /> Aprovar</button>
+                              </div>
+                            </div>
+                          )
+                        ) : (
+                          <button onClick={() => openReviewTarget(att)} className="text-[11px] font-bold text-next-purple-neon">Corrigir esta tentativa →</button>
+                        )
+                      )}
+                    </div>
+                  ))}
+                </>
+              )}
             </div>
           )}
 
@@ -1929,6 +2607,249 @@ Gere exatamente ${moduleCount} módulos, cada um com 2 a 5 aulas, em ordem pedag
                 <button type="submit" disabled={creatingStudent} className="w-full inline-flex items-center justify-center gap-2 px-3 py-2.5 next-brand-gradient-bg text-white font-bold text-xs rounded-xl shadow-next-glow-purple disabled:opacity-60" style={{ minHeight: '40px' }}>
                   {creatingStudent ? <Loader2 className="w-4 h-4 animate-spin" /> : <UserPlus className="w-3.5 h-3.5" />}
                   <span>{creatingStudent ? 'Criando conta real...' : 'Criar login real do aluno'}</span>
+                </button>
+              </form>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* EDIT STUDENT MODAL — dados cadastrais + ver/redefinir senha */}
+      <AnimatePresence>
+        {editingStudent && (
+          <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4" onClick={() => !savingStudentEdit && setEditingStudent(null)}>
+            <motion.div initial={{ opacity: 0, scale: 0.96 }} animate={{ opacity: 1, scale: 1 }} exit={{ opacity: 0, scale: 0.96 }} onClick={(e) => e.stopPropagation()} className="w-full max-w-md next-glass-panel rounded-next-2xl p-6 max-h-[92vh] overflow-y-auto">
+              <div className="flex items-center justify-between mb-4">
+                <h3 className="text-sm font-bold text-slate-100 flex items-center gap-2"><Pencil className="w-4 h-4 text-next-purple-neon" /> Editar aluno</h3>
+                <button onClick={() => setEditingStudent(null)} className="text-slate-500 hover:text-slate-300"><X className="w-4 h-4" /></button>
+              </div>
+
+              <div className="bg-slate-900/60 border border-next-border rounded-lg p-3 mb-4 space-y-2">
+                <p className="text-[10px] font-mono text-slate-500 uppercase flex items-center gap-1.5"><KeyRound className="w-3.5 h-3.5" /> Senha temporária</p>
+                {editingStudent.tempPassword ? (
+                  <div className="flex items-center gap-2">
+                    <code className="flex-1 text-[11px] text-slate-200 bg-slate-950 border border-next-border rounded px-2 py-1.5 font-mono truncate">{revealStudentPassword ? editingStudent.tempPassword : '••••••••••'}</code>
+                    <button type="button" onClick={() => setRevealStudentPassword(v => !v)} className="text-slate-500 hover:text-slate-300 flex-shrink-0">{revealStudentPassword ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}</button>
+                    <button type="button" onClick={() => { navigator.clipboard.writeText(editingStudent.tempPassword || ''); showMessage('Senha copiada.'); }} className="text-slate-500 hover:text-slate-300 flex-shrink-0"><Copy className="w-3.5 h-3.5" /></button>
+                  </div>
+                ) : (
+                  <p className="text-[11px] text-slate-500">Nenhuma senha conhecida (foi criada antes desta funcionalidade, ou já foi trocada pelo aluno). Gere uma nova abaixo.</p>
+                )}
+                <button type="button" onClick={handleResetStudentPassword} disabled={resettingStudentPassword} className="w-full inline-flex items-center justify-center gap-1.5 px-3 py-2 bg-slate-800 hover:bg-slate-700 border border-next-border text-slate-200 font-bold text-[11px] rounded-lg disabled:opacity-60">
+                  {resettingStudentPassword ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <RefreshCw className="w-3.5 h-3.5" />}
+                  {resettingStudentPassword ? 'Gerando nova senha...' : 'Gerar nova senha temporária'}
+                </button>
+                <p className="text-[9.5px] text-slate-600">Isso troca a senha real de login do aluno agora — a senha antiga deixa de funcionar.</p>
+              </div>
+
+              <div className="space-y-3">
+                <div>
+                  <label className="text-[10px] font-mono text-slate-500 uppercase">Nome completo</label>
+                  <input value={editStudentForm.name} onChange={(e) => setEditStudentForm(v => ({ ...v, name: e.target.value }))} className="w-full bg-slate-900 border border-next-border rounded-lg text-xs text-slate-200 px-3 py-2.5 mt-1" />
+                </div>
+                <div>
+                  <label className="text-[10px] font-mono text-slate-500 uppercase">E-mail</label>
+                  <input value={editingStudent.email || ''} disabled className="w-full bg-slate-900/50 border border-next-border rounded-lg text-xs text-slate-500 px-3 py-2.5 mt-1 cursor-not-allowed" />
+                  <p className="text-[9.5px] text-slate-600 mt-1">E-mail de login não pode ser trocado por aqui.</p>
+                </div>
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <label className="text-[10px] font-mono text-slate-500 uppercase">Curso</label>
+                    <select value={editStudentForm.courseId} onChange={(e) => setEditStudentForm(v => ({ ...v, courseId: e.target.value }))} className="w-full bg-slate-900 border border-next-border rounded-lg text-xs text-slate-200 px-3 py-2.5 mt-1">
+                      <option value="">— Nenhum —</option>
+                      {courses.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
+                    </select>
+                  </div>
+                  <div>
+                    <label className="text-[10px] font-mono text-slate-500 uppercase">Turma</label>
+                    <input value={editStudentForm.batchName} onChange={(e) => setEditStudentForm(v => ({ ...v, batchName: e.target.value }))} className="w-full bg-slate-900 border border-next-border rounded-lg text-xs text-slate-200 px-3 py-2.5 mt-1" />
+                  </div>
+                </div>
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <label className="text-[10px] font-mono text-slate-500 uppercase">Status</label>
+                    <select value={editStudentForm.status} onChange={(e) => setEditStudentForm(v => ({ ...v, status: e.target.value }))} className="w-full bg-slate-900 border border-next-border rounded-lg text-xs text-slate-200 px-3 py-2.5 mt-1">
+                      <option value="ativo">Ativo</option>
+                      <option value="inativo">Inativo</option>
+                      <option value="concluido">Concluído</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label className="text-[10px] font-mono text-slate-500 uppercase">Acesso expira em</label>
+                    <input type="date" value={editStudentForm.accessExpirationDate} onChange={(e) => setEditStudentForm(v => ({ ...v, accessExpirationDate: e.target.value }))} className="w-full bg-slate-900 border border-next-border rounded-lg text-xs text-slate-200 px-3 py-2.5 mt-1" />
+                  </div>
+                </div>
+
+                <div className="pt-2 border-t border-next-border">
+                  <p className="text-[10px] font-mono text-slate-500 uppercase mb-2">O que este aluno pode fazer</p>
+                  <div className="space-y-1.5">
+                    {STUDENT_PERMISSIONS.map(p => (
+                      <label key={String(p.key)} className="flex items-center gap-2.5 bg-slate-900/40 border border-next-border rounded-lg px-3 py-2 cursor-pointer">
+                        <input type="checkbox" checked={!!(editStudentForm as any)[p.key]} onChange={(e) => setEditStudentForm(v => ({ ...v, [p.key]: e.target.checked }))} className="w-4 h-4 rounded flex-shrink-0" />
+                        <span className="text-[10.5px] text-slate-300">{p.label}</span>
+                      </label>
+                    ))}
+                  </div>
+                </div>
+
+                <button onClick={handleSaveStudentEdit} disabled={savingStudentEdit} className="w-full inline-flex items-center justify-center gap-2 px-3 py-2.5 next-brand-gradient-bg text-white font-bold text-xs rounded-xl shadow-next-glow-purple disabled:opacity-60">
+                  {savingStudentEdit ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-3.5 h-3.5" />}
+                  <span>{savingStudentEdit ? 'Salvando...' : 'Salvar alterações'}</span>
+                </button>
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* STUDENT PREVIEW OVERLAY — admin viewing the real Student Portal, read-only */}
+      <AnimatePresence>
+        {previewStudentId && (
+          <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="fixed inset-0 z-50 bg-slate-950 overflow-y-auto">
+            <div className="sticky top-0 z-10 bg-slate-950/95 backdrop-blur border-b border-next-border px-4 py-3 flex items-center justify-between">
+              <p className="text-xs font-bold text-slate-300 flex items-center gap-2"><Eye className="w-4 h-4 text-next-purple-neon" /> Visualizando como aluno — somente leitura</p>
+              <button onClick={() => setPreviewStudentId(null)} className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-slate-800 hover:bg-slate-700 border border-next-border text-slate-200 font-bold text-[11px] rounded-lg"><X className="w-3.5 h-3.5" /> Sair da visualização</button>
+            </div>
+            <div className="p-4">
+              <NextStudentPortal previewStudentId={previewStudentId} />
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* WORKSPACE FICHA PREVIEW — the exact ficha+mapa a student sees when
+          opening this activity, shown for the professor with NO real
+          student attempt required. Interactive so the professor can click
+          around and understand the feature, but nothing here is ever
+          written to Firestore — closing it just discards the scratch state. */}
+      <AnimatePresence>
+        {previewingActivity && (() => {
+          const template = getTemplateForId(previewingActivity.templateId);
+          const ws = template.clinicalWorkspace;
+          if (!ws) return null;
+          return (
+            <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="fixed inset-0 z-50 bg-slate-950 overflow-y-auto">
+              <div className="sticky top-0 z-10 bg-slate-950/95 backdrop-blur border-b border-next-border px-4 py-3 flex items-center justify-between gap-3">
+                <p className="text-xs font-bold text-slate-300 flex items-center gap-2"><Eye className="w-4 h-4 text-next-purple-neon" /> Pré-visualização da ficha — {previewingActivity.title}</p>
+                <button onClick={() => { if (previewCustomImageUrl) URL.revokeObjectURL(previewCustomImageUrl); setPreviewCustomImageUrl(null); setPreviewingActivity(null); }} className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-slate-800 hover:bg-slate-700 border border-next-border text-slate-200 font-bold text-[11px] rounded-lg flex-shrink-0"><X className="w-3.5 h-3.5" /> Fechar</button>
+              </div>
+              <div className="p-4 max-w-5xl mx-auto space-y-3">
+                <div className="bg-amber-500/10 border border-amber-500/25 rounded-xl p-3 space-y-2">
+                  <p className="text-[11px] text-amber-300">Isto é só uma pré-visualização de como a aluna verá esta ficha — pode clicar e marcar pontos livremente pra entender o funcionamento, nada aqui é gravado.</p>
+                  <div className="flex items-center gap-3">
+                    <input ref={previewImageInputRef} type="file" accept="image/*" onChange={handlePreviewImageSelected} className="hidden" />
+                    <button type="button" onClick={() => previewImageInputRef.current?.click()} className="inline-flex items-center gap-1.5 text-[10.5px] font-bold text-amber-300 underline">
+                      <Upload className="w-3 h-3" /> {previewCustomImageUrl ? 'Trocar foto' : 'Usar uma foto real em vez da imagem de referência'}
+                    </button>
+                    {previewCustomImageUrl && (
+                      <button type="button" onClick={() => { URL.revokeObjectURL(previewCustomImageUrl); setPreviewCustomImageUrl(null); }} className="text-[10.5px] font-bold text-amber-300 underline">
+                        Voltar pra imagem de referência
+                      </button>
+                    )}
+                  </div>
+                </div>
+                <DoseColorLegend rules={workspacePrefs.colorRules} onChange={handleWorkspaceColorRulesChange} pointValueLabel={ws.pointValueLabel} />
+                <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 items-start">
+                  <ClinicalFichaPanel
+                    template={template}
+                    caseLabel={previewingActivity.title}
+                    dateLabel={new Date().toLocaleDateString('pt-BR')}
+                    professionalLabel="(pré-visualização)"
+                    headerFieldValues={{}}
+                    onHeaderFieldChange={() => {}}
+                    points={previewPoints}
+                    pointRecords={previewPointRecords}
+                    onPointRecordChange={(id, patch) => setPreviewPointRecords(v => ({ ...v, [id]: { ...(v[id] || { muscle: '', unidades: '', observacao: '' }), ...patch } }))}
+                    onDeletePoint={(id) => setPreviewDeleteRequestId(id)}
+                    selectedPointId={previewSelectedPointId}
+                    onSelectPoint={setPreviewSelectedPointId}
+                    observations=""
+                    hideObservations
+                  />
+                  <AcademyPlanningCanvas
+                    imageUrl={previewCustomImageUrl || ws.anatomicalAssetUrl}
+                    initialDrawingsJson={previewStrokesJson || undefined}
+                    enabledTools={template.executionCanvasTools}
+                    onPointsChange={handlePreviewPointsChange}
+                    selectedPointId={previewSelectedPointId}
+                    onSelectPoint={setPreviewSelectedPointId}
+                    deleteRequestedPointId={previewDeleteRequestId}
+                    onSavePlanning={(drawingsJson) => setPreviewStrokesJson(drawingsJson)}
+                    pointColorFor={previewPointColorFor}
+                  />
+                </div>
+              </div>
+            </motion.div>
+          );
+        })()}
+      </AnimatePresence>
+
+      {/* NEW PROFESSOR/MONITOR MODAL */}
+      <AnimatePresence>
+        {isAddProfessorOpen && (
+          <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4" onClick={() => !creatingProfessor && setIsAddProfessorOpen(false)}>
+            <motion.div initial={{ opacity: 0, scale: 0.96 }} animate={{ opacity: 1, scale: 1 }} exit={{ opacity: 0, scale: 0.96 }} onClick={(e) => e.stopPropagation()} className="w-full max-w-md next-glass-panel rounded-next-2xl p-6 max-h-[92vh] overflow-y-auto">
+              <div className="flex items-center justify-between mb-1">
+                <h3 className="text-sm font-bold text-slate-100 flex items-center gap-2"><UserPlus className="w-4 h-4 text-next-purple-neon" /> Adicionar professor/monitor</h3>
+                <button onClick={() => !creatingProfessor && setIsAddProfessorOpen(false)} className="text-slate-500 hover:text-slate-300"><X className="w-4 h-4" /></button>
+              </div>
+              <p className="text-[11px] text-amber-400/90 mb-4 flex items-center gap-1.5"><AlertTriangle className="w-3.5 h-3.5 flex-shrink-0" /> Isto cria um login real (Firebase Auth) com acesso ao Academy e à plataforma Eliza.</p>
+
+              <form onSubmit={handleCreateProfessor} className="space-y-3">
+                <div>
+                  <label className="text-[10px] font-mono text-slate-500 uppercase">Nome completo *</label>
+                  <input autoFocus value={newProfessor.name} onChange={(e) => setNewProfessor(v => ({ ...v, name: e.target.value }))} className="w-full bg-slate-900 border border-next-border rounded-lg text-xs text-slate-200 px-3 py-2.5 mt-1" />
+                </div>
+                <div>
+                  <label className="text-[10px] font-mono text-slate-500 uppercase">E-mail *</label>
+                  <input type="email" value={newProfessor.email} onChange={(e) => setNewProfessor(v => ({ ...v, email: e.target.value }))} className="w-full bg-slate-900 border border-next-border rounded-lg text-xs text-slate-200 px-3 py-2.5 mt-1" />
+                </div>
+                <div>
+                  <label className="text-[10px] font-mono text-slate-500 uppercase">Senha temporária *</label>
+                  <div className="relative mt-1">
+                    <input type={showProfessorPassword ? 'text' : 'password'} value={newProfessor.password} onChange={(e) => setNewProfessor(v => ({ ...v, password: e.target.value }))} className="w-full bg-slate-900 border border-next-border rounded-lg text-xs text-slate-200 px-3 py-2.5 pr-9" />
+                    <button type="button" onClick={() => setShowProfessorPassword(v => !v)} className="absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-500 hover:text-slate-300">
+                      {showProfessorPassword ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
+                    </button>
+                  </div>
+                </div>
+                <div>
+                  <label className="text-[10px] font-mono text-slate-500 uppercase">Nível de acesso no Academy</label>
+                  <select value={newProfessor.courseRole} onChange={(e) => setNewProfessor(v => ({ ...v, courseRole: e.target.value as any, selectedTurmaIds: [] }))} className="w-full bg-slate-900 border border-next-border rounded-lg text-xs text-slate-200 px-3 py-2.5 mt-1">
+                    <option value="professor">Professor (turmas específicas)</option>
+                    <option value="auxiliar">Monitor / Auxiliar (turmas específicas)</option>
+                    <option value="admin_curso">Administrador do curso (todas as turmas)</option>
+                  </select>
+                </div>
+
+                {newProfessor.courseRole !== 'admin_curso' && (
+                  <div className="pt-2 border-t border-next-border space-y-2">
+                    <label className="text-[10px] font-mono text-slate-500 uppercase">Vincular a turmas (opcional agora, dá pra fazer depois)</label>
+                    <select value={newProfessor.turmaCourseId} onChange={(e) => setNewProfessor(v => ({ ...v, turmaCourseId: e.target.value, selectedTurmaIds: [] }))} className="w-full bg-slate-900 border border-next-border rounded-lg text-xs text-slate-200 px-3 py-2.5">
+                      <option value="">Selecione um curso para listar as turmas...</option>
+                      {courses.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
+                    </select>
+                    {newProfessor.turmaCourseId && (
+                      professorFormTurmas.length === 0 ? (
+                        <p className="text-[11px] text-slate-500">Nenhuma turma cadastrada para este curso ainda.</p>
+                      ) : (
+                        <div className="space-y-1.5">
+                          {professorFormTurmas.map(t => (
+                            <label key={t.id} className="flex items-center gap-2.5 bg-slate-900/40 border border-next-border rounded-lg px-3 py-2 cursor-pointer">
+                              <input type="checkbox" checked={newProfessor.selectedTurmaIds.includes(t.id)} onChange={(e) => setNewProfessor(v => ({ ...v, selectedTurmaIds: e.target.checked ? [...v.selectedTurmaIds, t.id] : v.selectedTurmaIds.filter(id => id !== t.id) }))} className="w-4 h-4 rounded flex-shrink-0" />
+                              <span className="text-[10.5px] text-slate-300">{t.name}</span>
+                            </label>
+                          ))}
+                        </div>
+                      )
+                    )}
+                  </div>
+                )}
+
+                {createProfessorError && <p className="text-[11px] text-next-red-alert bg-next-red-alert/10 border border-next-red-alert/20 rounded-lg p-2">{createProfessorError}</p>}
+                <button type="submit" disabled={creatingProfessor} className="w-full inline-flex items-center justify-center gap-2 px-3 py-2.5 next-brand-gradient-bg text-white font-bold text-xs rounded-xl shadow-next-glow-purple disabled:opacity-60" style={{ minHeight: '40px' }}>
+                  {creatingProfessor ? <Loader2 className="w-4 h-4 animate-spin" /> : <UserPlus className="w-3.5 h-3.5" />}
+                  <span>{creatingProfessor ? 'Criando conta real...' : 'Criar login real'}</span>
                 </button>
               </form>
             </motion.div>

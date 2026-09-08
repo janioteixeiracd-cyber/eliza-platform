@@ -1,99 +1,121 @@
-import React from 'react';
-import { motion } from 'motion/react';
-import { ShieldAlert, ArrowLeft, Lock, FileText, CheckCircle } from 'lucide-react';
-import { useNavigate } from 'react-router-dom';
+/**
+ * Política de Privacidade pública (`/privacy`) — conteúdo/layout/CSS
+ * copiados literalmente do pacote premium aprovado
+ * (eliza-premium-entrega/app/privacy/page.tsx), fonte canônica. Rota
+ * preservada, pública, sem autenticação.
+ *
+ * Correções de texto autorizadas (rodada de refinamento pré-deploy):
+ * Seção 3 — WABA ID/Phone Number ID reenquadrados como "identificadores
+ * técnicos da integração" (com Business ID), em vez de categoria solta;
+ * Seção 4 — acrescentada frase neutra permitindo outras permissões
+ * técnicas além de `whatsapp_business_messaging`/`_management`, sem
+ * afirmar que só essas duas existirão sempre; Seção 10 — não afirma mais
+ * revogação automática de token ("...armazenados de forma protegida e
+ * revogados quando a conexão for encerrada" implicava automação que não
+ * existe); Seção 11 — mantida (já corrigida numa rodada anterior): o
+ * pacote original afirmava que a ELIZA "revoga ou elimina credenciais
+ * técnicas" ao desconectar — o backend real (POST
+ * /api/whatsapp/manual-disconnect) só apaga o documento da integração no
+ * Firestore; revogação/eliminação real do token é procedimento
+ * administrativo manual, nunca automático nesse momento. Nenhum outro
+ * trecho, seção, layout ou link foi alterado.
+ *
+ * Adaptação técnica: `next/link` → `Link` do react-router; wrapper
+ * `.eliza-premium-landing` (ver publicLandingLegal.css).
+ */
+import type { ReactNode } from 'react';
+import { Link } from 'react-router-dom';
+import './publicLandingLegal.css';
+
+function Header() {
+  return (
+    <header className="info-nav">
+      <Link to="/"><img src="/eliza-wordmark.png" alt="ELIZA" /></Link>
+      <Link to="/" className="info-back">← Voltar ao início</Link>
+    </header>
+  );
+}
+function Callout({ title, children }: { title: string; children: ReactNode }) {
+  return <aside className="legal-callout"><strong>{title}</strong><p>{children}</p></aside>;
+}
+function Section({ n, title, children }: { n: string; title: string; children: ReactNode }) {
+  return <section><h2><span>{n.padStart(2, "0")}</span>{title}</h2>{children}</section>;
+}
+function Footer() {
+  return (
+    <footer className="info-footer">
+      <span>ELIZA Clínica Inteligente</span>
+      <nav><Link to="/company">A empresa</Link><Link to="/terms">Termos</Link><Link to="/data-deletion">Exclusão de dados</Link></nav>
+    </footer>
+  );
+}
 
 export default function PrivacyPolicyView() {
-  const navigate = useNavigate();
-
   return (
-    <div className="min-h-screen bg-slate-50 flex items-center justify-center py-12 px-6 bg-[radial-gradient(circle_at_top_right,_var(--tw-gradient-stops))] from-slate-100 via-slate-50 to-white text-left font-sans">
-      <motion.div 
-        initial={{ opacity: 0, y: 15 }}
-        animate={{ opacity: 1, y: 0 }}
-        className="max-w-3xl w-full bg-white p-8 sm:p-12 rounded-[2.5rem] shadow-2xl border border-slate-200/60 relative overflow-hidden flex flex-col gap-8"
-      >
-        {/* Decorative border */}
-        <div className="absolute top-0 left-0 right-0 h-2 bg-gradient-to-r from-teal-500 to-emerald-500" />
+    <main className="eliza-premium-landing info-page">
+      <Header />
+      <article className="info-content wide-legal">
+        <p className="section-kicker">PRIVACIDADE • LGPD • META PLATFORM DATA</p>
+        <h1>Política de Privacidade</h1>
+        <p className="info-lead">Como a ELIZA trata dados de clínicas, profissionais e pacientes, inclusive informações processadas por meio da WhatsApp Business Platform.</p>
 
-        {/* Header */}
-        <div className="space-y-3">
-          <div className="flex items-center justify-between">
-            <span className="px-3.5 py-1.5 bg-emerald-55 border border-emerald-500/20 text-emerald-700 rounded-full text-[9px] font-black uppercase tracking-widest leading-none inline-flex items-center gap-1.5 shadow-sm">
-              <Lock className="w-3.5 h-3.5" /> Segurança Máxima (LGPD)
-            </span>
-            <button 
-              onClick={() => navigate('/')}
-              className="text-slate-400 hover:text-slate-600 transition-all text-xs font-bold uppercase tracking-wider flex items-center gap-1 bg-transparent border-none cursor-pointer"
-            >
-              <ArrowLeft className="w-3.5 h-3.5" /> Voltar
-            </button>
+        <Callout title="Identificação do operador">ELIZA Clínica Inteligente, operada por JANIO TEIXEIRA DA SILVA JUNIOR LTDA, CNPJ 37.421.772/0001-07, Rua Pedro Celestino, 949, Centro, Fátima do Sul – MS, CEP 79700-000. Contato de privacidade: <a href="mailto:admin@elizaclinic.com.br">admin@elizaclinic.com.br</a>.</Callout>
+
+        <Section n="1" title="Papéis e responsabilidades"><p>Para dados de pacientes, a clínica contratante atua, em regra, como controladora e a ELIZA como operadora, tratando dados sob instruções documentadas da clínica. Para cadastro, autenticação, segurança, suporte, contratação e faturamento dos próprios usuários da plataforma, a ELIZA atua como controladora.</p></Section>
+
+        <Section n="2" title="Categorias de dados">
+          <ul>
+            <li>Identificação e contato: nome, telefone, e-mail, endereço e dados cadastrais.</li>
+            <li>Dados clínicos e sensíveis: anamnese, histórico, exames, fotografias, planejamento, diagnóstico, termos e evoluções.</li>
+            <li>Dados financeiros administrativos: lançamentos, cobranças e situação de pagamentos.</li>
+            <li>Dados de usuários: nome, e-mail, função, clínica, permissões e registros de autenticação.</li>
+            <li>Dados técnicos: IP, dispositivo, logs de segurança, eventos, falhas e auditoria.</li>
+          </ul>
+        </Section>
+
+        <Section n="3" title="Dados recebidos da Meta e do WhatsApp">
+          <p>Quando uma clínica conecta sua conta por fluxo autorizado da Meta, a ELIZA poderá processar, conforme as funções ativadas:</p>
+          <ul>
+            <li>identificadores técnicos da integração, incluindo Business ID, WABA ID e Phone Number ID;</li>
+            <li>nome, número e informações do perfil comercial conectado;</li>
+            <li>modelos de mensagem, categorias, idiomas e status de aprovação;</li>
+            <li>conteúdo de mensagens enviadas e recebidas, número do remetente/destinatário, nome de perfil informado, data e contexto da conversa;</li>
+            <li>mídias e documentos enviados na conversa, quando a clínica habilitar esse processamento;</li>
+            <li>status de envio, entrega, leitura, falha e eventos recebidos por webhook;</li>
+            <li>tokens e credenciais técnicas necessários à integração, protegidos e com acesso restrito.</li>
+          </ul>
+        </Section>
+
+        <Section n="4" title="Permissões da Meta">
+          <div className="permission-grid">
+            <div><code>whatsapp_business_messaging</code><p>Usada para receber mensagens, responder pacientes, enviar templates aprovados e apresentar status de entrega dentro da clínica autorizada.</p></div>
+            <div><code>whatsapp_business_management</code><p>Usada para conectar e administrar, em nome da clínica, WABAs, números, perfis, templates e configurações necessárias ao serviço contratado.</p></div>
           </div>
-          <h1 className="text-2xl sm:text-3xl font-black text-slate-900 tracking-tight leading-tight uppercase font-sans mt-2">
-            Política de Privacidade
-          </h1>
-          <p className="text-[11px] text-slate-400 font-bold uppercase tracking-widest leading-normal">
-            Compromisso com o sigilo, integridade e proteção de dados clínicos do paciente
-          </p>
-        </div>
+          <p>A ELIZA solicita apenas permissões necessárias às funções oferecidas. A autorização não transfere à ELIZA a propriedade da conta, do número ou do relacionamento da clínica com seus pacientes.</p>
+          <p>Outras permissões técnicas poderão ser utilizadas quando necessárias para conectar, administrar e monitorar a solução autorizada pela clínica, sempre limitadas às funcionalidades efetivamente oferecidas e às autorizações concedidas.</p>
+        </Section>
 
-        {/* Actual Content in Markdown style styled with Tailwind */}
-        <div className="space-y-6 text-xs text-slate-600 leading-relaxed max-h-[450px] overflow-y-auto pr-2 border-r border-slate-100">
-          <section className="space-y-2">
-            <h2 className="text-sm font-black text-slate-800 uppercase tracking-widest">1. Introdução</h2>
-            <p>
-              A <strong>ELIZA Dental Platform</strong> (operada por JANIO TEIXEIRA DA SILVA JUNIOR LTDA) valoriza o sigilo, a transparência e a integridade de todas as informações inseridas na plataforma. Em conformidade com a Lei Geral de Proteção de Dados (LGPD - nº 13.709/18), nossa política estabelece diretrizes rigorosas para o tratamento de dados pessoais de pacientes, profissionais de saúde e parceiros integrados.
-            </p>
-          </section>
+        <Section n="5" title="Finalidades e limitações de uso"><p>Os dados são usados para operar agenda, prontuário, atendimento, comunicação autorizada, automações, segurança, suporte e gestão da clínica. Dados obtidos da Meta não são vendidos, licenciados para publicidade, usados para criar perfis publicitários independentes nem empregados para finalidades incompatíveis com o serviço autorizado. A ELIZA não fala em nome da Meta e não representa vínculo de patrocínio ou afiliação.</p></Section>
 
-          <section className="space-y-2">
-            <h2 className="text-sm font-black text-slate-800 uppercase tracking-widest">2. Coleta e Classificação de Dados</h2>
-            <p>
-              Coletamos informações essenciais para a coordenação clínica, agendamento de consultas e gerenciamento financeiro de clínicas odontológicas, incluindo:
-            </p>
-            <ul className="list-disc pl-5 space-y-1.5">
-              <li><strong>Dados de Identificação:</strong> Nome completo, CPF, RG, data de nascimento e gênero.</li>
-              <li><strong>Dados Sensíveis de Saúde:</strong> Anamnese clínica, histórico médico detalhado, fotografias cirúrgicas para planejamento, modelos de consentimento, diagnósticos e registros de evolução.</li>
-              <li><strong>Informações de Contato:</strong> Número do celular (para disparos ativos de agendamento no WhatsApp se integrado), e-mail e endereço.</li>
-              <li><strong>Dados Financeiros:</strong> Lançamentos e fechamentos parciais de caixa relativos ao custo e ao pagamento de tratamentos contratados pelo paciente.</li>
-            </ul>
-          </section>
+        <Section n="6" title="Consentimento, mensagens e atendimento humano"><p>A clínica é responsável por possuir base legal, fornecer avisos e obter o opt-in exigido antes de iniciar comunicações. Pedidos de interrupção ou opt-out devem ser respeitados. Fora da janela de atendimento aplicável, mensagens iniciadas pela clínica devem utilizar templates aprovados. Automações devem oferecer caminho claro para atendimento humano por conversa, telefone, e-mail ou suporte web.</p></Section>
 
-          <section className="space-y-2">
-            <h2 className="text-sm font-black text-slate-800 uppercase tracking-widest">3. Uso das Informações</h2>
-            <p>
-              Todos os dados são coletados e armazenados exclusivamente com o intuito de viabilizar atendimentos clínicos de alta qualidade, otimizar fluxos de recall pós-operatório (HOF), realizar validações de consentimentos odontológicos, gerar relatórios estatísticos confidenciais, e enviar alertas de compromisso via WhatsApp ou SMS.
-            </p>
-          </section>
+        <Section n="7" title="Inteligência artificial"><p>Recursos de IA podem estruturar rascunhos, organizar informações, sinalizar pendências e resumir dados. Sugestões que resultem em registro clínico exigem revisão e confirmação de profissional habilitado. A ELIZA não realiza diagnóstico ou decisão clínica autônoma. Quando fornecedores de IA forem utilizados, o processamento deve permanecer limitado ao serviço contratado, com salvaguardas técnicas e contratuais.</p></Section>
 
-          <section className="space-y-2">
-            <h2 className="text-sm font-black text-slate-800 uppercase tracking-widest">4. Sigilo Médico e Prontuários</h2>
-            <p>
-              Garantimos sigilo profissional irrestrito às informações do prontuário eletrônico. Nossos desenvolvedores e os sistemas executados na nuvem processam esses dados de formato seguro com privilégios restritos (role-based access) aos profissionais habilitados na própria clínica. Não vendemos, cedemos ou licenciamos qualquer registro clínico ou pessoal para terceiros.
-            </p>
-          </section>
+        <Section n="8" title="Compartilhamento e suboperadores"><p>A ELIZA pode utilizar provedores de infraestrutura em nuvem, Meta/WhatsApp, mensageria, inteligência artificial, monitoramento, suporte e pagamentos, sempre no limite necessário à operação. A lista aplicável poderá variar conforme módulos contratados. Não comercializamos dados pessoais.</p></Section>
 
-          <section className="space-y-2">
-            <h2 className="text-sm font-black text-slate-800 uppercase tracking-widest">5. Armazenamento e Criptografia</h2>
-            <p>
-              Utilizamos infraestrutura em nuvem segura e criptografias avançadas para proteger seus dados contra interceptação ou acessos não autorizados. Os backups do banco de dados são gerenciados automaticamente e submetidos a validações periódicas de integridade e escopo.
-            </p>
-          </section>
+        <Section n="9" title="Transferência internacional"><p>Alguns fornecedores podem processar dados fora do Brasil. Quando aplicável, a transferência observará a LGPD, a regulamentação da ANPD e mecanismos contratuais adequados de proteção.</p></Section>
 
-          <section className="space-y-2">
-            <h2 className="text-sm font-black text-slate-800 uppercase tracking-widest">6. Seus Direitos (LGPD)</h2>
-            <p>
-              A qualquer momento, o titular dos dados ou profissional credenciado poderá solicitar a confirmação do tratamento, a correção de dados incompletos ou inexatos, a portabilidade das informações clínicas, ou a revogação de seu consentimento, diretamente por meio do canal administrativo do sistema.
-            </p>
-          </section>
-        </div>
+        <Section n="10" title="Segurança"><p>Aplicamos controle de acesso por função, criptografia em trânsito, segregação lógica por clínica, trilhas de auditoria e restrição de acesso humano. Tokens e credenciais de integração são armazenados de forma protegida, deixam de ser utilizados pela ELIZA após a desconexão e seguem o procedimento de segurança e encerramento aplicável. Nenhum sistema é imune a riscos; incidentes relevantes serão tratados e comunicados nos termos legais aplicáveis.</p></Section>
 
-        {/* Closing details */}
-        <div className="pt-4 border-t border-slate-100 flex flex-wrap items-center justify-between text-[9px] font-bold text-slate-405 uppercase tracking-wider gap-2">
-          <span className="flex items-center gap-1 text-teal-650"><CheckCircle className="w-3.5 h-3.5 text-emerald-500 inline" /> Versão Atualizada: Junho, 2026</span>
-          <span>© {new Date().getFullYear()} ELIZA Dental</span>
-        </div>
-      </motion.div>
-    </div>
+        <Section n="11" title="Retenção, desconexão e exclusão"><p>Dados permanecem apenas pelo período necessário às finalidades, ao contrato e às obrigações legais. Ao desconectar a integração Meta, a ELIZA interrompe novas coletas e desativa webhooks sob seu controle; a revogação ou eliminação das credenciais técnicas envolvidas é conduzida por procedimento administrativo separado, ainda não automatizado no momento da desconexão. Mensagens incorporadas a prontuários ou registros sujeitos a guarda legal podem permanecer restritas até o término do prazo aplicável. Solicitações seguem a página de <Link to="/data-deletion">Exclusão de dados</Link>.</p></Section>
+
+        <Section n="12" title="Direitos dos titulares"><p>O titular pode solicitar confirmação, acesso, correção, anonimização, bloqueio, portabilidade, informação sobre compartilhamentos, revogação de consentimento e eliminação quando aplicável. Pacientes devem preferencialmente procurar a clínica controladora; a ELIZA prestará o suporte técnico necessário.</p></Section>
+
+        <Section n="13" title="Crianças e adolescentes"><p>A plataforma é destinada a profissionais adultos. Dados de pacientes menores podem ser tratados no contexto assistencial sob responsabilidade da clínica e com as autorizações exigidas pela legislação.</p></Section>
+
+        <Section n="14" title="Atualizações e contato"><p>Alterações materiais serão comunicadas pelos canais disponíveis. Dúvidas, solicitações e incidentes: <a href="mailto:admin@elizaclinic.com.br">admin@elizaclinic.com.br</a>. Versão atualizada em 31 de agosto de 2026.</p></Section>
+      </article>
+      <Footer />
+    </main>
   );
 }

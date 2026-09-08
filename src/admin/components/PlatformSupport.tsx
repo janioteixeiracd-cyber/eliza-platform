@@ -1,8 +1,10 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { useAdmin } from '../../contexts/AdminContext';
-import { ShieldAlert, CheckCircle2, AlertTriangle, Send, Activity, HelpCircle, Loader2 } from 'lucide-react';
-import { doc, getDoc, collection, getDocs } from 'firebase/firestore';
+import { ShieldAlert, CheckCircle2, AlertTriangle, Send, Activity, HelpCircle, Loader2, UserX } from 'lucide-react';
+import { doc, getDoc, collection, getDocs, query, where } from 'firebase/firestore';
 import { db } from '../../lib/firebase';
+
+interface StuckSignup { id: string; name?: string; email?: string; planRoleSelected?: string; paidAt?: any; }
 
 export default function PlatformSupport() {
   const { clinics, addClinicSupportNote, checkSystemHealth } = useAdmin();
@@ -11,6 +13,36 @@ export default function PlatformSupport() {
   const [isSending, setIsSending] = useState(false);
   const [diagnosing, setDiagnosing] = useState(false);
   const [diagResults, setDiagResults] = useState<any[] | null>(null);
+
+  // Someone paid but never finished the clinic-creation wizard — real
+  // customers who need a nudge, not a lost lead. `clinicId` is only set by
+  // OnboardingView's finalize-billing call once the wizard completes.
+  const [stuckSignups, setStuckSignups] = useState<StuckSignup[] | null>(null);
+  const [loadingStuck, setLoadingStuck] = useState(false);
+  useEffect(() => {
+    async function loadStuckSignups() {
+      setLoadingStuck(true);
+      try {
+        const q = query(collection(db, 'signups'), where('status', '==', 'paid'));
+        const snap = await getDocs(q);
+        const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+        const stuck = snap.docs
+          .map(d => ({ id: d.id, ...d.data() } as StuckSignup & { clinicId?: string | null; paidAt?: any }))
+          .filter(s => !s.clinicId)
+          .filter(s => {
+            const paidAtMs = s.paidAt?.toDate ? s.paidAt.toDate().getTime() : (s.paidAt ? new Date(s.paidAt).getTime() : 0);
+            return paidAtMs && paidAtMs < cutoff;
+          });
+        setStuckSignups(stuck);
+      } catch (e) {
+        console.error('Failed to load stuck signups:', e);
+        setStuckSignups([]);
+      } finally {
+        setLoadingStuck(false);
+      }
+    }
+    loadStuckSignups();
+  }, []);
 
   const handleSendNote = async () => {
     if (!selectedClinicId || !noteText.trim()) return;
@@ -87,6 +119,33 @@ export default function PlatformSupport() {
         <h2 className="text-3xl font-black text-slate-900 tracking-tight uppercase">Portal de Suporte</h2>
         <p className="text-xs text-slate-500 font-bold uppercase tracking-widest mt-1">Gerenciamento de notas técnicas, diagnóstico de integridade e auditoria</p>
       </header>
+
+      {/* Paid but stuck before finishing OnboardingView */}
+      <div className="bg-white rounded-[2.5rem] border border-slate-200 shadow-sm p-8 space-y-4">
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <UserX className="w-4 h-4 text-amber-600" />
+            <h3 className="text-sm font-black text-slate-900 uppercase tracking-widest">Pagos sem clínica criada</h3>
+          </div>
+          {loadingStuck && <Loader2 className="w-4 h-4 animate-spin text-slate-400" />}
+        </div>
+        <p className="text-[10px] text-slate-400 font-bold uppercase tracking-wider">Pagamento confirmado há mais de 24h, mas o assistente de criação da clínica nunca foi concluído — cliente real preso no meio do caminho, vale contato proativo.</p>
+        {stuckSignups && stuckSignups.length === 0 ? (
+          <p className="text-xs text-emerald-600 font-bold">Nenhum caso pendente agora.</p>
+        ) : stuckSignups && stuckSignups.length > 0 ? (
+          <div className="space-y-2">
+            {stuckSignups.map(s => (
+              <div key={s.id} className="flex items-center justify-between p-3 bg-amber-50 border border-amber-100 rounded-xl">
+                <div>
+                  <p className="text-xs font-black text-slate-800">{s.name || 'Sem nome'}</p>
+                  <p className="text-[10px] text-slate-500">{s.email} · {s.planRoleSelected || 'modalidade não registrada'}</p>
+                </div>
+                <span className="text-[9px] font-black uppercase text-amber-700">Pago, sem clínica</span>
+              </div>
+            ))}
+          </div>
+        ) : null}
+      </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
         {/* Left column: Write support note */}

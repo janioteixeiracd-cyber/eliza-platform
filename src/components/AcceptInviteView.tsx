@@ -211,10 +211,7 @@ export default function AcceptInviteView() {
       {/* Premium Header */}
       <nav className="p-8 flex justify-between items-center absolute top-0 w-full">
         <div className="flex items-center gap-3">
-          <div className="w-10 h-10 bg-teal-600 rounded-2xl flex items-center justify-center shadow-lg shadow-teal-600/20">
-            <span className="text-white font-black text-xl">E</span>
-          </div>
-          <span className="text-xl font-black text-slate-900 tracking-tighter">ELIZA</span>
+          <img src="/brand/eliza-wordmark-dark.png" alt="Eliza" className="h-9 w-auto object-contain" />
         </div>
       </nav>
 

@@ -21,6 +21,7 @@ import {
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { useAuth } from '../contexts/AuthContext';
+import { logStatusEvent } from '../next/services/statusEvents';
 import { db, handleFirestoreError, OperationType } from '../lib/firebase';
 import { 
   collection, 
@@ -150,7 +151,7 @@ function normalizePriorityItem(item: any): Task {
 }
 
 export default function TaskManagerView({ onSelectPatient }: { onSelectPatient?: (patientId: string) => void }) {
-  const { clinic, profile } = useAuth();
+  const { clinic, profile, user } = useAuth();
   const [tasks, setTasks] = useState<Task[]>([]);
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [loading, setLoading] = useState(false);
@@ -220,8 +221,23 @@ export default function TaskManagerView({ onSelectPatient }: { onSelectPatient?:
     const newStatus = task.status === 'done' ? 'pending' : 'done';
     try {
       await updateDoc(doc(db, 'clinics', clinic.id, 'pending_items', task.id), {
-        status: newStatus
+        status: newStatus,
+        ...(newStatus === 'done' ? { resolvedAt: serverTimestamp() } : {}),
       });
+      // This screen used to resolve items without recording WHEN — the
+      // event log is what makes pendency-resolution timing reliable
+      // regardless of which screen (esta ou a nova Central de Atividade) foi usada.
+      if (newStatus === 'done') {
+        logStatusEvent(clinic.id, {
+          entityType: 'pending_item',
+          entityId: task.id,
+          eventType: 'pending_item_resolved',
+          patientId: (task as any).patientId || null,
+          fromStatus: task.status,
+          toStatus: 'done',
+          metadata: { title: task.title, category: task.category },
+        }, user?.uid);
+      }
       // Update local state in case details modal is looking at it
       if (selectedTaskDetails && selectedTaskDetails.id === task.id) {
         setSelectedTaskDetails({ ...selectedTaskDetails, status: newStatus });

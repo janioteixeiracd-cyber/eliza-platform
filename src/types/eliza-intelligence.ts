@@ -178,7 +178,8 @@ export interface ElizaTool {
   inputSchema: JSONSchema;
   outputSchema: JSONSchema;
   requiresApproval: boolean;
-  
+  disabled?: boolean;
+
   handler: (input: any, context: ElizaContext) => Promise<any>;
 }
 
@@ -241,7 +242,8 @@ export enum ElizaErrorCode {
   // Validation
   VALIDATION_ERROR = "VALIDATION_ERROR",
   SCHEMA_VALIDATION_FAILED = "SCHEMA_VALIDATION_FAILED",
-  
+  INVALID_REQUEST = "INVALID_REQUEST",
+
   // Authentication
   AUTH_ERROR = "AUTH_ERROR",
   TOKEN_EXPIRED = "TOKEN_EXPIRED",
@@ -251,12 +253,13 @@ export enum ElizaErrorCode {
   UNAUTHORIZED = "UNAUTHORIZED",
   INSUFFICIENT_PERMISSION = "INSUFFICIENT_PERMISSION",
   CLINIC_NOT_FOUND = "CLINIC_NOT_FOUND",
-  
+
   // Resource
   PATIENT_NOT_FOUND = "PATIENT_NOT_FOUND",
   CONVERSATION_NOT_FOUND = "CONVERSATION_NOT_FOUND",
   TOOL_NOT_FOUND = "TOOL_NOT_FOUND",
-  
+  NOT_FOUND = "NOT_FOUND",
+
   // AI/Model
   MODEL_ERROR = "MODEL_ERROR",
   MODEL_UNAVAILABLE = "MODEL_UNAVAILABLE",
@@ -266,7 +269,14 @@ export enum ElizaErrorCode {
   // Tool Execution
   TOOL_EXECUTION_ERROR = "TOOL_EXECUTION_ERROR",
   TOOL_PERMISSION_DENIED = "TOOL_PERMISSION_DENIED",
-  
+  TOOL_NOT_AVAILABLE = "TOOL_NOT_AVAILABLE",
+  TOOL_DISABLED = "TOOL_DISABLED",
+
+  // Action proposals (approval/execution lifecycle)
+  INVALID_STATE = "INVALID_STATE",
+  EXPIRED = "EXPIRED",
+  EXECUTION_FAILED = "EXECUTION_FAILED",
+
   // Internal
   INTERNAL_ERROR = "INTERNAL_ERROR",
   DATABASE_ERROR = "DATABASE_ERROR",

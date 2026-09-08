@@ -63,6 +63,11 @@ export class ElizaIntelligenceLayer {
     // LOCAL STATE - unique per request, never shared
     const requestId = generateRequestId();
     const startTime = Date.now();
+    // Declared here (not `const` inside the try block) so the catch block
+    // below can still log a real audit entry if the request built a context
+    // before failing later — only truly unbuilt contexts fall back to the
+    // "unknown" placeholder.
+    let audit: AuditMetadata | null = null;
 
     try {
       // 1. Build context
@@ -70,7 +75,7 @@ export class ElizaIntelligenceLayer {
       const context = await buildContext(req, elizaRequest);
 
       // LOCAL audit object - not stored in instance
-      const audit: AuditMetadata = {
+      audit = {
         requestId,
         clinicId: context.clinicId,
         userId: context.userId,
@@ -84,7 +89,7 @@ export class ElizaIntelligenceLayer {
 
       // 3. Call AI model
       console.log(`[ELIZA:${requestId}] Calling AI model...`);
-      const modelResult = await this.callModel(context, promptResult);
+      const modelResult = await this.callModel(context, promptResult, requestId);
 
       // 4. Process response
       console.log(`[ELIZA:${requestId}] Processing response...`);
@@ -106,7 +111,7 @@ export class ElizaIntelligenceLayer {
           output: modelResult.outputTokens,
           total: modelResult.inputTokens + modelResult.outputTokens,
         },
-      });
+      }, audit, requestId);
 
       const processingTime = Date.now() - startTime;
 
@@ -143,17 +148,24 @@ export class ElizaIntelligenceLayer {
       const processingTime = Date.now() - startTime;
       const elizaError = err instanceof ElizaError ? err : this.wrapError(err);
 
-      // Log error audit
-      await this.logAuditTrail(
-        {} as ElizaContext,
-        {
-          status: "failed",
-          error: {
-            code: elizaError.code,
-            message: elizaError.message,
+      // Log error audit — only possible if context was built far enough to
+      // know which clinic/user this was; an earlier failure (e.g. bad auth)
+      // never reaches that point, so there's nothing scoped to log against.
+      const fallbackAudit: AuditMetadata = audit || { requestId, clinicId: "unknown", userId: "unknown", timestamp: new Date() };
+      if (audit) {
+        await this.logAuditTrail(
+          {} as ElizaContext,
+          {
+            status: "failed",
+            error: {
+              code: elizaError.code,
+              message: elizaError.message,
+            },
           },
-        }
-      ).catch((e) => console.error(`[ELIZA] Failed to log error audit:`, e));
+          audit,
+          requestId
+        ).catch((e) => console.error(`[ELIZA] Failed to log error audit:`, e));
+      }
 
       console.error(`[ELIZA:${requestId}] ❌ Error after ${processingTime}ms:`, elizaError.message);
 
@@ -165,7 +177,7 @@ export class ElizaIntelligenceLayer {
           details: elizaError.details ? JSON.stringify(elizaError.details) : undefined,
           debug: process.env.NODE_ENV === "development" ? { stackTrace: elizaError.stack } : undefined,
         },
-        audit: audit.requestId ? audit : { requestId: requestId, clinicId: "unknown", userId: "unknown", timestamp: new Date() },
+        audit: fallbackAudit,
       };
 
       throw errorResponse;
@@ -284,7 +296,8 @@ Sua tarefa é revisar contratos e identificar:
    */
   private async callModel(
     context: ElizaContext,
-    promptResult: PromptBuildResult
+    promptResult: PromptBuildResult,
+    requestId: string
   ): Promise<ModelCallResult> {
     const provider = context.request.preferredProvider || context.clinicData.config.aiProviderPrincipal;
     const model = this.selectModel(context);
@@ -343,8 +356,8 @@ Sua tarefa é revisar contratos e identificar:
     try {
       const response = await genai.models.generateContent({
         model,
-        systemInstruction: promptResult.systemInstruction,
         contents: [{ role: "user", parts: [{ text: promptResult.userMessage }] }],
+        config: { systemInstruction: promptResult.systemInstruction },
       });
 
       const text = response.text || "";
@@ -392,8 +405,10 @@ Sua tarefa é revisar contratos e identificar:
     try {
       const response = await openai.chat.completions.create({
         model,
-        system: promptResult.systemInstruction,
-        messages: [{ role: "user", content: promptResult.userMessage }],
+        messages: [
+          { role: "system", content: promptResult.systemInstruction },
+          { role: "user", content: promptResult.userMessage },
+        ],
         temperature: 0.7,
       });
 
@@ -488,7 +503,9 @@ Sua tarefa é revisar contratos e identificar:
    */
   private async logAuditTrail(
     context: ElizaContext,
-    result: any
+    result: any,
+    audit: AuditMetadata,
+    requestId: string
   ): Promise<void> {
     if (!audit.clinicId) return;
 

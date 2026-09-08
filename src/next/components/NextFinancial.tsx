@@ -41,11 +41,14 @@ import {
 } from 'lucide-react';
 import { useAuth } from '../../contexts/AuthContext';
 import { useNextReadOnly } from '../context/NextReadOnlyContext';
+import { useSetElizaScreenContext } from '../context/ElizaAssistantContext';
+import { useElizaStandingGapCheck } from '../hooks/useElizaStandingGapCheck';
 import { secureGetDocs } from '../services/next-db';
-import { collection, query, limit, addDoc, updateDoc, deleteDoc, setDoc, doc as fsDoc, serverTimestamp } from 'firebase/firestore';
+import { collection, query, limit, addDoc, updateDoc, deleteDoc, setDoc, getDoc, writeBatch, doc as fsDoc, serverTimestamp } from 'firebase/firestore';
 import { db } from '../../lib/firebase';
 import { getGenAI } from '../../lib/gemini';
 import { normalizeFinancialEntry } from '../../utils/financialHelpers';
+import { logStatusEvent } from '../services/statusEvents';
 
 interface FinancialEntryRow {
   id: string;
@@ -62,6 +65,11 @@ interface FinancialEntryRow {
   paidAt: any;
   paymentMethod: string;
   source: string;
+  professionalId?: string | null;
+  professionalName?: string | null;
+  /** Fase C — sempre a pessoa logada no momento da confirmação, nunca escolhível. Ausente em lançamentos recebidos antes desta fase. */
+  receivedBy?: string | null;
+  receivedByName?: string | null;
 }
 
 interface PatientLite { id: string; name: string; }
@@ -229,6 +237,10 @@ interface EntryFormState {
   paymentMethod: string;
   dueDate: string;
   patientId: string;
+  /** Optional, only set when staff explicitly picks who performed the procedure — never inferred. Needed for temporal "desempenho por profissional" by revenue. */
+  professionalId: string;
+  /** Status this entry had when the form was opened — null for a brand-new entry. Used only to detect a real pending→paid transition (see handleSaveEntry) so editing an already-paid entry never clobbers its real paidAt. */
+  originalStatus: 'pending' | 'partial' | 'paid' | 'cancelled' | null;
 }
 
 const EMPTY_FORM: EntryFormState = {
@@ -242,6 +254,8 @@ const EMPTY_FORM: EntryFormState = {
   paymentMethod: 'PIX',
   dueDate: toDateInputValue(new Date()),
   patientId: '',
+  professionalId: '',
+  originalStatus: null,
 };
 
 export default function NextFinancial() {
@@ -264,6 +278,10 @@ export default function NextFinancial() {
   const [form, setForm] = useState<EntryFormState>(EMPTY_FORM);
   const [saving, setSaving] = useState(false);
   const [deletingId, setDeletingId] = useState<string | null>(null);
+
+  const [receivingEntry, setReceivingEntry] = useState<FinancialEntryRow | null>(null);
+  const [receiveAmountInput, setReceiveAmountInput] = useState('');
+  const [confirmingReceive, setConfirmingReceive] = useState(false);
 
   const [closings, setClosings] = useState<ClosingRow[]>([]);
   const [selectedClosingDate, setSelectedClosingDate] = useState(toDateInputValue(new Date()));
@@ -310,7 +328,7 @@ export default function NextFinancial() {
     setLoading(true);
     try {
       const finRef = collection(db, 'clinics', clinic.id, 'financial_entries');
-      const finSnap = await secureGetDocs(query(finRef, limit(1000)), 'financial_entries', { addAuditLog });
+      const finSnap = await secureGetDocs(query(finRef, limit(3000)), 'financial_entries', { addAuditLog });
       const rows: FinancialEntryRow[] = [];
       finSnap.forEach(d => {
         const n = normalizeFinancialEntry({ id: d.id, ...d.data() });
@@ -324,7 +342,7 @@ export default function NextFinancial() {
       setEntries(rows);
 
       const patRef = collection(db, 'clinics', clinic.id, 'patients');
-      const patSnap = await secureGetDocs(query(patRef, limit(300)), 'patients', { addAuditLog });
+      const patSnap = await secureGetDocs(query(patRef, limit(8000)), 'patients', { addAuditLog });
       setPatients(patSnap.docs.map(d => ({ id: d.id, name: (d.data() as any).name || 'Sem nome' })));
 
       const closingsRef = collection(db, 'clinics', clinic.id, 'daily_closings');
@@ -414,8 +432,17 @@ export default function NextFinancial() {
 
   const now = new Date();
 
+  function inPeriod(d: Date | null, p: Period): boolean {
+    if (!d) return false;
+    if (p === 'today') return isSameDay(d, now);
+    if (p === 'month') return isSameMonth(d, now);
+    return true;
+  }
+
+  const periodLabel = period === 'today' ? 'hoje' : period === 'month' ? 'este mês' : 'no total';
+
   const kpis = useMemo(() => {
-    let receivedToday = 0, receivedMonth = 0, expensePaidMonth = 0;
+    let received = 0, expensePaid = 0;
     let receivable = 0, payable = 0, overdueCount = 0, overdueAmount = 0;
 
     for (const e of entries) {
@@ -425,50 +452,81 @@ export default function NextFinancial() {
       if (e.status === 'cancelled') continue;
 
       if (e.type === 'income') {
-        if ((e.status === 'paid' || e.status === 'partial') && paidD) {
-          if (isSameDay(paidD, now)) receivedToday += e.paidAmount;
-          if (isSameMonth(paidD, now)) receivedMonth += e.paidAmount;
+        if ((e.status === 'paid' || e.status === 'partial') && paidD && inPeriod(paidD, period)) {
+          received += e.paidAmount;
         }
-        if (e.status === 'pending' || e.status === 'partial') {
+        if ((e.status === 'pending' || e.status === 'partial') && dueD && inPeriod(dueD, period)) {
           receivable += e.pendingAmount;
-          if (dueD && dueD < now && !isSameDay(dueD, now)) {
+          if (dueD < now && !isSameDay(dueD, now)) {
             overdueCount++;
             overdueAmount += e.pendingAmount;
           }
         }
       } else {
-        if ((e.status === 'paid' || e.status === 'partial') && paidD && isSameMonth(paidD, now)) {
-          expensePaidMonth += e.paidAmount;
+        if ((e.status === 'paid' || e.status === 'partial') && paidD && inPeriod(paidD, period)) {
+          expensePaid += e.paidAmount;
         }
-        if (e.status === 'pending' || e.status === 'partial') {
+        if ((e.status === 'pending' || e.status === 'partial') && dueD && inPeriod(dueD, period)) {
           payable += e.pendingAmount;
         }
       }
     }
 
     return {
-      receivedToday,
-      receivedMonth,
-      expensePaidMonth,
-      balanceMonth: receivedMonth - expensePaidMonth,
+      received,
+      expensePaid,
+      balance: received - expensePaid,
       receivable,
       payable,
       overdueCount,
       overdueAmount,
     };
-  }, [entries]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [entries, period]);
 
   const categoryBreakdown = useMemo(() => {
     const map = new Map<string, number>();
     for (const e of entries) {
       if (e.type !== 'expense') continue;
       const d = toDate(e.paidAt) || toDate(e.dueDate);
-      if (!d || !isSameMonth(d, now)) continue;
+      if (!inPeriod(d, period)) continue;
       if (e.status !== 'paid' && e.status !== 'partial') continue;
       map.set(e.category, (map.get(e.category) || 0) + e.paidAmount);
     }
     return Array.from(map.entries()).sort((a, b) => b[1] - a[1]).slice(0, 6);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [entries, period]);
+
+  const aiSummaryTotals = useMemo(() => {
+    let receivedToday = 0, receivedMonth = 0, expensePaidMonth = 0;
+    for (const e of entries) {
+      if (e.status === 'cancelled') continue;
+      const paidD = toDate(e.paidAt) || toDate(e.dueDate);
+      if (!paidD || (e.status !== 'paid' && e.status !== 'partial')) continue;
+      if (e.type === 'income') {
+        if (isSameDay(paidD, now)) receivedToday += e.paidAmount;
+        if (isSameMonth(paidD, now)) receivedMonth += e.paidAmount;
+      } else if (isSameMonth(paidD, now)) {
+        expensePaidMonth += e.paidAmount;
+      }
+    }
+    return { receivedToday, receivedMonth, expensePaidMonth, balanceMonth: receivedMonth - expensePaidMonth };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [entries]);
+
+  useElizaStandingGapCheck('financeiro_open');
+
+  useSetElizaScreenContext(
+    'Financeiro',
+    entries.length === 0 ? '' : [
+      `Período selecionado na tela: ${periodLabel}.`,
+      `Recebido ${periodLabel}: ${formatCurrency(kpis.received)}. Pago ${periodLabel}: ${formatCurrency(kpis.expensePaid)}. Saldo: ${formatCurrency(kpis.balance)}.`,
+      `A receber (${periodLabel}): ${formatCurrency(kpis.receivable)}. A pagar (${periodLabel}): ${formatCurrency(kpis.payable)}.`,
+      `Contas vencidas (${periodLabel}): ${kpis.overdueCount} lançamento(s), totalizando ${formatCurrency(kpis.overdueAmount)}.`,
+      categoryBreakdown.length > 0 ? `Maiores categorias de despesa no período: ${categoryBreakdown.map(([cat, val]) => `${cat} (${formatCurrency(val)})`).join(', ')}.` : '',
+      `Total de lançamentos carregados: ${entries.length}.`,
+    ].filter(Boolean).join('\n')
+  );
 
   const recentEntries = useMemo(() => entries.slice(0, 6), [entries]);
   const upcomingReceivables = useMemo(() => {
@@ -487,7 +545,7 @@ export default function NextFinancial() {
       if (statusFilter !== 'all' && e.status !== statusFilter) return false;
       if (period !== 'all') {
         const d = toDate(e.dueDate);
-        if (!d) return period === 'all';
+        if (!d) return false;
         if (period === 'today' && !isSameDay(d, now)) return false;
         if (period === 'month' && !isSameMonth(d, now)) return false;
       }
@@ -516,6 +574,8 @@ export default function NextFinancial() {
       paymentMethod: e.paymentMethod || 'PIX',
       dueDate: toDateInputValue(e.dueDate),
       patientId: e.patientId || '',
+      professionalId: e.professionalId || '',
+      originalStatus: e.status,
     });
     setIsFormOpen(true);
   }
@@ -536,8 +596,19 @@ export default function NextFinancial() {
       }
       const pendingAmount = status === 'cancelled' ? 0 : Math.max(0, totalAmount - paidAmount);
       const patient = patients.find(p => p.id === form.patientId);
+      const professional = teamMembers.find(m => m.id === form.professionalId);
 
-      const basePayload = {
+      // Only stamp a NEW paidAt when this save is the actual moment the
+      // entry becomes paid/partial (a real "payment confirmed" event).
+      // Editing an already-settled entry for an unrelated reason (fixing
+      // the description, category, etc.) must never overwrite its real
+      // payment date with "now" — that was a real bug in the previous
+      // version of this form, which stamped paidAt on every single save.
+      const wasAlreadySettled = form.originalStatus === 'paid' || form.originalStatus === 'partial';
+      const isBecomingSettled = status === 'paid' || status === 'partial';
+      const isNewPaymentEvent = isBecomingSettled && !wasAlreadySettled;
+
+      const basePayload: Record<string, any> = {
         type: form.type,
         category: form.category,
         description: form.description.trim(),
@@ -547,23 +618,55 @@ export default function NextFinancial() {
         status,
         paymentMethod: form.paymentMethod,
         date: new Date(`${form.dueDate}T12:00:00`).toISOString(),
-        paidAt: (status === 'paid' || status === 'partial') ? new Date().toISOString() : null,
         patientId: form.patientId || null,
         patientName: patient?.name || null,
+        // Only set when staff explicitly picks a professional here — a
+        // reliable link for "desempenho por profissional" by revenue,
+        // never inferred from the appointment or anything else.
+        professionalId: form.professionalId || null,
+        professionalName: professional?.name || null,
         source: 'manual',
         updatedAt: serverTimestamp(),
       };
+      // Server-side timestamp — immune to client clock skew — stamped only
+      // on the real transition described above. Not included at all when
+      // it's not a new payment event, so updateDoc leaves any existing
+      // paidAt on the document untouched.
+      if (isNewPaymentEvent) basePayload.paidAt = serverTimestamp();
+      else if (!isBecomingSettled) basePayload.paidAt = null;
 
       if (form.id) {
         await updateDoc(fsDoc(db, 'clinics', clinic.id, 'financial_entries', form.id), basePayload);
+        if (form.originalStatus !== status) {
+          logStatusEvent(clinic.id, {
+            entityType: 'financial_entry',
+            entityId: form.id,
+            eventType: 'financial_entry_status_changed',
+            patientId: form.patientId || null,
+            fromStatus: form.originalStatus,
+            toStatus: status,
+            metadata: { description: basePayload.description, amount: totalAmount },
+          }, user?.uid);
+        }
         addAuditLog({ collection: 'financial_entries', action: 'WRITE', status: 'SUCCESS', details: `Lançamento "${basePayload.description}" atualizado (escrita real).` });
         showMessage('Lançamento atualizado.');
       } else {
-        await addDoc(collection(db, 'clinics', clinic.id, 'financial_entries'), {
+        const ref = await addDoc(collection(db, 'clinics', clinic.id, 'financial_entries'), {
           ...basePayload,
           createdAt: serverTimestamp(),
           createdBy: user?.uid || 'eliza_next',
         });
+        if (isBecomingSettled) {
+          logStatusEvent(clinic.id, {
+            entityType: 'financial_entry',
+            entityId: ref.id,
+            eventType: 'financial_entry_status_changed',
+            patientId: form.patientId || null,
+            fromStatus: null,
+            toStatus: status,
+            metadata: { description: basePayload.description, amount: totalAmount },
+          }, user?.uid);
+        }
         addAuditLog({ collection: 'financial_entries', action: 'WRITE', status: 'SUCCESS', details: `Lançamento "${basePayload.description}" (${formatCurrency(totalAmount)}) criado (escrita real).` });
         showMessage('Lançamento criado.');
       }
@@ -576,21 +679,111 @@ export default function NextFinancial() {
     }
   }
 
-  async function handleMarkSettled(e: FinancialEntryRow) {
+  function openReceive(e: FinancialEntryRow) {
+    setReceivingEntry(e);
+    const saldo = e.pendingAmount || e.totalAmount;
+    setReceiveAmountInput(String(saldo));
+  }
+  function closeReceive() {
+    setReceivingEntry(null);
+    setReceiveAmountInput('');
+  }
+
+  // Fase C: aceita valor parcial. Total -> mesmo comportamento de antes +
+  // receivedBy. Parcial -> este doc vira o recibo de hoje (reduzido ao
+  // valor recebido) e um doc NOVO nasce com o saldo em aberto — via
+  // writeBatch, as duas escritas são atômicas (tudo ou nada).
+  async function handleConfirmSettlement(e: FinancialEntryRow, receivedAmountRaw: number) {
     if (!clinic?.id) return;
+    const saldoPendente = e.pendingAmount || e.totalAmount;
+    const EPS = 0.005;
+    const receivedAmount = Math.round((Number(receivedAmountRaw) || 0) * 100) / 100;
+    if (!Number.isFinite(receivedAmount) || receivedAmount <= 0) {
+      showMessage('Informe um valor válido maior que zero.');
+      return;
+    }
+    const isFullPayment = receivedAmount >= saldoPendente - EPS;
+    const wasCapped = receivedAmount > saldoPendente + EPS;
+    const receivedByName = profile?.name || user?.email || 'Usuário';
+
+    setConfirmingReceive(true);
     try {
-      await updateDoc(fsDoc(db, 'clinics', clinic.id, 'financial_entries', e.id), {
-        status: 'paid',
-        paidAmount: e.totalAmount,
-        pendingAmount: 0,
-        paidAt: new Date().toISOString(),
-        updatedAt: serverTimestamp(),
-      });
-      addAuditLog({ collection: 'financial_entries', action: 'WRITE', status: 'SUCCESS', details: `"${e.description}" marcado como ${e.type === 'income' ? 'recebido' : 'pago'} (escrita real).` });
-      showMessage(e.type === 'income' ? 'Marcado como recebido.' : 'Marcado como pago.');
+      if (isFullPayment) {
+        await updateDoc(fsDoc(db, 'clinics', clinic.id, 'financial_entries', e.id), {
+          status: 'paid',
+          paidAmount: e.totalAmount,
+          pendingAmount: 0,
+          // Server-side clock — this button IS the "payment confirmed now"
+          // action, so always stamping is correct here (unlike the edit form).
+          paidAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+          receivedBy: user?.uid || null,
+          receivedByName,
+        });
+        logStatusEvent(clinic.id, {
+          entityType: 'financial_entry',
+          entityId: e.id,
+          eventType: 'financial_entry_status_changed',
+          patientId: e.patientId || null,
+          fromStatus: e.status,
+          toStatus: 'paid',
+          metadata: { description: e.description, amount: e.totalAmount },
+        }, user?.uid);
+        addAuditLog({ collection: 'financial_entries', action: 'WRITE', status: 'SUCCESS', details: `"${e.description}" marcado como ${e.type === 'income' ? 'recebido' : 'pago'} por ${receivedByName} (escrita real).` });
+        showMessage(wasCapped ? 'Valor informado era maior que o saldo — considerado o saldo total.' : (e.type === 'income' ? 'Marcado como recebido.' : 'Marcado como pago.'));
+      } else {
+        const remainder = Math.round((saldoPendente - receivedAmount) * 100) / 100;
+        // Leitura fresca do doc bruto — normalizeFinancialEntry não devolve
+        // groupId/quotationRef/professionalUid/installmentIndex/installmentTotal,
+        // então esses campos de linhagem não existem em `e` (FinancialEntryRow).
+        const rawSnap = await getDoc(fsDoc(db, 'clinics', clinic.id, 'financial_entries', e.id));
+        const raw: any = rawSnap.data() || {};
+        const groupId = raw.groupId || `fin-split-${e.id}-${Date.now()}`;
+
+        const patch: Record<string, any> = {
+          amount: receivedAmount, paidAmount: receivedAmount, pendingAmount: 0, status: 'paid',
+          paidAt: serverTimestamp(), updatedAt: serverTimestamp(),
+          receivedBy: user?.uid || null, receivedByName, groupId,
+        };
+        const newRef = fsDoc(collection(db, 'clinics', clinic.id, 'financial_entries'));
+        const remainderPayload: Record<string, any> = {
+          patientId: e.patientId || null, patientName: e.patientName || null,
+          type: e.type, category: e.category, description: e.description,
+          amount: remainder, paidAmount: 0, pendingAmount: remainder, status: 'pending',
+          paymentMethod: e.paymentMethod || 'PIX', date: e.dueDate || new Date().toISOString(),
+          professionalId: e.professionalId ?? null, professionalName: e.professionalName ?? null,
+          source: e.source || 'manual', groupId,
+          quotationRef: raw.quotationRef ?? null,
+          professionalUid: raw.professionalUid ?? null,
+          installmentIndex: raw.installmentIndex,
+          installmentTotal: raw.installmentTotal,
+          createdAt: serverTimestamp(), createdBy: user?.uid || 'eliza_next',
+        };
+        Object.keys(remainderPayload).forEach(k => remainderPayload[k] === undefined && delete remainderPayload[k]);
+
+        const batch = writeBatch(db);
+        batch.update(fsDoc(db, 'clinics', clinic.id, 'financial_entries', e.id), patch);
+        batch.set(newRef, remainderPayload);
+        await batch.commit();
+
+        logStatusEvent(clinic.id, {
+          entityType: 'financial_entry',
+          entityId: e.id,
+          eventType: 'financial_entry_status_changed',
+          patientId: e.patientId || null,
+          fromStatus: e.status,
+          toStatus: 'paid',
+          metadata: { description: e.description, amount: receivedAmount },
+        }, user?.uid);
+        addAuditLog({ collection: 'financial_entries', action: 'WRITE', status: 'SUCCESS', details: `"${e.description}" recebido parcialmente (${formatCurrency(receivedAmount)}) por ${receivedByName}; saldo de ${formatCurrency(remainder)} lançado como novo pendente (escrita real).` });
+        showMessage(`Recebido ${formatCurrency(receivedAmount)}. Saldo de ${formatCurrency(remainder)} lançado como novo pendente.`);
+      }
+      closeReceive();
       await loadData();
     } catch (err: any) {
       showMessage(`Falha: ${err?.message || err}`);
+    } finally {
+      setConfirmingReceive(false);
     }
   }
 
@@ -840,10 +1033,10 @@ export default function NextFinancial() {
       const topExpenses = categoryBreakdown.map(([cat, val]) => `${cat}: ${formatCurrency(val)}`).join(', ') || 'sem despesas pagas este mês';
 
       const context = `Dados reais desta clínica (ano/mês corrente):
-- Recebido hoje: ${formatCurrency(kpis.receivedToday)}
-- Recebido no mês: ${formatCurrency(kpis.receivedMonth)}
-- Despesas pagas no mês: ${formatCurrency(kpis.expensePaidMonth)}
-- Saldo do mês: ${formatCurrency(kpis.balanceMonth)}
+- Recebido hoje: ${formatCurrency(aiSummaryTotals.receivedToday)}
+- Recebido no mês: ${formatCurrency(aiSummaryTotals.receivedMonth)}
+- Despesas pagas no mês: ${formatCurrency(aiSummaryTotals.expensePaidMonth)}
+- Saldo do mês: ${formatCurrency(aiSummaryTotals.balanceMonth)}
 - A receber (pendente/parcial): ${formatCurrency(kpis.receivable)}
 - A pagar (pendente/parcial): ${formatCurrency(kpis.payable)}
 - Contas vencidas: ${kpis.overdueCount} lançamento(s), totalizando ${formatCurrency(kpis.overdueAmount)}
@@ -1134,27 +1327,27 @@ Use "income" quando o comprovante for de um valor recebido de paciente (ex: reci
 
               <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-5">
                 <div className="next-glass-panel rounded-next-xl p-5">
-                  <span className="text-[10px] font-mono text-slate-500 font-bold uppercase tracking-wider">Recebido Hoje</span>
-                  <h3 className="text-2xl font-extrabold text-slate-100 tracking-tight font-mono mt-1">{formatCurrency(kpis.receivedToday)}</h3>
+                  <span className="text-[10px] font-mono text-slate-500 font-bold uppercase tracking-wider">Recebido {periodLabel}</span>
+                  <h3 className="text-2xl font-extrabold text-slate-100 tracking-tight font-mono mt-1">{formatCurrency(kpis.received)}</h3>
                 </div>
                 <div className="next-glass-panel rounded-next-xl p-5">
-                  <span className="text-[10px] font-mono text-slate-500 font-bold uppercase tracking-wider">Recebido no Mês</span>
-                  <h3 className="text-2xl font-extrabold text-slate-100 tracking-tight font-mono mt-1">{formatCurrency(kpis.receivedMonth)}</h3>
+                  <span className="text-[10px] font-mono text-slate-500 font-bold uppercase tracking-wider">Pago {periodLabel}</span>
+                  <h3 className="text-2xl font-extrabold text-slate-100 tracking-tight font-mono mt-1">{formatCurrency(kpis.expensePaid)}</h3>
                 </div>
                 <div className="next-glass-panel rounded-next-xl p-5">
-                  <span className="text-[10px] font-mono text-slate-500 font-bold uppercase tracking-wider">Saldo do Mês</span>
-                  <h3 className={`text-2xl font-extrabold tracking-tight font-mono mt-1 ${kpis.balanceMonth >= 0 ? 'text-next-green-success' : 'text-next-red-alert'}`}>{formatCurrency(kpis.balanceMonth)}</h3>
+                  <span className="text-[10px] font-mono text-slate-500 font-bold uppercase tracking-wider">Saldo {periodLabel}</span>
+                  <h3 className={`text-2xl font-extrabold tracking-tight font-mono mt-1 ${kpis.balance >= 0 ? 'text-next-green-success' : 'text-next-red-alert'}`}>{formatCurrency(kpis.balance)}</h3>
                 </div>
                 <div className="next-glass-panel rounded-next-xl p-5">
-                  <span className="text-[10px] font-mono text-slate-500 font-bold uppercase tracking-wider">A Receber</span>
+                  <span className="text-[10px] font-mono text-slate-500 font-bold uppercase tracking-wider">A Receber ({periodLabel})</span>
                   <h3 className="text-2xl font-extrabold text-slate-100 tracking-tight font-mono mt-1">{formatCurrency(kpis.receivable)}</h3>
                 </div>
                 <div className="next-glass-panel rounded-next-xl p-5">
-                  <span className="text-[10px] font-mono text-slate-500 font-bold uppercase tracking-wider">A Pagar</span>
+                  <span className="text-[10px] font-mono text-slate-500 font-bold uppercase tracking-wider">A Pagar ({periodLabel})</span>
                   <h3 className="text-2xl font-extrabold text-slate-100 tracking-tight font-mono mt-1">{formatCurrency(kpis.payable)}</h3>
                 </div>
                 <div className="next-glass-panel rounded-next-xl p-5 border-next-red-alert/30">
-                  <span className="text-[10px] font-mono text-next-red-alert font-bold uppercase tracking-wider flex items-center gap-1"><AlertTriangle className="w-3 h-3" /> Contas Vencidas</span>
+                  <span className="text-[10px] font-mono text-next-red-alert font-bold uppercase tracking-wider flex items-center gap-1"><AlertTriangle className="w-3 h-3" /> Contas Vencidas ({periodLabel})</span>
                   <h3 className="text-2xl font-extrabold text-next-red-alert tracking-tight font-mono mt-1">{formatCurrency(kpis.overdueAmount)}</h3>
                   <p className="text-[10.5px] text-slate-500 mt-1">{kpis.overdueCount} lançamento(s) em atraso</p>
                 </div>
@@ -1297,6 +1490,9 @@ Use "income" quando o comprovante for de um valor recebido de paciente (ex: reci
                           <div className="min-w-0">
                             <p className="text-xs font-bold text-slate-200 truncate">{e.description}</p>
                             <p className="text-[10.5px] text-slate-500 truncate">{e.patientName ? `${e.patientName} · ` : ''}{e.category} · Vence {formatDate(e.dueDate)}{e.paymentMethod ? ` · ${e.paymentMethod}` : ''}</p>
+                            {e.status === 'paid' && e.receivedByName && (
+                              <p className="text-[9.5px] text-slate-500 truncate">{e.type === 'income' ? 'Recebido' : 'Pago'} por {e.receivedByName}</p>
+                            )}
                           </div>
                         </div>
                         <div className="flex items-center gap-2 flex-shrink-0">
@@ -1306,7 +1502,7 @@ Use "income" quando o comprovante for de um valor recebido de paciente (ex: reci
                           </div>
                           <span className={`text-[9px] font-black uppercase px-1.5 py-0.5 rounded border ${meta.classes}`}>{meta.label}</span>
                           {e.status !== 'paid' && e.status !== 'cancelled' && (
-                            <button onClick={() => handleMarkSettled(e)} title={e.type === 'income' ? 'Marcar como recebido' : 'Marcar como pago'} className="p-1.5 rounded-lg bg-next-green-success/10 border border-next-green-success/20 text-next-green-success">
+                            <button onClick={() => openReceive(e)} title={e.type === 'income' ? 'Marcar como recebido' : 'Marcar como pago'} className="p-1.5 rounded-lg bg-next-green-success/10 border border-next-green-success/20 text-next-green-success">
                               <CheckCircle2 className="w-3.5 h-3.5" />
                             </button>
                           )}
@@ -1921,6 +2117,14 @@ Use "income" quando o comprovante for de um valor recebido de paciente (ex: reci
                 </div>
               )}
 
+              <div>
+                <label className="text-[10px] font-mono text-slate-500 uppercase">Profissional (opcional — só se souber com certeza quem gerou esta receita)</label>
+                <select value={form.professionalId} onChange={(e) => setForm(f => ({ ...f, professionalId: e.target.value }))} className="w-full bg-slate-900 border border-next-border rounded-lg text-xs text-slate-200 px-3 py-2 mt-1">
+                  <option value="">— Não informado —</option>
+                  {teamMembers.map(m => <option key={m.id} value={m.id}>{m.name}</option>)}
+                </select>
+              </div>
+
               <button
                 onClick={handleSaveEntry}
                 disabled={saving || !form.description.trim() || !form.totalAmount}
@@ -1928,6 +2132,50 @@ Use "income" quando o comprovante for de um valor recebido de paciente (ex: reci
               >
                 {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-3.5 h-3.5" />}
                 <span>{saving ? 'Gravando...' : 'Salvar lançamento (real)'}</span>
+              </button>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* RECEIVE DRAWER */}
+      <AnimatePresence>
+        {receivingEntry && (
+          <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="fixed inset-0 bg-black/60 z-50 flex items-center justify-center p-4" onClick={closeReceive}>
+            <motion.div
+              initial={{ opacity: 0, scale: 0.96 }} animate={{ opacity: 1, scale: 1 }} exit={{ opacity: 0, scale: 0.96 }}
+              onClick={(e) => e.stopPropagation()}
+              className="bg-next-bg-card border border-next-border rounded-next-2xl p-6 w-full max-w-md space-y-4"
+            >
+              <div className="flex items-center justify-between">
+                <h3 className="text-sm font-bold text-slate-200">{receivingEntry.type === 'income' ? 'Receber pagamento' : 'Confirmar pagamento'}</h3>
+                <button onClick={closeReceive} className="text-slate-500 hover:text-slate-200"><X className="w-4 h-4" /></button>
+              </div>
+              <p className="text-xs text-slate-400">{receivingEntry.description}</p>
+              <div>
+                <label className="text-[10px] font-mono text-slate-500 uppercase">Saldo em aberto</label>
+                <p className="text-sm font-bold text-slate-200">{formatCurrency(receivingEntry.pendingAmount || receivingEntry.totalAmount)}</p>
+              </div>
+              <div>
+                <label className="text-[10px] font-mono text-slate-500 uppercase">Valor recebido agora (R$)</label>
+                <input
+                  type="number"
+                  value={receiveAmountInput}
+                  onChange={(e) => setReceiveAmountInput(e.target.value)}
+                  max={receivingEntry.pendingAmount || receivingEntry.totalAmount}
+                  className="w-full bg-slate-900 border border-next-border rounded-lg text-xs text-slate-200 px-3 py-2 mt-1"
+                />
+                {Number(receiveAmountInput) > (receivingEntry.pendingAmount || receivingEntry.totalAmount) + 0.005 && (
+                  <p className="text-[10px] text-next-orange-insight mt-1">Valor maior que o saldo — será considerado o saldo total.</p>
+                )}
+              </div>
+              <button
+                onClick={() => handleConfirmSettlement(receivingEntry, Number(receiveAmountInput) || 0)}
+                disabled={confirmingReceive || !receiveAmountInput || Number(receiveAmountInput) <= 0}
+                className="w-full inline-flex items-center justify-center gap-2 px-4 py-3 next-brand-gradient-bg text-white font-bold text-xs rounded-xl shadow-next-glow-purple disabled:opacity-50"
+              >
+                {confirmingReceive ? <Loader2 className="w-4 h-4 animate-spin" /> : <CheckCircle2 className="w-3.5 h-3.5" />}
+                <span>{confirmingReceive ? 'Confirmando...' : 'Confirmar recebimento'}</span>
               </button>
             </motion.div>
           </motion.div>

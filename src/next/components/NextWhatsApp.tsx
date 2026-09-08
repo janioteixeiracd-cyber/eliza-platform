@@ -18,10 +18,11 @@ import {
 import { useAuth } from '../../contexts/AuthContext';
 import { useNextReadOnly } from '../context/NextReadOnlyContext';
 import { secureGetDocs } from '../services/next-db';
-import { collection, query, limit } from 'firebase/firestore';
+import { collection, query, limit, orderBy, onSnapshot, doc as fsDoc, updateDoc } from 'firebase/firestore';
 import { db } from '../../lib/firebase';
 import { getGenAI } from '../../lib/gemini';
 import { normalizeFinancialEntry } from '../../utils/financialHelpers';
+import { Loader2 } from 'lucide-react';
 
 interface PatientLite { id: string; name: string; phone?: string; }
 interface AppointmentLite { patientName: string; patientId?: string; date?: string; time?: string; treatment?: string; status?: string; }
@@ -36,6 +37,26 @@ interface Signal {
   phone?: string;
   detail: string;
   amount?: number;
+}
+
+interface WaConversation {
+  id: string;
+  patientId?: string;
+  patientName?: string;
+  patientPhone?: string;
+  lastMessage?: string;
+  lastMessageAt?: any;
+  unreadCount?: number;
+  status?: string;
+}
+
+interface WaMessage {
+  id: string;
+  direction: 'inbound' | 'outbound';
+  text: string;
+  timestamp?: any;
+  status?: string;
+  sentByName?: string | null;
 }
 
 function toDate(v: any): Date | null {
@@ -54,6 +75,27 @@ function formatCurrency(v: number): string {
   return (v || 0).toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' });
 }
 
+function formatTime(v: any): string {
+  const d = toDate(v);
+  if (!d) return '';
+  const datePart = d.toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit' });
+  const timePart = d.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
+  return `${datePart} ${timePart}`;
+}
+
+function formatRelativeShort(v: any): string {
+  const d = toDate(v);
+  if (!d) return '';
+  const diffMin = Math.floor((Date.now() - d.getTime()) / 60000);
+  if (diffMin < 1) return 'agora';
+  if (diffMin < 60) return `${diffMin}min`;
+  const diffH = Math.floor(diffMin / 60);
+  if (diffH < 24) return `${diffH}h`;
+  const diffD = Math.floor(diffH / 24);
+  if (diffD < 7) return `${diffD}d`;
+  return d.toLocaleDateString('pt-BR');
+}
+
 function waLink(phone?: string, text?: string): string | null {
   const clean = (phone || '').replace(/\D/g, '');
   if (!clean) return null;
@@ -69,8 +111,10 @@ const CATEGORY_META: Record<SignalCategory, { label: string; icon: any; classes:
 };
 
 export default function NextWhatsApp() {
-  const { clinic } = useAuth();
+  const { clinic, user, profile } = useAuth();
   const { addAuditLog } = useNextReadOnly();
+
+  const [activeTab, setActiveTab] = useState<'conversas' | 'pendencias'>('conversas');
 
   const [patients, setPatients] = useState<PatientLite[]>([]);
   const [appointments, setAppointments] = useState<AppointmentLite[]>([]);
@@ -85,15 +129,80 @@ export default function NextWhatsApp() {
   const [draftLoading, setDraftLoading] = useState(false);
   const [draftError, setDraftError] = useState<string | null>(null);
 
+  // --- Conversas (inbox real de WhatsApp, via Twilio/Meta) ---------------
+  const [conversations, setConversations] = useState<WaConversation[]>([]);
+  const [conversationsLoading, setConversationsLoading] = useState(true);
+  const [selectedConvoId, setSelectedConvoId] = useState<string | null>(null);
+  const [messages, setMessages] = useState<WaMessage[]>([]);
+  const [replyText, setReplyText] = useState('');
+  const [sendingReply, setSendingReply] = useState(false);
+  const [sendError, setSendError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!clinic?.id) return;
+    const q = query(collection(db, 'clinics', clinic.id, 'whatsapp_conversations'), orderBy('lastMessageAt', 'desc'), limit(100));
+    const unsub = onSnapshot(q, (snap) => {
+      setConversations(snap.docs.map(d => ({ id: d.id, ...(d.data() as any) })));
+      setConversationsLoading(false);
+    }, (err) => {
+      console.error('Failed to load WhatsApp conversations:', err);
+      setConversationsLoading(false);
+    });
+    return () => unsub();
+  }, [clinic?.id]);
+
+  useEffect(() => {
+    if (!clinic?.id || !selectedConvoId) { setMessages([]); return; }
+    const convoRef = fsDoc(db, 'clinics', clinic.id, 'whatsapp_conversations', selectedConvoId);
+    const unsub = onSnapshot(
+      query(collection(convoRef, 'messages'), orderBy('timestamp', 'asc'), limit(500)),
+      (snap) => setMessages(snap.docs.map(d => ({ id: d.id, ...(d.data() as any) }))),
+      (err) => console.error('Failed to load WhatsApp message thread:', err)
+    );
+    updateDoc(convoRef, { unreadCount: 0 }).catch(() => {});
+    return () => unsub();
+  }, [clinic?.id, selectedConvoId]);
+
+  const selectedConversation = conversations.find(c => c.id === selectedConvoId) || null;
+
+  async function handleSendReply(e: React.FormEvent) {
+    e.preventDefault();
+    if (!clinic?.id || !selectedConvoId || !replyText.trim()) return;
+    setSendingReply(true);
+    setSendError(null);
+    try {
+      const response = await fetch('/api/whatsapp/send', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          clinicId: clinic.id,
+          conversationId: selectedConvoId,
+          text: replyText.trim(),
+          sentByUserId: user?.uid || null,
+          sentByName: profile?.name || null,
+          source: 'next_inbox',
+        }),
+      });
+      const resData = await response.json();
+      if (!response.ok) throw new Error(resData.error || 'Falha ao enviar mensagem.');
+      setReplyText('');
+      addAuditLog({ collection: 'whatsapp_conversations', action: 'WRITE', status: 'SUCCESS', details: `Mensagem enviada via WhatsApp para ${selectedConvoId}.` });
+    } catch (err: any) {
+      setSendError(err?.message || 'Erro ao enviar mensagem.');
+    } finally {
+      setSendingReply(false);
+    }
+  }
+
   useEffect(() => {
     async function loadData() {
       if (!clinic?.id) return;
       setLoading(true);
       try {
         const [patientsSnap, apptsSnap, finSnap] = await Promise.all([
-          secureGetDocs(query(collection(db, 'clinics', clinic.id, 'patients'), limit(300)), 'patients', { addAuditLog }),
-          secureGetDocs(query(collection(db, 'clinics', clinic.id, 'appointments'), limit(300)), 'appointments', { addAuditLog }),
-          secureGetDocs(query(collection(db, 'clinics', clinic.id, 'financial_entries'), limit(300)), 'financial_entries', { addAuditLog }),
+          secureGetDocs(query(collection(db, 'clinics', clinic.id, 'patients'), limit(8000)), 'patients', { addAuditLog }),
+          secureGetDocs(query(collection(db, 'clinics', clinic.id, 'appointments'), limit(2000)), 'appointments', { addAuditLog }),
+          secureGetDocs(query(collection(db, 'clinics', clinic.id, 'financial_entries'), limit(3000)), 'financial_entries', { addAuditLog }),
         ]);
 
         setPatients(patientsSnap.docs.map(d => ({ id: d.id, name: (d.data() as any).name || 'Sem nome', phone: (d.data() as any).phone })));
@@ -281,8 +390,8 @@ Responda ESTRITAMENTE em JSON válido, sem markdown: {"message":"texto da mensag
             </h1>
 
             <p className="text-slate-400 text-sm max-w-2xl leading-relaxed">
-              Pendências reais de agenda e financeiro desta clínica, com rascunho de mensagem gerado pela Eliza e
-              envio pelo seu próprio WhatsApp — nada é disparado automaticamente.
+              Conversas reais do WhatsApp oficial da clínica (Twilio/Meta) e pendências de agenda/financeiro com
+              rascunho de mensagem gerado pela Eliza.
             </p>
           </div>
 
@@ -299,6 +408,145 @@ Responda ESTRITAMENTE em JSON válido, sem markdown: {"message":"texto da mensag
         </div>
       </div>
 
+      {/* TAB SWITCHER */}
+      <div className="flex items-center gap-2">
+        <button
+          onClick={() => setActiveTab('conversas')}
+          className={`px-4 py-2 rounded-xl text-xs font-bold font-mono transition-all flex items-center gap-2 ${
+            activeTab === 'conversas' ? 'bg-next-purple-neon/20 border border-next-purple-neon/40 text-next-purple-light' : 'bg-slate-950/60 border border-next-border text-slate-500 hover:text-slate-300'
+          }`}
+        >
+          <MessageSquare className="w-3.5 h-3.5" /> Conversas
+          {conversations.some(c => (c.unreadCount || 0) > 0) && (
+            <span className="w-1.5 h-1.5 rounded-full bg-next-red-alert" />
+          )}
+        </button>
+        <button
+          onClick={() => setActiveTab('pendencias')}
+          className={`px-4 py-2 rounded-xl text-xs font-bold font-mono transition-all flex items-center gap-2 ${
+            activeTab === 'pendencias' ? 'bg-next-purple-neon/20 border border-next-purple-neon/40 text-next-purple-light' : 'bg-slate-950/60 border border-next-border text-slate-500 hover:text-slate-300'
+          }`}
+        >
+          <Sparkles className="w-3.5 h-3.5" /> Pendências
+        </button>
+      </div>
+
+      {activeTab === 'conversas' && (
+        <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 items-start">
+          <div className="lg:col-span-5 bg-next-bg-card border border-next-border rounded-next-2xl p-4 md:p-5 shadow-next-glass space-y-3">
+            <h3 className="text-xs font-bold text-slate-400 uppercase tracking-wider font-mono">Conversas reais (Twilio/Meta)</h3>
+            <div className="space-y-2 max-h-[520px] overflow-y-auto pr-1">
+              {conversationsLoading ? (
+                <div className="text-center py-12 font-mono text-xs text-slate-500 space-y-2">
+                  <RefreshCw className="w-5 h-5 animate-spin mx-auto text-next-purple-neon" />
+                  <span>Carregando conversas...</span>
+                </div>
+              ) : conversations.length === 0 ? (
+                <div className="border border-dashed border-next-border bg-slate-950/40 rounded-next-xl p-6 text-center space-y-3">
+                  <MessageSquare className="w-8 h-8 text-slate-600 mx-auto" />
+                  <div className="space-y-1">
+                    <h4 className="text-xs font-bold text-slate-300">Nenhuma conversa ainda</h4>
+                    <p className="text-[10.5px] text-slate-500 max-w-xs mx-auto leading-relaxed">
+                      Assim que um paciente mandar mensagem para o número oficial do WhatsApp, ela aparece aqui.
+                    </p>
+                  </div>
+                </div>
+              ) : (
+                conversations.map(c => {
+                  const unread = c.unreadCount || 0;
+                  const name = c.patientName || c.patientPhone || c.id;
+                  return (
+                    <div
+                      key={c.id}
+                      onClick={() => setSelectedConvoId(c.id)}
+                      className={`p-3 rounded-next-xl transition-all border cursor-pointer ${
+                        selectedConvoId === c.id ? 'bg-slate-900 border-next-purple-neon/60 shadow-next-glow-purple' : 'bg-slate-950/40 border-next-border/60 hover:border-next-border-glow'
+                      }`}
+                    >
+                      <div className="flex items-start gap-2.5">
+                        <div className="w-7 h-7 rounded-full bg-slate-950 border border-next-border flex items-center justify-center text-[11px] font-bold font-mono text-next-purple-light flex-shrink-0">
+                          {name.charAt(0).toUpperCase()}
+                        </div>
+                        <div className="min-w-0 flex-1 space-y-0.5">
+                          <div className="flex items-center justify-between gap-2">
+                            <h4 className="text-xs font-bold text-slate-200 truncate">{name}</h4>
+                            <span className="text-[9.5px] text-slate-500 font-mono flex-shrink-0">{formatRelativeShort(c.lastMessageAt)}</span>
+                          </div>
+                          <div className="flex items-center justify-between gap-2">
+                            <p className="text-[10.5px] text-slate-400 line-clamp-1">{c.lastMessage || '—'}</p>
+                            {unread > 0 && (
+                              <span className="text-[9px] font-black text-white bg-next-red-alert rounded-full w-4 h-4 flex items-center justify-center flex-shrink-0">{unread}</span>
+                            )}
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })
+              )}
+            </div>
+          </div>
+
+          <div className="lg:col-span-7">
+            {selectedConversation ? (
+              <div className="bg-next-bg-card border border-next-border rounded-next-2xl shadow-next-glass flex flex-col h-[560px]">
+                <div className="flex items-center gap-3 border-b border-next-border p-4">
+                  <div className="w-8 h-8 rounded-full bg-slate-950 border border-next-border flex items-center justify-center text-xs font-bold text-next-purple-light font-mono flex-shrink-0">
+                    {(selectedConversation.patientName || selectedConversation.id).charAt(0).toUpperCase()}
+                  </div>
+                  <div className="min-w-0">
+                    <h3 className="text-sm font-bold text-slate-100 truncate">{selectedConversation.patientName || 'Contato sem nome'}</h3>
+                    <span className="text-[10px] text-slate-500 font-mono">{selectedConversation.patientPhone || selectedConversation.id}</span>
+                  </div>
+                </div>
+
+                <div className="flex-1 overflow-y-auto p-4 space-y-2">
+                  {messages.length === 0 ? (
+                    <p className="text-[11px] text-slate-500 text-center py-8">Sem mensagens carregadas ainda.</p>
+                  ) : messages.map(m => (
+                    <div key={m.id} className={`flex ${m.direction === 'outbound' ? 'justify-end' : 'justify-start'}`}>
+                      <div className={`max-w-[80%] rounded-lg px-3 py-2 text-xs leading-relaxed ${
+                        m.direction === 'outbound' ? 'next-brand-gradient-bg text-white' : 'bg-slate-800 text-slate-200'
+                      }`}>
+                        <p>{m.text}</p>
+                        <p className={`text-[9px] mt-1 font-mono ${m.direction === 'outbound' ? 'text-white/60' : 'text-slate-500'}`}>
+                          {formatTime(m.timestamp)}{m.direction === 'outbound' && m.status === 'failed' ? ' · falhou' : ''}
+                        </p>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+
+                <form onSubmit={handleSendReply} className="border-t border-next-border p-3 flex items-end gap-2">
+                  <textarea
+                    value={replyText}
+                    onChange={(e) => setReplyText(e.target.value)}
+                    rows={1}
+                    placeholder="Responder pelo WhatsApp oficial..."
+                    className="flex-1 bg-slate-900 border border-next-border rounded-lg text-xs text-slate-200 placeholder-slate-600 px-3 py-2.5 resize-none focus:outline-none focus:border-next-purple-neon"
+                  />
+                  <button
+                    type="submit"
+                    disabled={sendingReply || !replyText.trim()}
+                    className="w-10 h-10 flex-shrink-0 inline-flex items-center justify-center next-brand-gradient-bg text-white rounded-lg disabled:opacity-50"
+                  >
+                    {sendingReply ? <Loader2 className="w-4 h-4 animate-spin" /> : <Send className="w-4 h-4" />}
+                  </button>
+                </form>
+                {sendError && <p className="text-[10.5px] text-next-red-alert px-3 pb-3">{sendError}</p>}
+              </div>
+            ) : (
+              <div className="bg-slate-900/30 border border-dashed border-next-border rounded-next-2xl p-12 text-center text-slate-500 text-xs leading-normal h-[560px] flex flex-col items-center justify-center">
+                <MessageSquare className="w-10 h-10 text-slate-600 mx-auto mb-2" />
+                <span>Selecione uma conversa ao lado para ver e responder as mensagens.</span>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {activeTab === 'pendencias' && (
+      <>
       {/* 2. REAL COUNTERS */}
       <div className="grid grid-cols-1 md:grid-cols-3 gap-5">
         {(Object.keys(CATEGORY_META) as SignalCategory[]).map(cat => {
@@ -501,9 +749,11 @@ Responda ESTRITAMENTE em JSON válido, sem markdown: {"message":"texto da mensag
       <div className="bg-slate-900 border border-next-border/60 rounded-xl p-4 flex items-start gap-3 text-[11px] text-slate-500 leading-relaxed font-mono">
         <AlertTriangle className="w-4 h-4 text-amber-500 flex-shrink-0 mt-0.5" />
         <span>
-          As pendências acima vêm de dados reais (agenda e financeiro desta clínica). O envio de mensagens depende de uma integração de mensageria própria (Twilio ou WhatsApp Cloud API) — por enquanto, o botão abre o WhatsApp Web/app com o texto pronto, e você decide se envia.
+          As pendências acima vêm de dados reais (agenda e financeiro desta clínica). Este fluxo continua manual de propósito — o botão abre o WhatsApp Web/app com o texto pronto, e você decide se envia. Para conversas que já chegaram pelo número oficial (Twilio/Meta), use a aba "Conversas".
         </span>
       </div>
+      </>
+      )}
 
     </div>
   );

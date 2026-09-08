@@ -615,7 +615,10 @@ export default function MedicalRecordView({ preSelectedId, onSelectPatient, onSc
       }
     });
 
-    const integrationRef = doc(db, 'clinics', clinic.id, 'integrations', 'whatsapp');
+    // Rodada final de fechamento (Seção 12 do plano) — lê só o doc
+    // sanitizado; nunca precisou de phoneNumberId/wabaId/token aqui, só
+    // `.status`, que também existe em whatsapp_status.
+    const integrationRef = doc(db, 'clinics', clinic.id, 'integrations', 'whatsapp_status');
     const unsubIntegration = onSnapshot(integrationRef, (snap) => {
       if (snap.exists()) {
         setWaIntegration(snap.data());

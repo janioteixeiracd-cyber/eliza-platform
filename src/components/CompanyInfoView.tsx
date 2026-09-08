@@ -1,102 +1,59 @@
-import React from 'react';
-import { motion } from 'motion/react';
-import { ShieldCheck, MapPin, Phone, Mail, FileText, ArrowLeft, Building2 } from 'lucide-react';
-import { useNavigate } from 'react-router-dom';
+/**
+ * Página institucional pública (`/company`) — conteúdo/layout/CSS
+ * copiados literalmente do pacote premium aprovado
+ * (eliza-premium-entrega/app/company/page.tsx), fonte canônica. Rota
+ * preservada, pública, sem autenticação.
+ *
+ * Correção de texto (rodada de refinamento pré-deploy): campo
+ * "Atendimento" não promete mais "protocolo" — nenhuma geração formal de
+ * número de protocolo existe hoje no backend (`grep` confirmado em
+ * server.ts) — trocado por "confirmação de recebimento e acompanhamento
+ * pelo canal informado". Nenhum outro trecho, seção ou layout alterado.
+ *
+ * Adaptação técnica: `next/link` → `Link` do react-router; wrapper
+ * `.eliza-premium-landing` (ver publicLandingLegal.css) pros resets
+ * escopados de link/tipografia.
+ */
+import { Link } from 'react-router-dom';
+import './publicLandingLegal.css';
+
+function Footer() {
+  return (
+    <footer className="info-footer">
+      <span>ELIZA Clínica Inteligente</span>
+      <nav><Link to="/privacy">Privacidade</Link><Link to="/terms">Termos</Link><Link to="/data-deletion">Exclusão de dados</Link></nav>
+    </footer>
+  );
+}
 
 export default function CompanyInfoView() {
-  const navigate = useNavigate();
-
   return (
-    <div className="min-h-screen bg-slate-50 flex items-center justify-center py-12 px-6 bg-[radial-gradient(circle_at_top_right,_var(--tw-gradient-stops))] from-slate-100 via-slate-50 to-white text-left font-sans">
-      <motion.div 
-        initial={{ opacity: 0, y: 15 }}
-        animate={{ opacity: 1, y: 0 }}
-        className="max-w-xl w-full bg-white p-8 sm:p-12 rounded-[2.5rem] shadow-2xl border border-slate-200/60 relative overflow-hidden flex flex-col gap-8"
-      >
-        {/* Visual Premium Frame */}
-        <div className="absolute top-0 left-0 right-0 h-2 bg-gradient-to-r from-teal-500 to-emerald-500" />
-        
-        {/* Header */}
-        <div className="space-y-3">
-          <div className="flex items-center justify-between">
-            <span className="px-3.5 py-1.5 bg-teal-550/10 border border-teal-500/20 text-teal-700 rounded-full text-[9px] font-black uppercase tracking-widest leading-none inline-flex items-center gap-1.5 shadow-sm">
-              <ShieldCheck className="w-3.5 h-3.5" /> Verificado Pela ELIZA
-            </span>
-            <button 
-              onClick={() => navigate('/')}
-              className="text-slate-400 hover:text-slate-600 transition-all text-xs font-bold uppercase tracking-wider flex items-center gap-1 bg-transparent border-none cursor-pointer"
-            >
-              <ArrowLeft className="w-3.5 h-3.5" /> Voltar
-            </button>
-          </div>
-          <h1 className="text-2xl sm:text-3xl font-black text-slate-900 tracking-tight leading-tight uppercase font-sans mt-2">
-            Informações da Empresa
-          </h1>
-          <p className="text-[11px] text-slate-400 font-bold uppercase tracking-widest leading-normal">
-            Dados para Verificações Empresariais e Credenciais da Plataforma
-          </p>
+    <main className="eliza-premium-landing info-page">
+      <header className="info-nav">
+        <Link to="/"><img src="/eliza-wordmark.png" alt="ELIZA" /></Link>
+        <Link to="/" className="info-back">← Voltar ao início</Link>
+      </header>
+      <article className="info-content">
+        <p className="section-kicker">EMPRESA • TECNOLOGIA • SUPORTE</p>
+        <h1>ELIZA Clínica Inteligente</h1>
+        <p className="info-lead">Plataforma brasileira de gestão e inteligência para clínicas, com tecnologia de comunicação integrada e foco em uma rotina mais conectada, segura e humana.</p>
+        <section><h2><span>01</span>Quem somos</h2><p>A ELIZA conecta agenda, pacientes, prontuário, financeiro, relatórios, automações e inteligência aplicada à rotina. Nosso propósito é reduzir trabalho disperso e ajudar profissionais e equipes a perceberem o que exige atenção.</p></section>
+        <section><h2><span>02</span>Provedora de tecnologia</h2><p>A ELIZA desenvolve integração para permitir que clínicas conectem suas próprias contas à WhatsApp Business Platform por fluxos autorizados da Meta. A clínica mantém a titularidade de sua conta, número e relacionamento com os pacientes. A ELIZA atua como provedora técnica dentro das permissões concedidas.</p></section>
+        <section><h2><span>03</span>Independência de marcas</h2><p>Meta, WhatsApp e WhatsApp Business Platform são marcas e serviços de terceiros. A ELIZA não é controlada, patrocinada ou afiliada à Meta e utiliza essas denominações apenas para identificar integrações compatíveis.</p></section>
+        <div className="company-data">
+          <div><small>Marca / plataforma</small><strong>ELIZA CLÍNICA INTELIGENTE</strong></div>
+          <div><small>Razão social</small><strong>JANIO TEIXEIRA DA SILVA JUNIOR LTDA</strong></div>
+          <div><small>CNPJ</small><strong>37.421.772/0001-07</strong></div>
+          <div><small>Sede oficial</small><strong>Rua Pedro Celestino, 949, Centro<br />Fátima do Sul – MS, CEP 79700-000</strong></div>
+          <div><small>Suporte e privacidade</small><strong>admin@elizaclinic.com.br</strong></div>
+          <div><small>Atendimento</small><strong>Solicitações recebidas por e-mail, com confirmação de recebimento e acompanhamento pelo canal informado.</strong></div>
         </div>
-
-        {/* Content body */}
-        <div className="space-y-6 divide-y divide-slate-105">
-          {/* Platform name */}
-          <div className="pt-2">
-            <h2 className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-1.5">Plataforma</h2>
-            <p className="text-sm font-black text-slate-800 uppercase tracking-normal">ELIZA Dental Platform</p>
-          </div>
-
-          {/* Legal Operator */}
-          <div className="pt-5 space-y-1">
-            <h2 className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-1.5 flex items-center gap-1">
-              <Building2 className="w-3.5 h-3.5 text-slate-500" /> Razão Social / Operador
-            </h2>
-            <p className="text-sm font-bold text-slate-800">JANIO TEIXEIRA DA SILVA JUNIOR LTDA</p>
-          </div>
-
-          {/* CNPJ */}
-          <div className="pt-5 space-y-1">
-            <h2 className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-1.5 flex items-center gap-1">
-              <FileText className="w-3.5 h-3.5 text-slate-500" /> Inscrição CNPJ
-            </h2>
-            <p className="text-sm font-mono font-black text-slate-800">37.421.772/0002-98</p>
-          </div>
-
-          {/* Address */}
-          <div className="pt-5 space-y-2">
-            <h2 className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-1.5 flex items-center gap-1">
-              <MapPin className="w-3.5 h-3.5 text-slate-500" /> Sede Oficial
-            </h2>
-            <div className="text-xs font-semibold text-slate-705 leading-relaxed space-y-0.5">
-              <p>Avenida Padre José Daniel, 94</p>
-              <p>Centro</p>
-              <p>Vicentina – MS</p>
-              <p className="font-mono font-bold text-slate-800">CEP 79710-000</p>
-            </div>
-          </div>
-
-          {/* Contacts */}
-          <div className="pt-5 grid grid-cols-1 sm:grid-cols-2 gap-4">
-            <div className="space-y-1">
-              <h2 className="text-[10px] font-black text-slate-400 uppercase tracking-widest flex items-center gap-1">
-                <Phone className="w-3.5 h-3.5 text-slate-500" /> Telefone
-              </h2>
-              <p className="text-xs font-semibold text-slate-850">(67) 99633-0065</p>
-            </div>
-            <div className="space-y-1">
-              <h2 className="text-[10px] font-black text-slate-400 uppercase tracking-widest flex items-center gap-1">
-                <Mail className="w-3.5 h-3.5 text-slate-500" /> E-mail de Contato
-              </h2>
-              <p className="text-xs font-semibold text-slate-850">admin@elizaclinic.com.br</p>
-            </div>
-          </div>
-        </div>
-
-        {/* Footer info lock */}
-        <div className="pt-4 border-t border-slate-100 flex items-center justify-between text-[9px] font-bold text-slate-405 uppercase tracking-wider">
-          <span>© {new Date().getFullYear()} ELIZA Platform</span>
-          <span>Todos os direitos reservados</span>
-        </div>
-      </motion.div>
-    </div>
+        <aside className="legal-callout">
+          <strong>Documentos públicos</strong>
+          <p>Consulte nossa <Link to="/privacy">Política de Privacidade</Link>, <Link to="/terms">Termos de Uso</Link> e <Link to="/data-deletion">Instruções de exclusão e desconexão</Link>.</p>
+        </aside>
+      </article>
+      <Footer />
+    </main>
   );
 }

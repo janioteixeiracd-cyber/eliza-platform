@@ -2,6 +2,8 @@ import "dotenv/config";
 import express from "express";
 import path from "path";
 import fs from "fs";
+import crypto from "crypto";
+import { rateLimit } from "express-rate-limit";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI } from "@google/genai";
 import { OpenAI } from "openai";
@@ -12,11 +14,38 @@ import { initializeApp, getApps, applicationDefault } from "firebase-admin/app";
 import { getFirestore, FieldValue, FieldPath } from "firebase-admin/firestore";
 import { getAuth as getAdminAuth } from "firebase-admin/auth";
 
-// ELIZA Intelligence Layer
+// ELIZA Intelligence Layer (v1 — kept running as-is; see plan notes before
+// removing: unused by any real screen today, JWT-based auth, not the layer
+// new code calls into)
 import { elizaIntelligence } from "./src/lib/elizaIntelligence";
 import { elizaAuthMiddleware } from "./src/lib/elizaAuthService";
-import { ElizaIntelligenceRequest, ElizaError } from "./src/types/eliza-intelligence";
+import { ElizaIntelligenceRequest, ElizaError, ElizaErrorCode } from "./src/types/eliza-intelligence";
 import * as authController from "./src/controllers/authController";
+
+// ELIZA Intelligence v2 — real Firebase-auth orchestrator, deterministic
+// tools, rule-based Insight Engine. See src/lib/elizaCore/.
+import { authenticateElizaRequest, authenticateAcademyRequest, canAccessFinance, validatePatientBelongsToClinic } from "./src/lib/elizaCore/auth";
+import { normalizeFunctionalRole, FUNCTIONAL_ROLE_LABELS, ROLE_FRAMING_HINTS } from "./src/lib/elizaCore/functionalRole";
+import { checkStandingGaps } from "./src/lib/elizaCore/insightGapBridge";
+import { getAgendaAnalysis, getFinancialSummary, comparePeriods, getOpenBudgets, getRecallCandidates, getPendingItems, getPatientContext, resolvePatientsByName } from "./src/lib/elizaCore/tools";
+import { buildInsights } from "./src/lib/elizaCore/insightEngine";
+import type { Insight } from "./src/lib/elizaCore/types";
+import { ACTION_REGISTRY, ACTIONS_REQUIRING_ADMIN, type ActionType } from "./src/lib/elizaCore/actions";
+import { detectFinishedAppointmentWithoutClinicalUpdate } from "./src/lib/elizaCore/cognitiveEvents";
+import { getTemporalOverview, detectTemporalChanges } from "./src/lib/elizaCore/temporal";
+import { getTemplateForId, DOCUMENT_TYPE_LABELS, type DocumentType } from "./src/lib/planningTemplates";
+
+// Cadastro → Checkout (Asaas) + e-mails via Hostinger SMTP
+import { findOrCreateAsaasCustomer, createAsaasSubscription } from "./src/server/asaasClient";
+import { sendVerificationEmail, sendPaymentConfirmationEmail, sendClinicCreatedEmail, sendPlanChangedEmail, sendAdminPasswordChangedEmail } from "./src/server/mailer";
+import { PLAN_ROLE_LABELS, type PlanRole } from "./src/lib/planCapabilities";
+
+// WhatsApp Embedded Signup (Coexistence) — plano vast-yawning-hamster.md v4.
+// Etapa A, fase local seguinte: só start-attempt/exchange, clientes de
+// Secret Manager e Graph API mockados nos testes, nenhuma chamada real.
+import { getSecretManagerClient } from "./src/lib/secretManager";
+import { getWhatsAppGraphClient } from "./src/lib/whatsappGraphClient";
+import { getWhatsAppSecretProvisioner } from "./src/lib/whatsappSecretProvisioner";
 
 // Simples Dental Bridge integration surface — read-only, Fase 1 (ver
 // SHADOW_MODE_READINESS.md no repositório da Bridge). Autenticação própria,
@@ -24,6 +53,8 @@ import * as authController from "./src/controllers/authController";
 // Firestore.
 import { createBridgeAuthMiddleware } from "./src/lib/bridgeAuth";
 import { fetchBridgePatientState } from "./src/lib/bridgeState";
+import { createBridgeSyncAuthMiddleware } from "./src/lib/bridgeSyncAuth";
+import { upsertAppointmentFromBridge, upsertFinancialEntryFromBridge, BridgePatientNotFoundError } from "./src/lib/bridgeSync";
 
 const AdminFieldValue = FieldValue;
 
@@ -52,6 +83,37 @@ async function startServer() {
 
   const app = express();
   const PORT = 3000;
+
+  // WhatsApp webhook route — registered BEFORE the global body parsers
+  // below so THIS route's own Content-Type-branching middleware controls
+  // how the body is parsed, instead of the global one. Meta needs the raw
+  // Buffer intact to verify X-Hub-Signature-256 over the exact bytes;
+  // Twilio needs the fully-parsed params object for twilio.validateRequest()
+  // (its signature is computed over the parsed fields, not raw bytes) — a
+  // naive express.raw() alone on this route would silently break Twilio,
+  // since a Content-Type it doesn't match just skips straight to the
+  // handler with req.body unset, never falling through to a parser that
+  // understands it. The two handler functions are declared further down
+  // in this file as hoisted function declarations, so referencing them
+  // here (before their textual definition) resolves correctly — and by
+  // the time either is actually invoked (an incoming request, always
+  // after startServer() has finished running), every const it closes over
+  // (adminDb, etc.) is already initialized.
+  app.get("/api/whatsapp/webhook", (req, res) => whatsappWebhookGetHandler(req, res));
+  app.post(
+    "/api/whatsapp/webhook",
+    (req, res, next) => {
+      const contentType = req.headers["content-type"] || "";
+      if (contentType.includes("application/json")) {
+        express.raw({ type: "application/json", limit: "1mb" })(req, res, next);
+      } else if (contentType.includes("application/x-www-form-urlencoded")) {
+        express.urlencoded({ extended: true, limit: "1mb" })(req, res, next);
+      } else {
+        res.status(415).send("Unsupported Content-Type");
+      }
+    },
+    (req, res) => whatsappWebhookPostHandler(req, res)
+  );
 
   // Middleware for parsing json with sufficient limit for base64 invoices/images
   app.use(express.json({ limit: "50mb" }));
@@ -286,14 +348,14 @@ async function startServer() {
     // out of fallback entirely via aiProviderFallback: "none"/"nenhum".
     const fallbackProviderFromConfig = (clinicConfig.aiProviderFallback || "gemini").toLowerCase();
 
-    let firstProvider = preferredProvider || "openai";
-    let secondProvider = (firstProvider === "openai") ? "gemini" : "openai";
+    let firstProvider: "openai" | "gemini" = preferredProvider || "openai";
+    let secondProvider: "openai" | "gemini" | "none" = (firstProvider === "openai") ? "gemini" : "openai";
 
     if (fallbackProviderFromConfig === "none" || fallbackProviderFromConfig === "nenhum") {
       secondProvider = "none";
     }
 
-    const criticalTasks = ["anamnese_dossie", "planejamento_facial", "receituario_interacoes", "risco_clinico"];
+    const criticalTasks = ["anamnese_dossie", "planejamento_facial", "clinical_planning_analysis", "receituario_interacoes", "risco_clinico"];
     const isCritical = criticalTasks.includes(resolvedTaskType);
 
     // 4. Determine Models
@@ -703,12 +765,7 @@ Responda APENAS com o nome da intenção em letras maiúsculas (ex: GET_TODAY_AG
       // 1. Try matching staff members:
       try {
         const staffPath = `clinics/${clinicId}/staff_whatsapp_access`;
-        console.log("[WA_FIRESTORE_OP]", { 
-          operation: "READ", 
-          path: staffPath, 
-          clinicId, 
-          conversationId: toPhone 
-        });
+        logSanitizedWaInfo({ scope: "WA_OUTBOUND", event: "staff_match_read", clinicId, ref: toPhone });
         const staffSnap = await adminDb.collection(staffPath).get();
         const matchedStaff = staffSnap.docs.find(d => {
           const sData = d.data();
@@ -723,19 +780,14 @@ Responda APENAS com o nome da intenção em letras maiúsculas (ex: GET_TODAY_AG
           normalizedPhone = toPhone;
         }
       } catch (err) {
-        console.warn("[AUDIT] staff check failed:", err);
+        logSanitizedWaError({ scope: "WA_OUTBOUND", errorCode: "WA_STAFF_MATCH_FAILED", phase: "STAFF_MATCH", ref: toPhone, err });
       }
 
       if (!patientName) {
         // 2. Try matching patients
         try {
           const patientsPath = `clinics/${clinicId}/patients`;
-          console.log("[WA_FIRESTORE_OP]", { 
-            operation: "READ", 
-            path: patientsPath, 
-            clinicId, 
-            conversationId: toPhone 
-          });
+          logSanitizedWaInfo({ scope: "WA_OUTBOUND", event: "patient_match_read", clinicId, ref: toPhone });
           const patientsSnap = await adminDb.collection(patientsPath).get();
           const matchedPatient = patientsSnap.docs.find(d => {
             const pData = d.data() || {};
@@ -752,12 +804,7 @@ Responda APENAS com o nome da intenção em letras maiúsculas (ex: GET_TODAY_AG
           } else {
             // Check conversations
             const convoPath = `clinics/${clinicId}/whatsapp_conversations/${toPhone}`;
-            console.log("[WA_FIRESTORE_OP]", { 
-              operation: "READ", 
-              path: convoPath, 
-              clinicId, 
-              conversationId: toPhone 
-            });
+            logSanitizedWaInfo({ scope: "WA_OUTBOUND", event: "conversation_match_read", clinicId, ref: toPhone });
             const convoSnap = await adminDb.doc(convoPath).get();
             if (convoSnap.exists) {
               const convoData = convoSnap.data() || {};
@@ -769,18 +816,13 @@ Responda APENAS com o nome da intenção em letras maiúsculas (ex: GET_TODAY_AG
             }
           }
         } catch (err) {
-          console.warn("[AUDIT] patient check failed:", err);
+          logSanitizedWaError({ scope: "WA_OUTBOUND", errorCode: "WA_PATIENT_MATCH_FAILED", phase: "PATIENT_MATCH", ref: toPhone, err });
         }
       }
 
       try {
         const logsPath = `clinics/${clinicId}/integration_logs`;
-        console.log("[WA_FIRESTORE_OP]", { 
-          operation: "WRITE", 
-          path: logsPath, 
-          clinicId, 
-          conversationId: toPhone 
-        });
+        logSanitizedWaInfo({ scope: "WA_OUTBOUND", event: "audit_log_write", clinicId, ref: toPhone });
         await adminDb.collection(logsPath).add({
           type: "whatsapp_send",
           patientId,
@@ -794,12 +836,12 @@ Responda APENAS com o nome da intenção em letras maiúsculas (ex: GET_TODAY_AG
           errorMessage: errorMessage || null,
           createdAt: AdminFieldValue.serverTimestamp()
         });
-        console.log(`[WA_SEND_AUDIT] Logged attempt to ${toPhone}. Success: ${success}`);
+        logSanitizedWaInfo({ scope: "WA_OUTBOUND", event: "audit_log_recorded", clinicId, ref: toPhone, extra: { success } });
       } catch (err) {
-        console.warn("[WA_SEND_AUDIT_ERROR] Failed saving audit log for send attempt to integration_logs (ignoring so flow continues):", err);
+        logSanitizedWaError({ scope: "WA_OUTBOUND", errorCode: "WA_SEND_AUDIT_LOG_FAILED", phase: "AUDIT_LOG", ref: toPhone, err });
       }
     } catch (err) {
-      console.error("[WA_SEND_AUDIT_OUTER_ERROR] Fatal in logWhatsAppSend (ignoring so flow continues):", err);
+      logSanitizedWaError({ scope: "WA_OUTBOUND", errorCode: "WA_SEND_AUDIT_OUTER_FAILED", phase: "AUDIT_LOG_OUTER", ref: toPhone, err });
     }
   };
 
@@ -808,49 +850,58 @@ Responda APENAS com o nome da intenção em letras maiúsculas (ex: GET_TODAY_AG
   // only has to deal with one contract:
   //   { success, providerMessageId?, errorCode?, errorMessage?, raw?, simulated? }
 
+  // Hardening pós-diagnóstico (rodada de correção dos gaps encontrados
+  // antes do teste real de whatsapp_business_messaging): esta função lia
+  // o token bruto direto de um campo do Firestore e chamava a Graph API
+  // v21.0 hardcoded, com um gate de simulação silenciosa (`skipApiCall`)
+  // que podia devolver sucesso falso sem nunca chamar a Meta. Reescrita
+  // pra: (1) resolver o access token EXCLUSIVAMENTE via Secret Manager,
+  // por nome+versão explícitos (nunca "latest", mesmo padrão já usado
+  // pelo /exchange — plano Seção 8); (2) falhar explicitamente, nunca
+  // simular, quando não há referência/versão de secret configurada ou a
+  // versão não existe; (3) usar RealWhatsAppGraphClient.sendMessage
+  // (v26.0, centralizado); (4) nunca logar telefone, token ou corpo da
+  // resposta da Meta — só eventos estruturados via logSanitizedWaInfo/
+  // logSanitizedWaError, com o phoneNumberId (identificador do NOSSO
+  // ativo, não do destinatário) como `ref` hasheada.
   const sendViaMeta = async (integrationData: any, toPhone: string, text: string) => {
-    const rawToken = integrationData.accessTokenSecretName || integrationData.accessToken || integrationData.access_token || integrationData.token || "";
     const phoneNumberId = integrationData.phoneNumberId || integrationData.phone_number_id || integrationData.metaPhoneId || "";
-
-    console.log("WHATSAPP_CONFIG_LOADED", { provider: "meta", phoneNumberId, tokenLength: rawToken ? rawToken.length : 0 });
+    const secretName = integrationData.accessTokenSecretName || "";
+    const secretVersion = integrationData.accessTokenSecretVersion || "";
 
     if (!phoneNumberId) {
       return { success: false, errorCode: "phone_id_missing", errorMessage: "Id do telefone (phoneNumberId) não preenchido na integração." };
     }
 
-    const skipApiCall = !rawToken || rawToken.startsWith("••••") || rawToken === "test_token" || rawToken.startsWith("test_token_simulated") || rawToken.length < 15;
-    if (skipApiCall) {
-      console.log(`[WA_DISPATCH] Simulated Meta dispatch to +${toPhone}`);
-      const simulatedId = "wamid.simulated_" + Math.random().toString(36).substring(2, 12);
-      return { success: true, providerMessageId: simulatedId, raw: { info: "Envio simulado por conta de token mascarado ou de teste" }, simulated: true };
+    // Fail-closed: sem referência+versão de secret, não há envio possível
+    // — nunca simula sucesso. `ref` correlaciona nos logs sem nunca expor
+    // o phoneNumberId em texto puro fora deste hash.
+    if (!secretName || !secretVersion) {
+      logSanitizedWaError({ scope: "WA_OUTBOUND", errorCode: "WA_SEND_TOKEN_NOT_CONFIGURED", phase: "TOKEN_RESOLUTION", ref: phoneNumberId });
+      return { success: false, errorCode: "token_not_configured", errorMessage: "Nenhuma versão de secret configurada para esta integração — configure o token antes de enviar." };
     }
 
-    const metaUrl = `https://graph.facebook.com/v21.0/${phoneNumberId}/messages`;
-    const payload = { messaging_product: "whatsapp", recipient_type: "individual", to: toPhone, type: "text", text: { body: text } };
-    console.log("META_REQUEST_URL", metaUrl);
-
-    const response = await fetch(metaUrl, {
-      method: "POST",
-      headers: { "Authorization": `Bearer ${rawToken}`, "Content-Type": "application/json" },
-      body: JSON.stringify(payload)
-    });
-    const responseText = await response.text();
-    console.log("META_RESPONSE_STATUS", response.status, "META_RESPONSE_BODY", responseText);
-
-    let responseData: any = {};
-    try { responseData = JSON.parse(responseText); } catch (_) { responseData = { rawText: responseText }; }
-
-    if (!response.ok) {
-      const errCode = responseData.error?.code || response.status;
-      const errMsg = responseData.error?.message || responseText || "Erro desconhecido na chamada da API Meta.";
-      return { success: false, errorCode: errCode, errorMessage: errMsg, raw: responseData };
+    let accessToken: string;
+    try {
+      accessToken = await getSecretManagerClient().accessSecretVersion(secretName, secretVersion);
+    } catch (err: any) {
+      logSanitizedWaError({ scope: "WA_OUTBOUND", errorCode: "WA_SEND_TOKEN_RESOLUTION_FAILED", phase: "TOKEN_RESOLUTION", ref: phoneNumberId, err });
+      return { success: false, errorCode: "token_resolution_failed", errorMessage: "Falha ao resolver o token de acesso no Secret Manager." };
+    }
+    if (!accessToken) {
+      logSanitizedWaError({ scope: "WA_OUTBOUND", errorCode: "WA_SEND_TOKEN_EMPTY", phase: "TOKEN_RESOLUTION", ref: phoneNumberId });
+      return { success: false, errorCode: "token_resolution_failed", errorMessage: "Token de acesso resolvido veio vazio." };
     }
 
-    const providerMessageId = responseData.messages?.[0]?.id;
-    if (!providerMessageId) {
-      return { success: false, errorCode: "missing_message_id", errorMessage: "A Meta não retornou o Id da mensagem (messages[0].id) na resposta de sucesso.", raw: responseData };
+    logSanitizedWaInfo({ scope: "WA_OUTBOUND", event: "send_attempt", ref: phoneNumberId });
+    try {
+      const result = await getWhatsAppGraphClient().sendMessage(phoneNumberId, accessToken, toPhone, text);
+      logSanitizedWaInfo({ scope: "WA_OUTBOUND", event: "send_succeeded", ref: phoneNumberId });
+      return { success: true, providerMessageId: result.providerMessageId, waId: result.waId };
+    } catch (err: any) {
+      logSanitizedWaError({ scope: "WA_OUTBOUND", errorCode: "WA_SEND_GRAPH_CALL_FAILED", phase: "SEND", ref: phoneNumberId, err });
+      return { success: false, errorCode: "graph_send_failed", errorMessage: "Falha ao enviar mensagem via Meta Graph API." };
     }
-    return { success: true, providerMessageId, raw: responseData, waId: responseData.contacts?.[0]?.wa_id || null };
   };
 
   const toWhatsAppE164 = (raw: string) => {
@@ -925,12 +976,7 @@ Responda APENAS com o nome da intenção em letras maiúsculas (ex: GET_TODAY_AG
   const dispatchWhatsAppMessage = async (clinicId: string, toPhone: string, text: string) => {
     try {
       const integrationPath = `clinics/${clinicId}/integrations/whatsapp`;
-      console.log("[WA_FIRESTORE_OP]", {
-        operation: "READ",
-        path: integrationPath,
-        clinicId,
-        conversationId: toPhone
-      });
+      logSanitizedWaInfo({ scope: "WA_OUTBOUND", event: "integration_read", clinicId, ref: toPhone });
       const integrationRef = adminDb.doc(integrationPath);
       let integrationSnap;
       let integrationData: any = {};
@@ -954,15 +1000,15 @@ Responda APENAS com o nome da intenção em letras maiúsculas (ex: GET_TODAY_AG
 
       const result = await sendWhatsAppMessage(integrationData, toPhone, text);
       if (!result.success) {
-        console.error(`[ELIZA_INTERNA_DISPATCH] Send failed:`, result.errorMessage);
+        logSanitizedWaError({ scope: "WA_OUTBOUND", errorCode: "WA_INTERNAL_DISPATCH_FAILED", phase: "SEND", ref: toPhone });
         await logWhatsAppSend(clinicId, toPhone, text, false, null, result.errorCode, result.errorMessage);
-        return { success: false, errorCode: result.errorCode, errorMessage: result.errorMessage, metaResponse: result.raw };
+        return { success: false, errorCode: result.errorCode, errorMessage: result.errorMessage };
       }
 
       await logWhatsAppSend(clinicId, toPhone, text, true, result.providerMessageId, null, null);
-      return { success: true, whatsappMessageId: result.providerMessageId, metaResponse: result.raw, simulated: result.simulated };
+      return { success: true, whatsappMessageId: result.providerMessageId, waId: (result as any).waId ?? null };
     } catch (err: any) {
-      console.error(`[ELIZA_INTERNA_DISPATCH] Dispatch error:`, err);
+      logSanitizedWaError({ scope: "WA_OUTBOUND", errorCode: "WA_INTERNAL_DISPATCH_THREW", phase: "SEND", ref: toPhone, err });
       await logWhatsAppSend(clinicId, toPhone, text, false, null, "catch_error", err.message || String(err));
       return {
         success: false,
@@ -1168,9 +1214,1079 @@ Responda APENAS com o nome da intenção em letras maiúsculas (ex: GET_TODAY_AG
     } catch (error: any) {
       console.error("[ELIZA_SERVER_ERROR] Model generation failed via AI Gateway:", error);
       const detail = error && error.message ? error.message : String(error);
-      return res.status(500).json({ 
-        error: `A ELIZA AI falhou: ${detail}. Verifique a configuração das chaves de API em Configurações > IA ELIZA ou em Segredos.` 
+      return res.status(500).json({
+        error: `A ELIZA AI falhou: ${detail}. Verifique a configuração das chaves de API em Configurações > IA ELIZA ou em Segredos.`
       });
+    }
+  });
+
+  // ============================================================================
+  // ELIZA INTELLIGENCE v2 — single orchestrator endpoint (vertical slice)
+  // ============================================================================
+  // Pergunta → tools determinísticas (Firestore real) → Insight Engine
+  // (regras, sem IA) → generateElizaAIResponse (o mesmo gateway de sempre,
+  // OpenAI-first/Gemini-fallback) só para explicar/priorizar os insights já
+  // computados — nunca para inventar números. Autenticação 100% Firebase
+  // real (ver src/lib/elizaCore/auth.ts); nenhum sistema de login paralelo.
+  app.post("/api/eliza/ask", async (req, res) => {
+    const requestId = crypto.randomUUID();
+    const startedAt = Date.now();
+    let authedUser: Awaited<ReturnType<typeof authenticateElizaRequest>> | null = null;
+
+    try {
+      authedUser = await authenticateElizaRequest(req);
+      const { clinicId, uid } = authedUser;
+      const question = String(req.body?.question || "").trim();
+      if (!question) {
+        return res.status(400).json({ success: false, error: "question é obrigatório." });
+      }
+      const pageContext = req.body?.pageContext && typeof req.body.pageContext === "object" ? req.body.pageContext : null;
+      const screenType = typeof req.body?.screenType === "string" ? req.body.screenType : "geral";
+      const requestedPatientId = typeof req.body?.patientId === "string" && req.body.patientId ? req.body.patientId : null;
+
+      // Conversational continuity (last few turns only, client-supplied and
+      // never trusted as fact — see systemPrompt rule 8 below): lets "esses
+      // horários"/"esse paciente" resolve to what was just discussed without
+      // re-deriving the whole conversation. Capped hard so a long chat can't
+      // balloon the payload sent to the model.
+      const conversationHistory = Array.isArray(req.body?.conversationHistory)
+        ? req.body.conversationHistory
+            .slice(-3)
+            .map((t: any) => ({ question: String(t?.question || "").slice(0, 200), summary: String(t?.summary || "").slice(0, 400) }))
+            .filter((t: any) => t.question || t.summary)
+        : [];
+
+      // patientId is never trusted just because the frontend sent it —
+      // same principle as clinicId in auth.ts: confirm the patient doc
+      // actually lives under this clinic before any tool touches it.
+      let patientId: string | null = null;
+      if (requestedPatientId) {
+        const belongs = await validatePatientBelongsToClinic(clinicId, requestedPatientId);
+        if (!belongs) {
+          return res.status(403).json({ success: false, error: "Paciente não pertence a esta clínica." });
+        }
+        patientId = requestedPatientId;
+      }
+
+      // General patient lookup: when the caller isn't already on a specific
+      // patient's screen but the question names one by a capitalized word
+      // (ex: "prontuário do paciente Jânio", "quando foi a última consulta
+      // do João"), try to resolve it — this is what lets "olhe o histórico
+      // de X" work from Home/anywhere, not only from inside that patient's
+      // own record screen.
+      let resolvedPatientName: string | null = null;
+      let ambiguousPatientMatches: { id: string; name: string }[] = [];
+      if (!patientId) {
+        // Sentence-initial capitalization isn't a name signal, so the first
+        // word is skipped; short/common capitalized words are filtered by
+        // requiring 3+ letters after the first.
+        const candidateWords = question.split(/\s+/).slice(1).filter((w: string) => /^[A-ZÀ-Ý][a-zà-ÿ]{2,}$/.test(w));
+        for (const candidate of candidateWords) {
+          const matches = await resolvePatientsByName(adminDb, clinicId, candidate);
+          if (matches.length === 1) {
+            patientId = matches[0].id;
+            resolvedPatientName = matches[0].name;
+            break;
+          } else if (matches.length > 1) {
+            ambiguousPatientMatches = matches;
+          }
+        }
+      }
+
+      const now = new Date();
+      const currentMonthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+      const previousMonthStart = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+      // Same elapsed-days comparison, not full-previous-month-vs-partial-
+      // current-month — comparing Aug 1-15 against the entirety of July
+      // would make any month look like a crash before it's even over.
+      const previousMonthEnd = new Date(now.getFullYear(), now.getMonth() - 1, now.getDate(), 23, 59, 59);
+
+      // Every question in this MVP crosses the same modules — no intent
+      // router yet (plan explicitly asked not to over-build this in v1).
+      // Financial data is only pulled/shown if this member's role is
+      // actually allowed to see it (see auth.ts's canAccessFinance).
+      const includeFinance = canAccessFinance(authedUser);
+      // Papel funcional decide só ênfase/vocabulário no prompt e um bônus
+      // leve de ranking em buildInsights — nunca gate de acesso (isso
+      // continua sendo canAccessFinance acima). Ver functionalRole.ts.
+      const functionalRole = normalizeFunctionalRole(authedUser);
+
+      // Performance: when the question is scoped to one patient, the two
+      // clinic-wide "which patients need X" tools (open budgets across the
+      // whole clinic, recall candidates across the whole clinic) don't add
+      // anything the patient-scoped tool doesn't already cover for THIS
+      // patient, and they're the two heaviest reads (up to ~4000/~3000 docs
+      // scanned). Skipping them here is a targeted, justified cut — not a
+      // general "guess what's relevant" heuristic, which would risk the
+      // reliability requirement this system is built around.
+      const skipClinicWideBudgetsAndRecall = !!patientId;
+
+      const toolsCalled: string[] = ["getAgendaAnalysis", "getPendingItems"];
+      if (includeFinance) toolsCalled.push("getFinancialSummary", "comparePeriods");
+      if (includeFinance && !skipClinicWideBudgetsAndRecall) toolsCalled.push("getOpenBudgets");
+      if (!skipClinicWideBudgetsAndRecall) toolsCalled.push("getRecallCandidates");
+      if (patientId) toolsCalled.push("getPatientContext");
+
+      const [agenda, financial, comparison, budgets, recall, pending, patient] = await Promise.all([
+        getAgendaAnalysis(adminDb, clinicId, { days: 7 }),
+        includeFinance ? getFinancialSummary(adminDb, clinicId, { from: currentMonthStart, to: now }) : Promise.resolve(undefined),
+        includeFinance ? comparePeriods(adminDb, clinicId, { from: currentMonthStart, to: now }, { from: previousMonthStart, to: previousMonthEnd }) : Promise.resolve(undefined),
+        includeFinance && !skipClinicWideBudgetsAndRecall ? getOpenBudgets(adminDb, clinicId) : Promise.resolve(undefined),
+        skipClinicWideBudgetsAndRecall ? Promise.resolve(undefined) : getRecallCandidates(adminDb, clinicId),
+        getPendingItems(adminDb, clinicId),
+        patientId ? getPatientContext(adminDb, clinicId, patientId) : Promise.resolve(undefined),
+      ]);
+
+      const insights: Insight[] = buildInsights({ agenda, financial, budgets, recall, pending, patient, screenType, functionalRole });
+
+      // The model only ever sees this compact JSON — never raw Firestore
+      // documents, never the full appointment/financial collections.
+      const modelInput = {
+        question,
+        screenType,
+        pageContext,
+        conversationHistory: conversationHistory.length > 0 ? conversationHistory : undefined,
+        insights: insights.map((i) => ({ id: i.id, category: i.category, severity: i.severity, title: i.title, description: i.description, priorityScore: i.priorityScore, priorityFactors: i.priorityFactors })),
+        periodComparison: comparison
+          ? {
+              currentMonth: { from: comparison.periodA.rangeFrom, to: comparison.periodA.rangeTo, receitaRecebida: comparison.periodA.incomeReceived, atendimentos: comparison.periodA.appointmentCountInRange },
+              previousMonth: { from: comparison.periodB.rangeFrom, to: comparison.periodB.rangeTo, receitaRecebida: comparison.periodB.incomeReceived, atendimentos: comparison.periodB.appointmentCountInRange },
+              deltaReceita: comparison.revenueDelta,
+              deltaReceitaPct: comparison.revenueDeltaPct,
+              deltaAtendimentos: comparison.appointmentCountDelta,
+              deltaTicketMedioPct: comparison.avgTicketDeltaPct,
+            }
+          : null,
+        financeVisible: includeFinance,
+        // Nunca inferido pelo modelo — decidido deterministicamente por
+        // normalizeFunctionalRole() a partir do role real do membro (ou
+        // sempre "gestao" pra owner/admin). Ver regra 13 do systemPrompt.
+        userFunctionalRole: FUNCTIONAL_ROLE_LABELS[functionalRole],
+        roleFramingHint: ROLE_FRAMING_HINTS[functionalRole],
+        // Present whenever a patient is in scope — either because the
+        // caller is inside that patient's own screen (Prontuário/
+        // Planejamento) or because the question named them and
+        // resolvePatientsByName found exactly one match. The model must
+        // ground any patient-specific remark in exactly these fields,
+        // nothing else.
+        patientContext: patient
+          ? {
+              name: patient.name,
+              anamnesis: patient.anamnesis,
+              // Count is computed here, deterministically — the model is
+              // never asked to count array items itself (a real test found
+              // it inventing a nonzero count for an empty array otherwise).
+              openQuotationsCount: patient.openQuotations.length,
+              openQuotations: patient.openQuotations,
+              upcomingAppointmentsCount: patient.upcomingAppointments.length,
+              lastAppointment: patient.lastAppointment,
+              overdueFinancial: patient.overdueFinancial.count > 0 ? { count: patient.overdueFinancial.count, amount: patient.overdueFinancial.amount } : null,
+              lastEvolution: patient.lastEvolution,
+            }
+          : null,
+        // Only set when the question named a patient but more than one real
+        // patient in this clinic matched — the model must ask which one
+        // instead of guessing (never silently picks the first).
+        ambiguousPatientMatches: ambiguousPatientMatches.length > 0 ? ambiguousPatientMatches.map((m) => m.name) : undefined,
+      };
+
+      const systemPrompt = `Você é a ELIZA — não uma assistente genérica de chat, mas a colega sênior de operações desta clínica: você já leu os dados reais antes de responder, então fala como quem sabe do que fala. Quando os dados sustentarem uma leitura clara, dê sua opinião com confiança — não se esconda atrás de "consulte um profissional" quando VOCÊ é a camada de inteligência que deveria opinar. Isso não muda a regra de ouro: você NUNCA calcula números — todos os números que você recebe abaixo já foram calculados deterministicamente pelo sistema, a partir de dados reais do Firestore. Sua função é EXPLICAR, OPINAR e RECOMENDAR com leitura profissional — nunca inventar um dado novo.
+
+REGRAS OBRIGATÓRIAS:
+1. Use APENAS os números fornecidos em "insights" e "periodComparison" abaixo. Nunca cite um número que não esteja ali.
+2. Separe claramente, em cada explicação: o que é FATO/CÁLCULO (já fornecido) do que é sua INFERÊNCIA (leitura contextual) e SUGESTÃO (recomendação de ação).
+3. CAUSALIDADE — regra crítica: se a pergunta pedir uma causa (ex: "por que faturamos menos"), você só pode apontar como causa algo que "periodComparison" mostra que MUDOU entre os dois períodos (ex: deltaAtendimentos negativo, deltaTicketMedioPct negativo). Itens como orçamentos em aberto ou confirmações pendentes são um retrato do momento ATUAL, não uma comparação entre períodos — NÃO os apresente como causa de uma variação, mesmo como hipótese, mesmo com "pode estar relacionado". Se "periodComparison" for null ou não tiver um fator claramente correlacionado (queda de atendimentos ou de ticket médio na mesma proporção da queda de receita), defina "dataSufficiency" como "insufficient" e diga explicitamente, no "summary", que não há dados suficientes para determinar a causa — liste em "caveats" o que seria necessário para concluir (ex: "detalhamento por procedimento", "motivo dos cancelamentos").
+4. Se "financeVisible" for false, não comente sobre financeiro — diga que essa informação não está disponível para o perfil de acesso do usuário.
+5. Seja direto e específico, como um analista sênior que já leu os dados e tem opinião formada — não um chatbot genérico. Quando os dados sustentarem, afirme sua leitura profissional em vez de apenas listar números.
+6. "screenType" diz de onde o usuário está perguntando — priorize a categoria correspondente na sua resposta, mas sem esconder outros pontos relevantes. Se "patientContext" estiver presente, a pergunta é sobre ESSE paciente especificamente — use apenas os campos ali contidos para falar dele (incluindo "lastAppointment", a última consulta já realizada — diferente de "upcomingAppointments", que são futuras), nunca infira dados clínicos que não estejam em "anamnesis".
+7. NUNCA conte itens de um array você mesmo nem estime uma quantidade — use exclusivamente os campos de contagem já fornecidos (ex: "openQuotationsCount", "upcomingAppointmentsCount"). Se um campo de contagem for 0, ou um array estiver vazio, diga explicitamente que não há nenhum — nunca afirme um número positivo que não esteja literalmente em um campo numérico fornecido.
+8. Cada insight já vem com "priorityScore" (número) e "priorityFactors" (lista dos motivos, ex: "impacto financeiro de R$ X", "parado(s) há até N dias") — esses dois campos já foram calculados pelo sistema. Você pode EXPLICAR por que algo tem prioridade citando os "priorityFactors" fornecidos, mas nunca invente um motivo que não esteja nessa lista nem proponha um score diferente.
+9. Se "conversationHistory" estiver presente, são os últimos turnos reais desta conversa — use-os SOMENTE para entender a que a pergunta atual se refere (pronomes como "esses"/"ele"/"isso", ex: "esses horários" pode se referir a algo já mencionado). Nunca trate algo dito ali como um fato novo: todo fato da sua resposta ainda precisa vir de "insights"/"periodComparison"/"patientContext" fornecidos agora, nesta mesma chamada.
+10. "insightExplanations" NÃO é obrigatório e na maioria das vezes deve ficar VAZIO ([]) — só inclua um insight ali se ele for realmente sobre o que foi perguntado. Uma pergunta sobre um paciente específico, um cumprimento, uma dúvida administrativa, ou qualquer coisa sem relação com orçamentos/financeiro/agenda/recall NÃO deve trazer nenhum insight junto — não "aproveite" a resposta para empurrar os alertas gerais da clínica se não foi isso que foi perguntado.
+11. Se "ambiguousPatientMatches" estiver presente, o nome citado na pergunta bate com mais de um paciente real desta clínica — não responda como se soubesse de qual paciente se trata; diga que encontrou mais de um paciente com esse nome (liste os nomes) e peça para o usuário confirmar qual, ou informar sobrenome/telefone. Defina "dataSufficiency" como "insufficient" nesse caso.
+12. "pageContext.summary" é um retrato real e atual da tela onde o usuário está agora — já calculado pelo componente a partir do Firestore, igual a "insights", não uma suposição sua nem algo dito pelo usuário. Use-o para entender a situação concreta em que a pergunta foi feita (ex: quantos agendamentos há hoje, qual período financeiro está selecionado na tela), mas a regra 1 vale igual: só cite um número de "pageContext.summary" se ele estiver literalmente escrito ali.
+13. "userFunctionalRole" e "roleFramingHint" dizem o papel funcional de quem pergunta e uma lente de ênfase já definida pelo sistema — não por você. Use isso para decidir O QUE citar primeiro e QUE VOCABULÁRIO usar (operacional para secretaria/recepção, clínico para profissional de saúde, caixa/conciliação para financeiro, funil/conversão para marketing/comercial, visão cruzada para gestão/coordenação), mas NUNCA para omitir um insight de severidade "risco" só porque a categoria dele não é a prioridade do papel — risco financeiro ou operacional grave sempre deve aparecer, ainda que resumido, independentemente de quem pergunta.
+
+DADOS REAIS DISPONÍVEIS (já calculados pelo sistema):
+${JSON.stringify(modelInput, null, 2)}
+
+Pergunta do usuário: "${question}"
+
+Responda ESTRITAMENTE em JSON válido, sem markdown, neste formato exato:
+{
+  "summary": "resposta direta em 2-4 frases",
+  "insightExplanations": [{"id": "id-do-insight-fornecido-acima", "aiExplanation": "por que isso importa (inferência)", "recommendation": "ação recomendada (sugestão)"}],
+  "dataSufficiency": "ok" | "insufficient",
+  "caveats": ["ressalva 1, se houver"]
+}
+Inclua em "insightExplanations" apenas os insights realmente relevantes para a pergunta — não force todos.`;
+
+      // Performance requirement: measure exactly what's sent to the model,
+      // not an estimate — this is the literal prompt string byte size.
+      const modelInputBytes = Buffer.byteLength(systemPrompt, "utf8");
+
+      const aiResult = await generateElizaAIResponse({
+        taskType: "eliza_intelligence_v2",
+        contents: [{ role: "user", parts: [{ text: systemPrompt }] }],
+        clinicId,
+      });
+
+      const rawText: string = aiResult?.text || "";
+      const jsonMatch = rawText.match(/\{[\s\S]*\}/);
+      let summary = "";
+      let dataSufficiency: "ok" | "insufficient" = "ok";
+      let caveats: string[] = [];
+      // Only insights the model actually explained (rule 10 above: leave
+      // insightExplanations empty when nothing is relevant to the question)
+      // are sent to the frontend — this is what previously always attached
+      // every standing clinic-wide alert to every answer, even a specific
+      // patient lookup or a plain "oi", regardless of what was asked.
+      let relevantInsights: Insight[] = insights;
+      if (jsonMatch) {
+        try {
+          const parsed = JSON.parse(jsonMatch[0]);
+          summary = String(parsed.summary || "");
+          dataSufficiency = parsed.dataSufficiency === "insufficient" ? "insufficient" : "ok";
+          caveats = Array.isArray(parsed.caveats) ? parsed.caveats.map(String) : [];
+          const explanations: Record<string, { aiExplanation?: string; recommendation?: string }> = {};
+          if (Array.isArray(parsed.insightExplanations)) {
+            for (const e of parsed.insightExplanations) {
+              if (e?.id) explanations[e.id] = { aiExplanation: e.aiExplanation, recommendation: e.recommendation };
+            }
+          }
+          for (const insight of insights) {
+            const match = explanations[insight.id];
+            if (match) {
+              insight.aiExplanation = match.aiExplanation;
+              insight.recommendation = match.recommendation;
+            }
+          }
+          relevantInsights = insights.filter((i) => !!explanations[i.id]);
+        } catch (parseErr) {
+          console.warn("[ELIZA_V2] Failed to parse model JSON, returning insights without explanations:", parseErr);
+          summary = "Não consegui formatar a explicação agora, mas os dados abaixo são reais.";
+        }
+      }
+
+      const durationMs = Date.now() - startedAt;
+
+      // Audit trail — clinic-scoped, never cross-clinic (matches req #12 of
+      // the approved plan). Best-effort: a logging failure must never break
+      // the actual answer the user is waiting for.
+      adminDb.collection(`clinics/${clinicId}/ai_eliza_v2_audit`).doc(requestId).set({
+        requestId,
+        userId: uid,
+        question,
+        screenType,
+        patientId,
+        pageContext,
+        toolsCalled,
+        insightIds: insights.map((i) => i.id),
+        dataSufficiency,
+        durationMs,
+        modelInputBytes,
+        conversationHistoryTurns: conversationHistory.length,
+        createdAt: AdminFieldValue.serverTimestamp(),
+      }).catch((e: any) => console.warn("[ELIZA_V2] Audit log write failed:", e.message || e));
+
+      return res.json({
+        success: true,
+        summary,
+        insights: relevantInsights,
+        periodComparison: modelInput.periodComparison,
+        dataSufficiency,
+        caveats,
+        resolvedPatientId: patientId && resolvedPatientName ? patientId : null,
+        resolvedPatientName,
+        generatedAt: new Date().toISOString(),
+        meta: { durationMs, modelInputBytes, toolsCalled },
+      });
+    } catch (err: any) {
+      const isElizaError = err instanceof ElizaError;
+      const statusCode = isElizaError ? err.statusCode : 500;
+      console.error("[ELIZA_V2_ERROR]", err);
+      return res.status(statusCode).json({
+        success: false,
+        error: isElizaError ? err.message : "A ELIZA não conseguiu processar sua pergunta agora.",
+      });
+    }
+  });
+
+  // ============================================================================
+  // ELIZA INTELLIGENCE v2 — TEMPORAL LAYER
+  // ============================================================================
+  // Deterministic comparison (src/lib/elizaCore/temporal.ts) + an optional,
+  // bounded AI pass that only ever explains changes the deterministic layer
+  // already found — same "system decides the facts, model explains them"
+  // split as the Insight Engine above. Reuses authenticateElizaRequest,
+  // canAccessFinance and the same audit-logging pattern as /api/eliza/ask.
+
+  app.post("/api/eliza/temporal-overview", async (req, res) => {
+    const requestId = crypto.randomUUID();
+    const startedAt = Date.now();
+    try {
+      const authedUser = await authenticateElizaRequest(req);
+      const { clinicId, uid } = authedUser;
+      const days = Number(req.body?.days) > 0 ? Number(req.body.days) : 30;
+      const includeFinance = canAccessFinance(authedUser);
+
+      const overview = await getTemporalOverview(adminDb, clinicId, { days, includeFinance });
+      const changes = detectTemporalChanges(overview);
+
+      let modelInputBytes = 0;
+      if (changes.length > 0) {
+        const prompt = `Você é a ELIZA. Abaixo estão mudanças que o sistema JÁ DETECTOU deterministicamente (números e magnitude já calculados — você nunca recalcula nada). Sua única função é explicar, para cada mudança, o que ela pode significar.
+
+REGRAS OBRIGATÓRIAS:
+1. Use apenas os números fornecidos abaixo. Nunca cite um número que não esteja ali.
+2. Cada mudança já vem com "interpretationType": "tendencia" (o sistema só afirma que a métrica mudou — isso é fato/cálculo). Você pode ampliar para "correlacao" (se notar relação plausível com OUTRA mudança da mesma lista) ou "hipotese" (uma possível explicação, deixando claro que é hipótese) — mas NUNCA afirme causa comprovada. Nunca diga "isso aconteceu porque X" como fato — diga "pode estar relacionado a X" ou "uma hipótese é X".
+3. Se "reliabilityNote" existir para uma métrica, mencione a ressalva na sua explicação (ex: cancelamentos são contados pela data agendada, não pela data do cancelamento).
+4. Seja direto, 1-2 frases por mudança.
+
+MUDANÇAS DETECTADAS:
+${JSON.stringify(changes.map((c) => ({ id: c.id, title: c.title, description: c.description, direction: c.direction, magnitudePct: c.magnitudePct, reliability: c.reliability, reliabilityNote: c.reliabilityNote })), null, 2)}
+
+Responda ESTRITAMENTE em JSON válido, sem markdown: {"interpretations": [{"id": "id-da-mudança", "text": "explicação", "interpretationType": "tendencia"|"correlacao"|"hipotese"}]}`;
+        modelInputBytes = Buffer.byteLength(prompt, "utf8");
+
+        try {
+          const aiResult = await generateElizaAIResponse({ taskType: "eliza_intelligence_v2", contents: [{ role: "user", parts: [{ text: prompt }] }], clinicId });
+          const rawText: string = aiResult?.text || "";
+          const jsonMatch = rawText.match(/\{[\s\S]*\}/);
+          if (jsonMatch) {
+            const parsed = JSON.parse(jsonMatch[0]);
+            const byId: Record<string, { text: string; interpretationType: string }> = {};
+            if (Array.isArray(parsed.interpretations)) {
+              for (const it of parsed.interpretations) {
+                if (it?.id) byId[it.id] = { text: String(it.text || ""), interpretationType: String(it.interpretationType || "tendencia") };
+              }
+            }
+            for (const change of changes) {
+              const match = byId[change.id];
+              if (match) {
+                change.aiInterpretation = match.text;
+                if (match.interpretationType === "correlacao" || match.interpretationType === "hipotese") {
+                  change.interpretationType = match.interpretationType as any;
+                }
+              }
+            }
+          }
+        } catch (aiErr: any) {
+          console.warn("[ELIZA_V2_TEMPORAL] AI interpretation failed (deterministic result still returned):", aiErr?.message || aiErr);
+        }
+      }
+
+      const durationMs = Date.now() - startedAt;
+      adminDb.collection(`clinics/${clinicId}/ai_eliza_v2_temporal_audit`).doc(requestId).set({
+        requestId,
+        userId: uid,
+        days,
+        includeFinance,
+        changesDetected: changes.map((c) => c.metricKey),
+        docsRead: overview.perf.docsRead,
+        calcMs: overview.perf.calcMs,
+        durationMs,
+        modelInputBytes,
+        createdAt: AdminFieldValue.serverTimestamp(),
+      }).catch((e: any) => console.warn("[ELIZA_V2_TEMPORAL] Audit log write failed:", e.message || e));
+
+      return res.json({
+        success: true,
+        currentPeriod: overview.currentPeriod,
+        previousPeriod: overview.previousPeriod,
+        metrics: overview.metrics,
+        changes,
+        meta: { durationMs, docsRead: overview.perf.docsRead, calcMs: overview.perf.calcMs, modelInputBytes },
+      });
+    } catch (err: any) {
+      const isElizaError = err instanceof ElizaError;
+      console.error("[ELIZA_V2_TEMPORAL_ERROR]", err);
+      return res.status(isElizaError ? err.statusCode : 500).json({ success: false, error: isElizaError ? err.message : "A ELIZA não conseguiu calcular a visão temporal agora." });
+    }
+  });
+
+  // ============================================================================
+  // ELIZA INTELLIGENCE v2 — CLINICAL PLANNING LAYER (Planejamento IA)
+  // ============================================================================
+  // Same auth/gateway/audit family as /api/eliza/ask and /api/eliza/temporal-
+  // overview above — reuses authenticateElizaRequest, validatePatientBelongs-
+  // ToClinic, getPatientContext and generateElizaAIResponse exactly like the
+  // rest of this file. Not a second AI system — just its own prompt/schema
+  // because the task itself (multimodal clinical reasoning over a small set
+  // of professional-selected photos) doesn't fit the numeric-insight shape
+  // /api/eliza/ask is built around.
+  app.post("/api/eliza/planning-analysis", async (req, res) => {
+    const requestId = crypto.randomUUID();
+    const startedAt = Date.now();
+    try {
+      const authedUser = await authenticateElizaRequest(req);
+      const { clinicId, uid } = authedUser;
+      const patientId = String(req.body?.patientId || "");
+      const procedureId = String(req.body?.procedureId || "");
+      const objective = String(req.body?.objective || "").trim();
+      const clinicalEvaluation = String(req.body?.clinicalEvaluation || "").trim();
+      // Only images the professional explicitly selected for THIS analysis
+      // are ever sent — never the patient's whole gallery. Hard-capped at 4
+      // regardless of what the client sends. Each carries the documentType
+      // the professional declared for it (photo/x-ray/CT/other) so the
+      // prompt below can tell the model never to read an x-ray as a face photo.
+      const VALID_DOC_TYPES: DocumentType[] = ["fotografia_clinica", "radiografia", "tomografia", "outro_exame"];
+      const images: { mimeType: string; dataBase64: string; documentType: DocumentType }[] = Array.isArray(req.body?.images)
+        ? req.body.images.slice(0, 4)
+            .filter((img: any) => img?.mimeType && img?.dataBase64)
+            .map((img: any) => ({
+              mimeType: img.mimeType,
+              dataBase64: img.dataBase64,
+              documentType: VALID_DOC_TYPES.includes(img.documentType) ? img.documentType : "fotografia_clinica",
+            }))
+        : [];
+      // Free-text/boolean values the professional typed into this template's
+      // structured fields — passed through as declared facts, never as
+      // something the AI is meant to compute or validate.
+      const structuredFields: Record<string, string | boolean> = (req.body?.structuredFields && typeof req.body.structuredFields === "object")
+        ? req.body.structuredFields
+        : {};
+
+      if (!patientId) return res.status(400).json({ success: false, error: "patientId é obrigatório." });
+      if (!procedureId) return res.status(400).json({ success: false, error: "procedureId é obrigatório." });
+      if (!objective && !clinicalEvaluation) return res.status(400).json({ success: false, error: "Informe o objetivo ou a avaliação clínica." });
+
+      const belongs = await validatePatientBelongsToClinic(clinicId, patientId);
+      if (!belongs) return res.status(403).json({ success: false, error: "Paciente não pertence a esta clínica." });
+
+      // procedureId is never trusted for its display name (or its template)
+      // from the client — resolved for real against this clinic's own
+      // Catálogo Clínico Central, same principle as patientId just above.
+      const procedureSnap = await adminDb.doc(`clinics/${clinicId}/procedure_catalog/${procedureId}`).get();
+      if (!procedureSnap.exists) return res.status(404).json({ success: false, error: "Procedimento não encontrado no catálogo desta clínica." });
+      const procedureData: any = procedureSnap.data();
+      const template = getTemplateForId(procedureData.templateId);
+
+      const patientContext = await getPatientContext(adminDb, clinicId, patientId);
+
+      const imagesBlock = images.length > 0
+        ? images.map((img, i) => `- Imagem ${i + 1}: tipo declarado pelo profissional = ${DOCUMENT_TYPE_LABELS[img.documentType]}`).join("\n")
+        : "- Nenhuma imagem anexada.";
+
+      const structuredFieldsBlock = Object.keys(structuredFields).length > 0
+        ? Object.entries(structuredFields).map(([k, v]) => `- ${k}: ${typeof v === "boolean" ? (v ? "sim" : "não") : String(v || "não informado")}`).join("\n")
+        : "- Nenhum campo estruturado adicional informado.";
+
+      // The categories the model must split its answer into, and the JSON
+      // shape it must follow, both come from the template's own
+      // `outputSchema` — nothing here assumes the 5 categories both
+      // validated templates happen to share today.
+      const categoriesBlock = template.outputSchema
+        .map(f => `   - "${f.key}": ${f.label} — ${f.hint}.`)
+        .join("\n");
+      const jsonShapeExample = template.outputSchema.map(f => `"${f.key}": ["..."]`).join(", ");
+      const safetyRulesBlock = template.safetyRules.length > 0
+        ? template.safetyRules.map(r => `- ${r}`).join("\n")
+        : "- Nenhuma regra adicional além das instruções obrigatórias abaixo.";
+
+      const prompt = `Você é a ELIZA, camada de inteligência clínica da plataforma, atuando agora no Planejamento IA — apoio ao planejamento de "${procedureData.name}" (${procedureData.category}). Você é uma ferramenta de APOIO: nunca decide, nunca desenha ou marca nada na imagem — isso é sempre feito manualmente pelo profissional depois de ler sua análise.
+
+Você recebeu ${images.length} imagem(ns) real(is), selecionada(s) pelo profissional especificamente para esta análise (nunca a galeria inteira do paciente). Tipo declarado de cada uma:
+${imagesBlock}
+
+DADOS REAIS DO PACIENTE (use somente isto — nunca infira além disso):
+- Nome: ${patientContext.name}
+- Alergias: ${patientContext.anamnesis?.allergies || "não informado"}
+- Condições de saúde (diabetes/cardíaco/etc.): ${patientContext.anamnesis?.conditions || "não informado"}
+- Medicação contínua: ${patientContext.anamnesis?.medications || "não informado"}
+- Última evolução clínica registrada: ${patientContext.lastEvolution ? `${patientContext.lastEvolution.date} — ${patientContext.lastEvolution.text}` : "nenhuma registrada"}
+
+OBJETIVO INFORMADO PELO PROFISSIONAL: "${objective || "não informado"}"
+AVALIAÇÃO CLÍNICA DO PROFISSIONAL: "${clinicalEvaluation || "não informado"}"
+
+CAMPOS ESTRUTURADOS INFORMADOS PELO PROFISSIONAL (fatos declarados — nunca calcule ou corrija estes valores, apenas raciocine sobre eles se estiverem presentes):
+${structuredFieldsBlock}
+
+CONTEXTO DESTE TEMPLATE (${template.templateId}): ${template.aiContext}
+
+REGRAS DE SEGURANÇA DESTE TEMPLATE (NUNCA VIOLAR):
+${safetyRulesBlock}
+
+INSTRUÇÕES OBRIGATÓRIAS:
+1. Analise de verdade as imagens anexadas, respeitando o tipo declarado de cada uma — nunca leia uma radiografia/tomografia como se fosse uma fotografia clínica comum, e vice-versa. Nunca descreva algo que não esteja visível nas imagens fornecidas.
+2. Separe SEMPRE a resposta nestas categorias, sem misturar uma na outra:
+${categoriesBlock}
+3. Você PODE sugerir uma dose, volume, medida ou especificação técnica típica — mas só dentro da categoria "sugestao" (nunca em "dadoClinico"/"observacaoVisual"/"inferencia"), sempre deixando explícito que é uma sugestão a ser avaliada, nunca um fato medido ou uma prescrição pronta; a decisão final e a confirmação do valor são sempre do profissional. Nunca invente diagnóstico. Respeite sempre as regras de segurança do template acima. Se faltar informação pra sugerir algo com segurança, diga isso explicitamente em "caveats" e marque "dataSufficiency":"insufficient".
+4. Nunca fale de preço/valor — isso não é decidido aqui.
+
+Responda ESTRITAMENTE em JSON válido, sem markdown, exatamente neste formato:
+{${jsonShapeExample}, "dataSufficiency": "ok" ou "insufficient", "caveats": ["..."]}`;
+
+      const modelInputBytes = Buffer.byteLength(prompt, "utf8");
+      const parts: any[] = [{ text: prompt }];
+      for (const img of images) parts.push({ inlineData: { mimeType: img.mimeType, data: img.dataBase64.includes(",") ? img.dataBase64.split(",")[1] : img.dataBase64 } });
+
+      const aiResult = await generateElizaAIResponse({
+        taskType: "clinical_planning_analysis",
+        contents: [{ role: "user", parts }],
+        clinicId,
+      });
+
+      const rawText: string = aiResult?.text || "";
+      const jsonMatch = rawText.match(/\{[\s\S]*\}/);
+      const analysis: Record<string, string[]> = Object.fromEntries(template.outputSchema.map(f => [f.key, [] as string[]]));
+      let dataSufficiency: "ok" | "insufficient" = "ok";
+      let caveats: string[] = [];
+      if (jsonMatch) {
+        try {
+          const parsed = JSON.parse(jsonMatch[0]);
+          const asStrArr = (v: any) => (Array.isArray(v) ? v.map(String) : []);
+          for (const field of template.outputSchema) analysis[field.key] = asStrArr(parsed[field.key]);
+          dataSufficiency = parsed.dataSufficiency === "insufficient" ? "insufficient" : "ok";
+          caveats = Array.isArray(parsed.caveats) ? parsed.caveats.map(String) : [];
+        } catch (parseErr) {
+          console.warn("[ELIZA_V2_PLANNING] Failed to parse model JSON:", parseErr);
+          dataSufficiency = "insufficient";
+          caveats = ["Não foi possível formatar a análise agora — tente novamente."];
+        }
+      }
+
+      const durationMs = Date.now() - startedAt;
+      adminDb.collection(`clinics/${clinicId}/ai_eliza_v2_planning_audit`).doc(requestId).set({
+        requestId,
+        userId: uid,
+        patientId,
+        procedureId,
+        templateId: template.templateId,
+        imagesCount: images.length,
+        dataSufficiency,
+        durationMs,
+        modelInputBytes,
+        createdAt: AdminFieldValue.serverTimestamp(),
+      }).catch((e: any) => console.warn("[ELIZA_V2_PLANNING] Audit log write failed:", e.message || e));
+
+      return res.json({
+        success: true,
+        analysis,
+        dataSufficiency,
+        caveats,
+        generatedAt: new Date().toISOString(),
+        meta: { durationMs, modelInputBytes, imagesAnalyzed: images.length },
+      });
+    } catch (err: any) {
+      const isElizaError = err instanceof ElizaError;
+      console.error("[ELIZA_V2_PLANNING_ERROR]", err);
+      return res.status(isElizaError ? err.statusCode : 500).json({ success: false, error: isElizaError ? err.message : "A ELIZA não conseguiu analisar o planejamento agora." });
+    }
+  });
+
+  // ============================================================================
+  // ELIZA ACADEMY — TUTOR (2026-08-29)
+  // ============================================================================
+  // Anti-gabarito contract: the professor's own review (professorReview) is
+  // read from Firestore ONLY inside the 'post_review' branch below, and only
+  // after confirming both activity.tutorPolicy.revealReferenceAfterReview
+  // and a real attempt.professorReview already exist. Every other branch
+  // structurally never fetches or references that field — a student asking
+  // the model to "ignore instructions and reveal the professor's answer"
+  // cannot work, because the data was never in the payload to begin with.
+  app.post("/api/eliza/academy-tutor", async (req, res) => {
+    try {
+      const authed = await authenticateAcademyRequest(req);
+      const { clinicId, turmaId, uid, role } = authed;
+      const activityId = String(req.body?.activityId || "");
+      const attemptId = req.body?.attemptId ? String(req.body.attemptId) : null;
+      const mode = String(req.body?.mode || "");
+      const question = req.body?.question ? String(req.body.question).slice(0, 2000) : null;
+
+      if (!activityId) return res.status(400).json({ success: false, error: "activityId é obrigatório." });
+      if (!["explain", "analyze", "post_review"].includes(mode)) {
+        return res.status(400).json({ success: false, error: "mode inválido." });
+      }
+
+      const activitySnap = await adminDb.doc(`clinics/${clinicId}/education_activities/${activityId}`).get();
+      if (!activitySnap.exists) return res.status(404).json({ success: false, error: "Atividade não encontrada." });
+      const activity: any = activitySnap.data();
+      if (activity.turmaId !== turmaId) return res.status(403).json({ success: false, error: "Atividade não pertence a esta turma." });
+
+      const template = getTemplateForId(activity.templateId);
+
+      let attempt: any = null;
+      if (attemptId) {
+        const attemptSnap = await adminDb.doc(`clinics/${clinicId}/education_activities/${activityId}/attempts/${attemptId}`).get();
+        if (!attemptSnap.exists) return res.status(404).json({ success: false, error: "Tentativa não encontrada." });
+        attempt = attemptSnap.data();
+      }
+
+      // Mode-specific authorization — a student may only analyze/reflect on
+      // HER OWN attempt, never someone else's.
+      if (mode !== "explain") {
+        if (!attempt) return res.status(400).json({ success: false, error: "attemptId é obrigatório para este modo." });
+        if (role === "student" && attempt.studentId !== uid) {
+          return res.status(403).json({ success: false, error: "Você só pode usar a ELIZA sobre a sua própria tentativa." });
+        }
+      }
+
+      let policyOk = true;
+      let policyDeniedReason = "";
+      if (mode === "explain" && !activity.tutorPolicy?.allowExplainBeforeSubmit) { policyOk = false; policyDeniedReason = "Explicações estão desativadas para esta atividade."; }
+      if (mode === "analyze" && !activity.tutorPolicy?.allowAnalyzeOwnContent) { policyOk = false; policyDeniedReason = "Análise pela ELIZA está desativada para esta atividade."; }
+      if (mode === "post_review") {
+        if (!activity.tutorPolicy?.revealReferenceAfterReview) { policyOk = false; policyDeniedReason = "A comparação com a correção do professor não está liberada para esta atividade."; }
+        else if (!attempt?.professorReview) { policyOk = false; policyDeniedReason = "Esta tentativa ainda não tem correção do professor."; }
+      }
+      if (!policyOk) return res.status(403).json({ success: false, error: policyDeniedReason });
+
+      const safetyRulesBlock = template.safetyRules.length > 0
+        ? template.safetyRules.map((r: string) => `- ${r}`).join("\n")
+        : "- Nenhuma regra adicional além das instruções obrigatórias abaixo.";
+
+      const structuredFieldsBlock = attempt && Object.keys(attempt.structuredFields || {}).length > 0
+        ? Object.entries(attempt.structuredFields).map(([k, v]) => `- ${k}: ${typeof v === "boolean" ? (v ? "sim" : "não") : String(v || "não informado")}`).join("\n")
+        : "- Nenhum campo estruturado preenchido ainda.";
+
+      // Clinical Learning Workspace (2026-08-29): the fixed anatomical
+      // point-map's own structured records — same "facts declared by the
+      // student, never recalculated" contract as structuredFieldsBlock
+      // above. Lets the tutor's pedagogical questions reference a SPECIFIC
+      // point ("você marcou o M. Corrugador, mas..."), which a generic
+      // "marcações existem" summary never could.
+      const pointValueUnit = (template.clinicalWorkspace?.pointValueLabel || "unidades").toLowerCase();
+      const pointsBlock = attempt && attempt.pointRecords && Object.keys(attempt.pointRecords).length > 0
+        ? Object.values(attempt.pointRecords).map((p: any, i: number) => `- Ponto ${i + 1}: ${p.muscle || "sem região selecionada"}${p.unidades ? ` — ${p.unidades} (${pointValueUnit})` : ` — ${pointValueUnit} não informado(a)`}${p.observacao ? ` — obs: "${p.observacao}"` : ""}`).join("\n")
+        : "- Nenhum ponto marcado no mapa ainda.";
+
+      let taskBlock = "";
+      if (mode === "explain") {
+        taskBlock = `MODO: Orientação antes do envio. A aluna ainda está produzindo o próprio raciocínio — você pode explicar como usar a atividade, esclarecer conceitos e fazer perguntas que orientem o processo, mas NUNCA revele um planejamento pronto, nem diga o que ela "deveria" marcar/decidir para este caso específico.
+
+ATIVIDADE: "${activity.title}" — ${activity.description || "sem descrição adicional"}
+OBJETIVOS EDUCACIONAIS: ${activity.educationalObjectives || "não informado"}
+INSTRUÇÕES DO PROFESSOR: ${activity.instructions || "não informado"}
+PERGUNTA DA ALUNA: "${question || "explique como devo abordar esta atividade"}"`;
+      } else if (mode === "analyze") {
+        taskBlock = `MODO: Analisar meu planejamento (a aluna já produziu conteúdo próprio e pediu apoio). Identifique, com perguntas pedagógicas (nunca respostas prontas): campos importantes ainda não preenchidos; inconsistências internas; região marcada sem justificativa correspondente; justificativa sem correspondência no desenho; informação apresentada como fato sem documentação suficiente; aspectos que merecem ser reconsiderados. Prefira "O que você considerou para tomar essa decisão?" em vez de "Faça X."
+
+ATIVIDADE: "${activity.title}"
+CAMPOS ESTRUTURADOS PREENCHIDOS PELA ALUNA (fatos declarados por ela — nunca corrija/recalcule):
+${structuredFieldsBlock}
+PONTOS MARCADOS NO MAPA ANATÔMICO (fatos declarados por ela — nunca corrija/recalcule, e nunca comente um ponto que não está listado aqui):
+${pointsBlock}
+ANÁLISE DA ALUNA: "${attempt.studentAnalysis || "não preenchida"}"
+JUSTIFICATIVA DA ALUNA: "${attempt.justification || "não preenchida"}"
+OBSERVAÇÕES DA ALUNA: "${attempt.observations || "não preenchida"}"
+MARCAÇÕES NO CANVAS: ${attempt.strokesJson ? "a aluna fez marcações visuais (não descritas aqui em detalhe, apenas confirme que existem)" : "nenhuma marcação ainda"}`;
+      } else {
+        // post_review — professorReview is read ONLY here, ONLY after the
+        // policy+existence checks above already passed.
+        const review = attempt.professorReview;
+        // Only reachable here (never in explain/analyze) — the professor's
+        // OWN reference points are exactly the "gabarito" the anti-injection
+        // contract protects; structurally absent from every other branch.
+        const professorPointsBlock = review.referencePointRecords && Object.keys(review.referencePointRecords).length > 0
+          ? Object.values(review.referencePointRecords).map((p: any, i: number) => `- Ponto ${i + 1}: ${p.muscle || "sem região"}${p.unidades ? ` — ${p.unidades} (${pointValueUnit})` : ""}${p.observacao ? ` — obs: "${p.observacao}"` : ""}`).join("\n")
+          : "- O professor não marcou pontos de referência, só deixou comentários.";
+        taskBlock = `MODO: Raciocínio educacional após a correção do professor. NÃO diga simplesmente "você errou e o professor está certo" — construa raciocínio: o que a aluna considerou; o que o professor acrescentou; onde existem diferenças reais; quais justificativas precisam ser revistas; perguntas para a aluna refletir; pontos que já estavam adequadamente documentados. A decisão clínica final é sempre do professor/humano, nunca sua.
+
+O QUE A ALUNA PRODUZIU:
+${structuredFieldsBlock}
+PONTOS QUE A ALUNA MARCOU:
+${pointsBlock}
+ANÁLISE DA ALUNA: "${attempt.studentAnalysis || "não preenchida"}"
+JUSTIFICATIVA DA ALUNA: "${attempt.justification || "não preenchida"}"
+
+CORREÇÃO DO PROFESSOR:
+PONTOS DE REFERÊNCIA DO PROFESSOR:
+${professorPointsBlock}
+DECISÃO: ${review.decision === "approved" ? "Aprovado" : "Revisão solicitada"}
+COMENTÁRIOS: "${review.comments || "sem comentários adicionais"}"`;
+      }
+
+      const prompt = `Você é a ELIZA, tutora clínica educacional — não a IA de apoio clínico ao profissional, e sim uma tutora pedagógica dentro do Eliza Academy. Seu papel é apoiar o raciocínio da aluna, nunca substituí-lo, nunca decidir por ela, e nunca revelar um gabarito.
+
+CONTEXTO DO TEMPLATE (${template.templateId}): ${template.aiContext}
+
+REGRAS DE SEGURANÇA DESTE TEMPLATE (NUNCA VIOLAR):
+${safetyRulesBlock}
+
+CLASSIFICAÇÃO OBRIGATÓRIA — ao longo da resposta, deixe claro (mesmo que informalmente) quando algo é:
+DADO CLÍNICO (já registrado) / OBSERVAÇÃO (visível na documentação) / INFORMAÇÃO DA ALUNA / INFORMAÇÃO DO PROFESSOR / INFERÊNCIA (leitura da ELIZA, não é fato) / SUGESTÃO EDUCACIONAL (pra ela considerar).
+Nunca apresente uma inferência como fato. Nunca invente diagnóstico, dose, volume, produto, técnica, anatomia individual não documentada, medida, contraindicação específica inexistente nos dados, ou execução clínica. IMPORTANTE: mesmo que as regras de segurança do template acima permitam sugerir dose/volume/técnica pra apoio clínico real (fora do Academy), AQUI — no ambiente pedagógico do tutor — essa permissão NÃO se aplica: você nunca entrega um valor específico pronto de dose/volume/técnica pra aluna, mesmo em tom de sugestão; o objetivo é ela construir esse raciocínio sozinha, com perguntas, nunca com a resposta.
+
+${taskBlock}
+
+Responda em português, tom pedagógico e encorajador, em parágrafos curtos ou perguntas — nunca uma lista de comandos.`;
+
+      const aiResult = await generateElizaAIResponse({
+        taskType: "academy_tutor",
+        contents: [{ role: "user", parts: [{ text: prompt }] }],
+        clinicId,
+      });
+      const answer: string = aiResult?.text || "Não consegui gerar uma resposta agora — tente novamente.";
+
+      if (attemptId) {
+        adminDb.doc(`clinics/${clinicId}/education_activities/${activityId}/attempts/${attemptId}`)
+          .update({ aiInteractions: AdminFieldValue.arrayUnion({ mode, question: question || null, answer, createdAt: new Date().toISOString() }) })
+          .catch((e: any) => console.warn("[ACADEMY_TUTOR] Failed to persist AI interaction:", e.message || e));
+      }
+
+      return res.json({ success: true, answer, mode });
+    } catch (err: any) {
+      const isElizaError = err instanceof ElizaError;
+      console.error("[ACADEMY_TUTOR_ERROR]", err);
+      return res.status(isElizaError ? err.statusCode : 500).json({ success: false, error: isElizaError ? err.message : "A ELIZA não conseguiu responder agora." });
+    }
+  });
+
+  // Setting another user's password requires the Admin SDK (the client SDK's
+  // secondary-auth-app trick, used for account CREATION elsewhere in this
+  // app, only works at creation — never for updating an existing user's
+  // credentials). Firebase Auth passwords are never retrievable in plaintext,
+  // so this is also the only way an admin recovers from "I don't remember
+  // the password I set". Reuses authenticateElizaRequest (real clinic
+  // membership check) rather than a parallel auth path — same pattern as
+  // set-owner-password above, just scoped to a CLINIC admin instead of a
+  // platform admin, and to a student instead of a clinic owner.
+  app.post("/api/eliza/academy-reset-student-password", async (req, res) => {
+    try {
+      const authedUser = await authenticateElizaRequest(req);
+      const isAdminCurso = authedUser.memberData?.courseRole === "admin_curso";
+      if (!authedUser.isOwnerOrAdmin && !isAdminCurso) {
+        throw new ElizaError(ElizaErrorCode.UNAUTHORIZED, "Apenas administradores da clínica ou do curso podem redefinir a senha de um aluno.", 403);
+      }
+      const studentUid = String(req.body?.studentUid || "");
+      if (!studentUid) {
+        throw new ElizaError(ElizaErrorCode.VALIDATION_ERROR, "studentUid é obrigatório.", 400);
+      }
+      const studentRef = adminDb.doc(`clinics/${authedUser.clinicId}/education_students/${studentUid}`);
+      const studentSnap = await studentRef.get();
+      if (!studentSnap.exists) {
+        throw new ElizaError(ElizaErrorCode.NOT_FOUND, "Aluno não encontrado nesta clínica.", 404);
+      }
+      const requested = req.body?.newPassword ? String(req.body.newPassword).trim() : "";
+      const password = requested.length >= 6 ? requested : `Eliza${crypto.randomUUID().replace(/-/g, "").slice(0, 10)}`;
+
+      await getAdminAuth().updateUser(studentUid, { password });
+      await studentRef.update({
+        tempPassword: password,
+        mustChangePassword: true,
+        passwordResetAt: AdminFieldValue.serverTimestamp(),
+        passwordResetBy: authedUser.uid,
+      });
+
+      return res.json({ success: true, password });
+    } catch (err: any) {
+      const isElizaError = err instanceof ElizaError;
+      console.error("[ACADEMY_RESET_STUDENT_PASSWORD_ERROR]", err);
+      return res.status(isElizaError ? err.statusCode : 500).json({ success: false, error: isElizaError ? err.message : "Falha ao redefinir a senha do aluno." });
+    }
+  });
+
+  // ============================================================================
+  // ELIZA INTELLIGENCE v2 — ACTION LAYER
+  // ============================================================================
+  // Two-phase, always: propose() only ever builds a preview (reads, an AI
+  // draft call, zero side effects) and writes a `pending` proposal doc.
+  // execute() — the real write / real WhatsApp send — only ever runs from
+  // the approve route below, after a human confirms this exact proposal.
+  // Every phase transition is audit-logged.
+
+  async function elizaGenerateText(prompt: string, taskType: string, clinicId: string): Promise<string> {
+    const result = await generateElizaAIResponse({ taskType, contents: [{ role: "user", parts: [{ text: prompt }] }], clinicId });
+    return result?.text || "";
+  }
+
+  async function logActionAudit(clinicId: string, entry: Record<string, any>) {
+    await adminDb.collection(`clinics/${clinicId}/ai_eliza_v2_actions_audit`).add({
+      requestId: crypto.randomUUID(),
+      createdAt: AdminFieldValue.serverTimestamp(),
+      ...entry,
+    }).catch((e: any) => console.warn("[ELIZA_V2_ACTIONS] Audit log write failed:", e.message || e));
+  }
+
+  app.post("/api/eliza/actions/propose", async (req, res) => {
+    try {
+      const authedUser = await authenticateElizaRequest(req);
+      const { clinicId, uid } = authedUser;
+      const actionType = req.body?.actionType as ActionType;
+      const input = req.body?.input && typeof req.body.input === "object" ? req.body.input : {};
+
+      if (!actionType || !ACTION_REGISTRY[actionType]) {
+        return res.status(400).json({ success: false, error: "actionType inválido." });
+      }
+
+      const result = await ACTION_REGISTRY[actionType].propose(input, {
+        db: adminDb,
+        clinicId,
+        uid,
+        generateText: (prompt, taskType) => elizaGenerateText(prompt, taskType, clinicId),
+      });
+
+      // Some actions (propose_clinical_evolution) can determine, before any
+      // proposal exists, that the message wasn't a clinical description at
+      // all — a question or an insufficient/ambiguous reply. No
+      // action_proposals doc is created in that case: there is nothing to
+      // approve/reject, only a conversational reply, and the cognitive gap
+      // stays open on the client for a following turn. Content itself is
+      // never logged here — only the classification.
+      if (result && (result as any).type === "clarification") {
+        const { message, messageType } = result as { type: "clarification"; message: string; messageType: string };
+        await logActionAudit(clinicId, { userId: uid, actionType, phase: "clarification", messageType });
+        return res.json({ success: true, clarification: message, messageType });
+      }
+
+      const { preview, executionInput } = result as { preview: any; executionInput: any };
+
+      // Achado B3-R fix: at most one PENDING clinical proposal per cognitive
+      // gap — never "one proposal forever per gap" (a rejected/cancelled
+      // proposal must never permanently block a later, valid one for the
+      // same still-open gap). Only propose_clinical_evolution carries a
+      // gapId; every other action type keeps the original .add() path,
+      // untouched. The lock is a SEPARATE doc (never the proposal's own id),
+      // keyed by gapId, holding only a pointer to whichever proposal is
+      // currently open for that gap — so a proposal can freely move through
+      // pending -> rejected/executed and a fresh one can later claim the
+      // same gap once it's genuinely free again.
+      //
+      // Atomicity: the read-check-write (read the lock, read what it points
+      // to, decide reuse vs. create, write) all happens inside one Firestore
+      // transaction. Two concurrent requests for the same gap race on the
+      // SAME lock document; Firestore aborts and retries the loser
+      // automatically, so the retry's read sees the winner's just-written
+      // lock and reuses that proposal instead of creating a second one —
+      // this is what actually prevents the duplicate, not an application-
+      // level check.
+      const gapId: string | undefined = actionType === "propose_clinical_evolution" ? executionInput?.gapId : undefined;
+
+      let proposalId: string;
+      let finalPreview = preview;
+      let reused = false;
+
+      if (gapId) {
+        const lockRef = adminDb.doc(`clinics/${clinicId}/action_proposal_locks/${gapId}`);
+        const newProposalRef = adminDb.collection(`clinics/${clinicId}/action_proposals`).doc();
+        const outcome = await adminDb.runTransaction(async (tx) => {
+          const lockSnap = await tx.get(lockRef);
+          const lockedProposalId: string | undefined = lockSnap.exists ? lockSnap.data()?.proposalId : undefined;
+          if (lockedProposalId) {
+            const existingSnap = await tx.get(adminDb.doc(`clinics/${clinicId}/action_proposals/${lockedProposalId}`));
+            if (existingSnap.exists && existingSnap.data()?.status === "pending") {
+              // Another proposal for this exact gap is already open —
+              // return it instead of creating a duplicate. This is the
+              // ONLY branch that can fire concurrently for two racing
+              // requests, and Firestore's transaction retry is what
+              // guarantees only one of them ever reaches the create branch.
+              return { reused: true, proposalId: lockedProposalId, preview: existingSnap.data()!.preview };
+            }
+            // Lock points at a proposal that's no longer pending (rejected/
+            // cancelled/executed) — the gap may still be open for a fresh
+            // description; fall through to create a new one and re-point
+            // the lock at it.
+          }
+          tx.set(newProposalRef, {
+            actionType,
+            status: "pending",
+            proposedBy: uid,
+            input,
+            executionInput,
+            preview,
+            createdAt: AdminFieldValue.serverTimestamp(),
+          });
+          tx.set(lockRef, { proposalId: newProposalRef.id, updatedAt: AdminFieldValue.serverTimestamp() });
+          return { reused: false, proposalId: newProposalRef.id, preview };
+        });
+        proposalId = outcome.proposalId;
+        finalPreview = outcome.preview;
+        reused = outcome.reused;
+      } else {
+        const proposalRef = await adminDb.collection(`clinics/${clinicId}/action_proposals`).add({
+          actionType,
+          status: "pending",
+          proposedBy: uid,
+          input,
+          executionInput,
+          preview,
+          createdAt: AdminFieldValue.serverTimestamp(),
+        });
+        proposalId = proposalRef.id;
+      }
+
+      // A reused proposal isn't new — its own "propose" audit entry already
+      // exists from when it was actually created; logging another one here
+      // would misrepresent this call as having proposed something.
+      if (!reused) {
+        await logActionAudit(clinicId, { userId: uid, actionType, phase: "propose", proposalId });
+      }
+
+      return res.json({ success: true, proposalId, actionType, preview: finalPreview });
+    } catch (err: any) {
+      const isElizaError = err instanceof ElizaError;
+      console.error("[ELIZA_V2_ACTION_PROPOSE_ERROR]", err);
+      return res.status(isElizaError ? err.statusCode : 400).json({ success: false, error: err.message || "Falha ao preparar a ação." });
+    }
+  });
+
+  app.post("/api/eliza/actions/:proposalId/approve", async (req, res) => {
+    try {
+      const authedUser = await authenticateElizaRequest(req);
+      const { clinicId, uid } = authedUser;
+      const proposalId = req.params.proposalId;
+
+      const proposalRef = adminDb.doc(`clinics/${clinicId}/action_proposals/${proposalId}`);
+      const proposalSnap = await proposalRef.get();
+      if (!proposalSnap.exists) {
+        return res.status(404).json({ success: false, error: "Proposta não encontrada nesta clínica." });
+      }
+      const proposal = proposalSnap.data()!;
+      if (proposal.status !== "pending") {
+        return res.status(409).json({ success: false, error: `Proposta já está em status "${proposal.status}".` });
+      }
+
+      const actionType = proposal.actionType as ActionType;
+      if (ACTIONS_REQUIRING_ADMIN.includes(actionType) && !authedUser.isOwnerOrAdmin) {
+        return res.status(403).json({ success: false, error: "Apenas donos/administradores podem aprovar esta ação." });
+      }
+
+      // Narrow, whitelisted override channel — lets a human resolve a
+      // decision the proposal itself flagged as needing input (today: which
+      // existing treatment to attach an evolution to, when
+      // propose_clinical_evolution found more than one plausible match and
+      // refused to guess). Never a general-purpose executionInput patch: any
+      // key not on this list is dropped, so a client can never use this to
+      // rewrite something the model already decided (e.g. willMarkPlanCompleted).
+      const ALLOWED_APPROVE_OVERRIDE_KEYS = ["selectedTreatmentId"];
+      const rawOverrides = req.body?.overrides && typeof req.body.overrides === "object" ? req.body.overrides : {};
+      const overrides: Record<string, any> = {};
+      for (const key of ALLOWED_APPROVE_OVERRIDE_KEYS) {
+        if (key in rawOverrides) overrides[key] = rawOverrides[key];
+      }
+      const executionInput = { ...proposal.executionInput, ...overrides };
+
+      let executionResult: any = null;
+      let executionError: string | null = null;
+      let finalStatus: "executed" | "failed" = "executed";
+      try {
+        executionResult = await ACTION_REGISTRY[actionType].execute(executionInput, {
+          db: adminDb,
+          clinicId,
+          uid,
+          sendWhatsApp: (phone: string, text: string) => dispatchWhatsAppMessage(clinicId, phone, text),
+        });
+      } catch (execErr: any) {
+        finalStatus = "failed";
+        executionError = execErr.message || String(execErr);
+      }
+
+      await proposalRef.update({
+        status: finalStatus,
+        approvedBy: uid,
+        approvedAt: AdminFieldValue.serverTimestamp(),
+        executionResult,
+        executionError,
+      });
+
+      await logActionAudit(clinicId, { userId: uid, actionType, phase: "approve", proposalId, status: finalStatus, executionError });
+
+      if (finalStatus === "failed") {
+        return res.status(500).json({ success: false, error: executionError, proposalId, status: finalStatus });
+      }
+      return res.json({ success: true, proposalId, status: finalStatus, result: executionResult });
+    } catch (err: any) {
+      const isElizaError = err instanceof ElizaError;
+      console.error("[ELIZA_V2_ACTION_APPROVE_ERROR]", err);
+      return res.status(isElizaError ? err.statusCode : 500).json({ success: false, error: err.message || "Falha ao executar a ação." });
+    }
+  });
+
+  app.post("/api/eliza/actions/:proposalId/reject", async (req, res) => {
+    try {
+      const authedUser = await authenticateElizaRequest(req);
+      const { clinicId, uid } = authedUser;
+      const proposalId = req.params.proposalId;
+
+      const proposalRef = adminDb.doc(`clinics/${clinicId}/action_proposals/${proposalId}`);
+      const proposalSnap = await proposalRef.get();
+      if (!proposalSnap.exists) {
+        return res.status(404).json({ success: false, error: "Proposta não encontrada nesta clínica." });
+      }
+      const proposal = proposalSnap.data()!;
+      if (proposal.status !== "pending") {
+        return res.status(409).json({ success: false, error: `Proposta já está em status "${proposal.status}".` });
+      }
+
+      await proposalRef.update({
+        status: "rejected",
+        rejectedBy: uid,
+        rejectedAt: AdminFieldValue.serverTimestamp(),
+        rejectionReason: typeof req.body?.reason === "string" ? req.body.reason : null,
+      });
+
+      await logActionAudit(clinicId, { userId: uid, actionType: proposal.actionType, phase: "reject", proposalId });
+
+      return res.json({ success: true, proposalId, status: "rejected" });
+    } catch (err: any) {
+      const isElizaError = err instanceof ElizaError;
+      console.error("[ELIZA_V2_ACTION_REJECT_ERROR]", err);
+      return res.status(isElizaError ? err.statusCode : 500).json({ success: false, error: err.message || "Falha ao rejeitar a ação." });
+    }
+  });
+
+  // ELIZA Consciência Ativa — first cognitive event. Called by NextAgenda.tsx
+  // right after an appointment's status is set to "finalizado" (thin client
+  // call — no clinical logic lives there). The detector itself is
+  // idempotent both ways: creates at most one pending_item per appointment
+  // (atomic doc-ID create), and self-resolves a stale one if the gap no
+  // longer applies. Safe to call more than once for the same appointment.
+  app.post("/api/eliza/cognitive-events/check-appointment", async (req, res) => {
+    try {
+      const authedUser = await authenticateElizaRequest(req);
+      const { clinicId } = authedUser;
+      const appointmentId = req.body?.appointmentId;
+      if (!appointmentId || typeof appointmentId !== "string") {
+        return res.status(400).json({ success: false, error: "appointmentId é obrigatório." });
+      }
+      const gap = await detectFinishedAppointmentWithoutClinicalUpdate(adminDb, clinicId, appointmentId);
+      return res.json({ success: true, gap });
+    } catch (err: any) {
+      const isElizaError = err instanceof ElizaError;
+      console.error("[ELIZA_COGNITIVE_EVENTS_ERROR]", err);
+      return res.status(isElizaError ? err.statusCode : 400).json({ success: false, error: err.message || "Falha ao verificar o atendimento." });
+    }
+  });
+
+  // ELIZA Consciência Ativa — "standing gaps" (Fase 1 da reformulação de
+  // proatividade). Reaproveita insightEngine.ts (Insight[] já calculado,
+  // determinístico) via insightGapBridge.ts — nenhuma detecção nova.
+  // Chamado por useElizaStandingGapCheck.ts ao montar NextFinancial.tsx
+  // ('financeiro_open') ou NextAgenda.tsx ('agenda_open'), com cooldown no
+  // cliente — nunca em background/cron (decisão explícita do plano).
+  app.post("/api/eliza/cognitive-events/check-standing", async (req, res) => {
+    try {
+      const authedUser = await authenticateElizaRequest(req);
+      const { clinicId } = authedUser;
+      const checkpoint = req.body?.checkpoint;
+      if (checkpoint !== "financeiro_open" && checkpoint !== "agenda_open") {
+        return res.status(400).json({ success: false, error: "checkpoint inválido." });
+      }
+      // Financeiro nunca é lido nem promovido sem a mesma permissão que já
+      // gate a IA financeira em /api/eliza/ask — nunca vaza dado.
+      if (checkpoint === "financeiro_open" && !canAccessFinance(authedUser)) {
+        return res.json({ success: true, gaps: [] });
+      }
+
+      const now = new Date();
+      const currentMonthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+
+      const [agenda, financial, budgets, recall, pending] = await Promise.all([
+        checkpoint === "agenda_open" ? getAgendaAnalysis(adminDb, clinicId, { days: 7 }) : Promise.resolve(undefined),
+        checkpoint === "financeiro_open" ? getFinancialSummary(adminDb, clinicId, { from: currentMonthStart, to: now }) : Promise.resolve(undefined),
+        checkpoint === "financeiro_open" ? getOpenBudgets(adminDb, clinicId) : Promise.resolve(undefined),
+        checkpoint === "agenda_open" ? getRecallCandidates(adminDb, clinicId) : Promise.resolve(undefined),
+        checkpoint === "agenda_open" ? getPendingItems(adminDb, clinicId) : Promise.resolve(undefined),
+      ]);
+
+      const insights = buildInsights({ agenda, financial, budgets, recall, pending });
+      const gaps = await checkStandingGaps(adminDb, clinicId, checkpoint, insights);
+      return res.json({ success: true, gaps });
+    } catch (err: any) {
+      const isElizaError = err instanceof ElizaError;
+      console.error("[ELIZA_COGNITIVE_EVENTS_STANDING_ERROR]", err);
+      return res.status(isElizaError ? err.statusCode : 400).json({ success: false, error: err.message || "Falha ao verificar pendências." });
     }
   });
 
@@ -1193,68 +2309,642 @@ Responda APENAS com o nome da intenção em letras maiúsculas (ex: GET_TODAY_AG
     }
   });
 
-  // GET Webhook Verification for Meta
-  app.get("/api/whatsapp/webhook", async (req, res) => {
+  // GET Webhook Verification for Meta — global verify token only (the
+  // webhook URL is registered ONCE on the Meta app, not per clinic/WABA).
+  // No Firestore fallback, no hardcoded literal: META_WEBHOOK_VERIFY_TOKEN
+  // is a dedicated global secret, never reused for the App Secret and
+  // never stored per-clinic.
+  async function whatsappWebhookGetHandler(req: any, res: any) {
     const mode = req.query["hub.mode"];
     const token = req.query["hub.verify_token"];
     const challenge = req.query["hub.challenge"];
 
     console.log("[WHATSAPP WEBHOOK]");
     console.log(`received mode: ${mode}`);
-    console.log(`received token: ${token}`);
 
-    if (mode === "subscribe" && token) {
-      let matched = false;
-
-      // 1. Check direct prompt/env/system configurations
-      if (token === "XA29LW50") {
-        matched = true;
-      } else if (process.env.WHATSAPP_VERIFY_TOKEN && token === process.env.WHATSAPP_VERIFY_TOKEN) {
-        matched = true;
-      } else {
-        // 2. Fall back to scanning Firestore clinic collections
-        try {
-          const clinicsSnap = await adminDb.collection("clinics").get();
-          for (const clinicDoc of clinicsSnap.docs) {
-            const integrationRef = adminDb.doc(`clinics/${clinicDoc.id}/integrations/whatsapp`);
-            const integrationSnap = await integrationRef.get();
-            if (integrationSnap.exists) {
-              const data = integrationSnap.data() || {};
-              if (data.verifyToken === token || data.verify_token === token) {
-                matched = true;
-                break;
-              }
-            }
-          }
-        } catch (err) {
-          console.error("[WHATSAPP WEBHOOK] Error checking token in Firestore:", err);
-        }
-      }
-
-      if (matched) {
-        console.log("verification success");
-        return res.status(200).send(challenge);
-      } else {
-        console.log("verification failed");
-        return res.sendStatus(403);
-      }
+    const expectedToken = process.env.META_WEBHOOK_VERIFY_TOKEN;
+    if (mode === "subscribe" && token && expectedToken && token === expectedToken) {
+      console.log("verification success");
+      return res.status(200).send(challenge);
     }
 
     console.log("verification failed");
     return res.sendStatus(403);
-  });
+  }
+
+  // Dedup + lease-fencing state machine for inbound webhook events —
+  // clinics/{clinicId}/whatsapp_processed_events/{eventKey}, status one of
+  // "processing" | "completed" | "failed" | "dead_letter".
+  //
+  // Second revision — closes two real gaps the first version still had:
+  //   1. A crash between producing the real effect (writing the message)
+  //      and marking "completed" left the effect done but the state stale;
+  //      a retry would then redo the effect (double unreadCount). Fixed by
+  //      making completion part of the SAME Firestore transaction as the
+  //      effect wherever the effect is itself a Firestore write (see
+  //      commitInboundPatientMessage below) — either both happen or
+  //      neither does, so there is no window where a retry could see
+  //      "not completed yet" while the effect already landed. Where the
+  //      effect is NOT a Firestore write (the staff-command auto-reply,
+  //      which sends a real WhatsApp message over HTTP), true atomicity
+  //      with Firestore is not possible — documented at that call site.
+  //   2. Two workers can legitimately both believe they hold the claim: a
+  //      reclaim (of an abandoned "processing" doc, or a retried "failed"
+  //      one) does not retroactively stop whatever the ORIGINAL worker is
+  //      still doing if it was merely slow, not actually dead. Fixed with
+  //      claim fencing: every successful claim/reclaim gets a fresh random
+  //      `claimId`; every write that would conclude a claim (completing
+  //      the transaction above, or markWhatsAppWebhookEventCompleted /
+  //      markWhatsAppWebhookEventFailed) re-reads the doc INSIDE its own
+  //      transaction and only proceeds if `claimId` still matches what it
+  //      was handed at claim time. A worker whose claim was superseded
+  //      finds a different claimId on the document and aborts without
+  //      writing anything — it can neither complete, fail, nor overwrite
+  //      whatever the newer claim already recorded.
+  //
+  // Retries are capped: WA_WEBHOOK_MAX_ATTEMPTS failures move the event to
+  // "dead_letter" instead of "failed" — a dead_letter'd event is never
+  // reclaimed/re-executed automatically again (see claimWhatsAppWebhookEvent
+  // below). Future admin reprocessing (not built in this round — no new
+  // endpoint/UI is in scope): an authenticated owner/admin-only endpoint
+  // would read a specific dead_letter doc, and — after a human has looked
+  // at why it kept failing — issue a fresh claim on it explicitly (new
+  // claimId, status back to "processing", attempts reset to 1) so the
+  // normal flow above picks it up again on the next matching delivery, or
+  // (if the source event can't be redelivered by the provider) re-invoke
+  // the same processing function directly with the stored event context.
+  // The dead_letter doc already retains everything such an endpoint would
+  // need (clinicId, eventKey, attempts, last errorCode/errorClass/phase).
+  const WA_WEBHOOK_PROCESSING_CLAIM_TIMEOUT_MS = 5 * 60 * 1000;
+  const WA_WEBHOOK_EVENT_RETENTION_MS = 30 * 24 * 60 * 60 * 1000; // safety-net TTL for stuck processing/failed/dead_letter docs
+  const WA_WEBHOOK_COMPLETED_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+  const WA_WEBHOOK_MAX_ATTEMPTS = 5;
+
+  // Only these error CLASSES (constructor/name) are ever recorded in
+  // Firestore, never the raw err.message (may echo webhook payload
+  // content back, e.g. via a thrown validation error) and never a stack
+  // trace. Anything outside this small allowlist is recorded as
+  // "UnknownError" — full technical detail (including the real message)
+  // goes ONLY to server logs via console.error, which are themselves
+  // already never given the raw payload/token either.
+  const WA_ALLOWED_ERROR_CLASSES = new Set(["TypeError", "RangeError", "ReferenceError", "FirebaseError", "Error"]);
+
+  // Shared by the webhook dedup machinery above/below AND the Embedded
+  // Signup start-attempt/exchange endpoints further down — one allowlist,
+  // one log shape, for every WhatsApp-related error this file produces.
+  function classifyErrorClass(err: any): string {
+    const name = err?.constructor?.name || err?.name || "Error";
+    return WA_ALLOWED_ERROR_CLASSES.has(name) ? name : "UnknownError";
+  }
+
+  // The ONLY sanctioned way to log a WhatsApp-flow error anywhere in this
+  // file — never call console.error with a raw Error/exception object or
+  // an interpolated err.message directly; always go through this. Emits a
+  // single-line JSON structured log containing EXACTLY: scope, errorCode
+  // (a small fixed string, not free text), errorClass (from the allowlist
+  // above), phase, a SHA-256-hashed reference (never the literal
+  // eventKey/attemptId/messageId — those can be Meta-assigned but are
+  // still opaque identifiers worth not echoing verbatim), attempt count,
+  // and a timestamp. Deliberately excludes: the raw error message, any
+  // stack trace, the webhook/request payload, tokens, headers, full phone
+  // numbers, and message text — full technical detail for live debugging
+  // is a conscious trade-off given up here in favor of never risking a
+  // patient-data leak into logs; correlate via the hashed ref against the
+  // Firestore doc itself (which stores the same sanitized fields, nothing
+  // more).
+  function logSanitizedWaError(fields: {
+    scope: string;
+    errorCode: string;
+    phase: string;
+    ref: string;
+    err?: any;
+    attempt?: number | null;
+  }): void {
+    const refHash = crypto.createHash("sha256").update(fields.ref).digest("hex").slice(0, 12);
+    console.error(JSON.stringify({
+      scope: fields.scope,
+      errorCode: fields.errorCode,
+      errorClass: classifyErrorClass(fields.err),
+      phase: fields.phase,
+      ref: refHash,
+      attempt: fields.attempt ?? null,
+      timestamp: new Date().toISOString(),
+    }));
+  }
+
+  // Companion informational logger (não-erro) pro webhook do WhatsApp —
+  // achado real: a rota do webhook logava payload cru, headers completos
+  // (incluindo X-Hub-Signature/X-Hub-Signature-256) e telefone/texto/nome
+  // de contato/IDs externos direto em console.log, em várias linhas
+  // espalhadas pela função. Correção mínima e isolada: toda linha de log
+  // informativo dentro de whatsappWebhookPostHandler passa a usar só
+  // isto — nunca o payload, nunca headers, nunca um identificador externo
+  // (messageId/conversationId/telefone) em texto puro; um `ref` quando
+  // precisa de correlação vira hash SHA-256/12 (mesmo padrão de
+  // logSanitizedWaError acima), nunca o valor cru.
+  function logSanitizedWaInfo(fields: {
+    scope: string;
+    event: string;
+    clinicId?: string | null;
+    ref?: string | null;
+    extra?: Record<string, string | number | boolean | null>;
+  }): void {
+    console.log(JSON.stringify({
+      scope: fields.scope,
+      event: fields.event,
+      clinicId: fields.clinicId ?? null,
+      ref: fields.ref ? crypto.createHash("sha256").update(fields.ref).digest("hex").slice(0, 12) : null,
+      ...(fields.extra || {}),
+      timestamp: new Date().toISOString(),
+    }));
+  }
+
+  // Thrown by commitInboundPatientMessage (and treated as a no-op, not a
+  // real failure, by the call sites) when the claimId handed in no longer
+  // matches the document's current claimId — i.e. this worker's claim was
+  // reclaimed out from under it. Never surfaces as a "failed"/dead_letter
+  // transition, and never sets anyEventFailed at the call site.
+  class WaWebhookStaleClaimError extends Error {
+    constructor(message: string) { super(message); this.name = "WaWebhookStaleClaimError"; }
+  }
+
+  function webhookEventRef(clinicId: string, eventKey: string) {
+    const safeKey = eventKey.replace(/\//g, "_");
+    return adminDb.doc(`clinics/${clinicId}/whatsapp_processed_events/${safeKey}`);
+  }
+
+  async function claimWhatsAppWebhookEvent(clinicId: string, eventKey: string): Promise<{ claimed: boolean; claimId: string | null }> {
+    const ref = webhookEventRef(clinicId, eventKey);
+    const now = Date.now();
+    const claimId = crypto.randomUUID();
+    const freshClaim = {
+      status: "processing",
+      attempts: 1,
+      claimId,
+      firstClaimedAt: AdminFieldValue.serverTimestamp(),
+      claimedAt: AdminFieldValue.serverTimestamp(),
+      completedAt: null,
+      deadLetteredAt: null,
+      errorCode: null,
+      errorClass: null,
+      errorPhase: null,
+      lastFailedAt: null,
+      expiresAt: new Date(now + WA_WEBHOOK_EVENT_RETENTION_MS),
+    };
+    try {
+      await ref.create(freshClaim);
+      return { claimed: true, claimId };
+    } catch (createErr: any) {
+      if (!(createErr?.code === 6 || /already exists/i.test(String(createErr?.message || "")))) {
+        // Reservation itself failed for an unrelated reason (e.g. transient
+        // Firestore error) — fail open (process it, under this claimId)
+        // rather than silently dropping a legitimate event.
+        logSanitizedWaError({ scope: "WA_WEBHOOK_DEDUP", errorCode: "WA_CLAIM_CREATE_FAILED", phase: "CLAIM", ref: `${clinicId}:${eventKey}`, err: createErr });
+        return { claimed: true, claimId };
+      }
+    }
+
+    // Doc already exists — decide, inside a transaction, whether this
+    // delivery may (re)claim it.
+    try {
+      return await adminDb.runTransaction(async (tx) => {
+        const snap = await tx.get(ref);
+        if (!snap.exists) {
+          // Raced with something between the create() above and this read
+          // (e.g. TTL expiry) — treat as a fresh claim.
+          tx.set(ref, freshClaim);
+          return { claimed: true, claimId };
+        }
+        const data = snap.data() as any;
+        if (data.status === "completed") {
+          console.log(`[WA_WEBHOOK_DEDUP] Duplicate of completed event skipped: clinic=${clinicId} eventKey=${ref.id}`);
+          return { claimed: false, claimId: null };
+        }
+        if (data.status === "dead_letter") {
+          // Permanently given up on automatically — never auto-executes
+          // again. Only a future admin reprocessing action (see comment
+          // above) may revive it.
+          console.log(`[WA_WEBHOOK_DEDUP] Delivery for dead_letter event ignored: clinic=${clinicId} eventKey=${ref.id}`);
+          return { claimed: false, claimId: null };
+        }
+        if (data.status === "failed") {
+          if ((data.attempts || 0) >= WA_WEBHOOK_MAX_ATTEMPTS) {
+            // Defensive belt-and-suspenders only — markWhatsAppWebhookEventFailed
+            // already converts to dead_letter the moment attempts hits the
+            // cap, so a "failed" doc at/above the cap should not normally
+            // exist. Never reclaim it if it somehow does.
+            return { claimed: false, claimId: null };
+          }
+          // Safe retry: a previous attempt genuinely failed, this new
+          // delivery gets one more try under a FRESH claimId — the old
+          // claimId can no longer complete or fail anything.
+          tx.update(ref, {
+            status: "processing",
+            attempts: AdminFieldValue.increment(1),
+            claimId,
+            claimedAt: AdminFieldValue.serverTimestamp(),
+            errorCode: null,
+            errorClass: null,
+            errorPhase: null,
+          });
+          console.log(`[WA_WEBHOOK_DEDUP] Retrying previously-failed event: clinic=${clinicId} eventKey=${ref.id}`);
+          return { claimed: true, claimId };
+        }
+        // status === "processing": only reclaim if the previous claim is
+        // stale (abandoned — crash, deploy restart, hung request). A
+        // still-fresh "processing" doc means another delivery is
+        // genuinely in flight right now; this one must NOT also claim —
+        // and if the original worker was merely slow rather than dead,
+        // fencing on claimId (see commitInboundPatientMessage / markXxx
+        // below) is what stops it from writing once it does resume.
+        const claimedAtMs = typeof data.claimedAt?.toMillis === "function" ? data.claimedAt.toMillis() : 0;
+        const abandoned = now - claimedAtMs > WA_WEBHOOK_PROCESSING_CLAIM_TIMEOUT_MS;
+        if (!abandoned) {
+          console.log(`[WA_WEBHOOK_DEDUP] Concurrent in-flight delivery, not reclaiming: clinic=${clinicId} eventKey=${ref.id}`);
+          return { claimed: false, claimId: null };
+        }
+        tx.update(ref, {
+          status: "processing",
+          attempts: AdminFieldValue.increment(1),
+          claimId,
+          claimedAt: AdminFieldValue.serverTimestamp(),
+        });
+        console.log(`[WA_WEBHOOK_DEDUP] Reclaiming abandoned processing event: clinic=${clinicId} eventKey=${ref.id}`);
+        return { claimed: true, claimId };
+      });
+    } catch (txErr) {
+      logSanitizedWaError({ scope: "WA_WEBHOOK_DEDUP", errorCode: "WA_CLAIM_TRANSACTION_FAILED", phase: "CLAIM", ref: `${clinicId}:${eventKey}`, err: txErr });
+      return { claimed: true, claimId }; // same fail-open rationale as the create() branch above
+    }
+  }
+
+  // Fenced, NOT bundled with any effect — for call sites whose real effect
+  // already happened outside Firestore (the staff-command auto-reply,
+  // which sent an actual WhatsApp message over HTTP before this point) and
+  // so cannot be made atomic with the completion marker. A stale claimId
+  // here means a NEWER claim already owns this event; silently not
+  // overwriting it is correct — the effect (the WhatsApp send) already
+  // irreversibly happened under the OLD claim and nothing here can or
+  // should undo that, but the bookkeeping must still end up reflecting
+  // whichever claim is current, never regress it.
+  async function markWhatsAppWebhookEventCompleted(clinicId: string, eventKey: string, claimId: string): Promise<void> {
+    const ref = webhookEventRef(clinicId, eventKey);
+    try {
+      await adminDb.runTransaction(async (tx) => {
+        const snap = await tx.get(ref);
+        const data = snap.data() as any;
+        if (!snap.exists || data.claimId !== claimId || data.status !== "processing") {
+          console.warn(`[WA_WEBHOOK_DEDUP] Stale claim on complete, not overwriting: clinic=${clinicId} eventKey=${ref.id}`);
+          return;
+        }
+        tx.update(ref, {
+          status: "completed",
+          completedAt: AdminFieldValue.serverTimestamp(),
+          errorCode: null,
+          errorClass: null,
+          errorPhase: null,
+          lastFailedAt: null,
+          expiresAt: new Date(Date.now() + WA_WEBHOOK_COMPLETED_RETENTION_MS),
+        });
+      });
+    } catch (err) {
+      logSanitizedWaError({ scope: "WA_WEBHOOK_DEDUP", errorCode: "WA_MARK_COMPLETED_FAILED", phase: "MARK_COMPLETED", ref: `${clinicId}:${eventKey}`, err });
+    }
+  }
+
+  // Fenced. Returns true only if THIS call actually transitioned the
+  // document (to "failed" or "dead_letter") — false if it was a no-op
+  // because the claim was stale. Callers use the return value to decide
+  // whether to flag the whole HTTP response as a failure (a stale-claim
+  // no-op is not a real failure of the CURRENT state and should not force
+  // an otherwise-successful delivery to look like an error to the
+  // provider). Caps retries: once `attempts` reaches WA_WEBHOOK_MAX_ATTEMPTS,
+  // writes "dead_letter" instead of "failed" so claimWhatsAppWebhookEvent
+  // stops offering it for reclaim.
+  async function markWhatsAppWebhookEventFailed(clinicId: string, eventKey: string, claimId: string, phase: string, err: any): Promise<boolean> {
+    const ref = webhookEventRef(clinicId, eventKey);
+    const errorClass = classifyErrorClass(err);
+    const errorCode = `WA_${phase}_FAILED`;
+    try {
+      return await adminDb.runTransaction(async (tx) => {
+        const snap = await tx.get(ref);
+        const data = snap.data() as any;
+        if (!snap.exists || data.claimId !== claimId || data.status !== "processing") {
+          logSanitizedWaError({ scope: "WA_WEBHOOK_DEDUP", errorCode: "WA_STALE_CLAIM_ON_FAIL", phase, ref: `${clinicId}:${eventKey}`, attempt: data?.attempts ?? null });
+          return false;
+        }
+        const attemptsSoFar = data.attempts || 1;
+        if (attemptsSoFar >= WA_WEBHOOK_MAX_ATTEMPTS) {
+          tx.update(ref, {
+            status: "dead_letter",
+            deadLetteredAt: AdminFieldValue.serverTimestamp(),
+            lastFailedAt: AdminFieldValue.serverTimestamp(),
+            errorCode, errorClass, errorPhase: phase,
+          });
+          logSanitizedWaError({ scope: "WA_WEBHOOK_DEDUP", errorCode: "WA_MAX_ATTEMPTS_REACHED", phase, ref: `${clinicId}:${eventKey}`, err, attempt: attemptsSoFar });
+        } else {
+          tx.update(ref, {
+            status: "failed",
+            lastFailedAt: AdminFieldValue.serverTimestamp(),
+            errorCode, errorClass, errorPhase: phase,
+          });
+          logSanitizedWaError({ scope: "WA_WEBHOOK_DEDUP", errorCode, phase, ref: `${clinicId}:${eventKey}`, err, attempt: attemptsSoFar });
+        }
+        return true;
+      });
+    } catch (markErr) {
+      logSanitizedWaError({ scope: "WA_WEBHOOK_DEDUP", errorCode: "WA_MARK_FAILED_TRANSACTION_FAILED", phase, ref: `${clinicId}:${eventKey}`, err: markErr });
+      return false;
+    }
+  }
+
+  // Bundles the real inbound-message effect (conversation upsert + message
+  // doc create) and the completion marker into ONE Firestore transaction —
+  // see the "gap 1" note in the block comment above. Also defensively
+  // checks whether msgRef already exists before writing: if it does (e.g.
+  // an earlier, already-superseded attempt somehow got far enough to write
+  // it under a since-reclaimed old codepath), the effect is NOT repeated
+  // (no second unreadCount increment, no overwritten message) — only the
+  // completion marker is (re)confirmed. Throws WaWebhookStaleClaimError,
+  // producing NO writes at all, if `claimId` no longer matches the
+  // document's current claim.
+  async function commitInboundPatientMessage(
+    clinicId: string,
+    eventKey: string,
+    claimId: string,
+    convoRef: FirebaseFirestore.DocumentReference,
+    convoData: Record<string, any>,
+    msgRef: FirebaseFirestore.DocumentReference,
+    msgData: Record<string, any>,
+  ): Promise<void> {
+    const eventRef = webhookEventRef(clinicId, eventKey);
+    await adminDb.runTransaction(async (tx) => {
+      // All reads before any write, per Firestore transaction rules.
+      const eventSnap = await tx.get(eventRef);
+      const msgSnap = await tx.get(msgRef);
+      const eventData = eventSnap.data() as any;
+      if (!eventSnap.exists || eventData.claimId !== claimId || eventData.status !== "processing") {
+        throw new WaWebhookStaleClaimError(`Claim superseded for clinic=${clinicId} eventKey=${eventRef.id}`);
+      }
+      if (!msgSnap.exists) {
+        tx.set(convoRef, convoData, { merge: true });
+        tx.set(msgRef, msgData);
+      }
+      tx.update(eventRef, {
+        status: "completed",
+        completedAt: AdminFieldValue.serverTimestamp(),
+        errorCode: null,
+        errorClass: null,
+        errorPhase: null,
+        lastFailedAt: null,
+        expiresAt: new Date(Date.now() + WA_WEBHOOK_COMPLETED_RETENTION_MS),
+      });
+    });
+  }
+
+  // ---- Webhook inbound routing exclusively via whatsapp_phone_index (item 2) ----
+  // Substitui a varredura de todas as clínicas que existia antes (O(n)
+  // clínicas por evento, e em teoria ambígua se duas clínicas tivessem
+  // phoneNumberId coincidente por erro de dado). Agora o índice é a ÚNICA
+  // fonte de verdade pro roteamento — e, além de existir e estar 'active',
+  // a integração ativa da clínica apontada precisa CONCORDAR com o índice
+  // (mesma phoneNumberId, status 'conectado'). Qualquer inconsistência
+  // aborta como "não roteável" — nunca cai de volta pra varrer todas as
+  // clínicas, nunca encaminha pra uma clínica "provável"/"presumida".
+  type ClinicResolution = { ok: true; clinicId: string; integration: any } | { ok: false; reason: string };
+  async function resolveClinicForPhoneNumberId(phoneNumberId: string): Promise<ClinicResolution> {
+    const indexSnap = await adminDb.doc(`whatsapp_phone_index/${phoneNumberId}`).get();
+    if (!indexSnap.exists) return { ok: false as const, reason: "phone_index_missing" };
+    const indexData = indexSnap.data() as any;
+    if (indexData.status !== "active") return { ok: false as const, reason: `phone_index_status_${indexData.status}` };
+    const clinicId = indexData.clinicId;
+    if (!clinicId || typeof clinicId !== "string") return { ok: false as const, reason: "phone_index_missing_clinic_id" };
+
+    const integrationSnap = await adminDb.doc(`clinics/${clinicId}/integrations/whatsapp`).get();
+    const integration = integrationSnap.exists ? integrationSnap.data() : null;
+    const coherent = !!integration && integration.status === "conectado" && integration.phoneNumberId === phoneNumberId;
+    if (!coherent) return { ok: false as const, reason: "phone_index_integration_mismatch" };
+
+    return { ok: true as const, clinicId, integration };
+  }
+
+  // ---- Roteamento: falha recuperável (503) vs inconsistência persistente
+  // em quarentena (rodada final de fechamento) ----
+  // Antes desta rodada, TODA falha de roteamento virava 200 (ack) — certo
+  // pra inconsistência de DADO (retry não resolveria), errado pra falha de
+  // INFRAESTRUTURA (leitura do Firestore lançou, ou índice está 'pending'
+  // — uma ativação em andamento que deve virar 'active' em segundos): um
+  // ack nesses casos faz a Meta desistir de reentregar algo que uma
+  // segunda tentativa, segundos depois, teria roteado com sucesso.
+  //   - RECUPERÁVEL (503, sem quarentena): leitura do índice lançou
+  //     exceção; índice em 'pending' (ativação genuinamente em andamento).
+  //   - PERSISTENTE (200 ack + quarentena sanitizada): índice ausente, sem
+  //     clinicId, ou incoerente com a integração da clínica apontada —
+  //     nenhum desses se autocorrige com um reenvio; fica registrado (só
+  //     phoneNumberId + motivo + contagem, nunca payload/mensagem) pra
+  //     investigação humana em vez de silenciosamente desaparecer no log.
+  const WA_ROUTING_RECOVERABLE_REASONS = new Set(["phone_index_status_pending", "phone_index_lookup_failed"]);
+
+  // ---- Política de TTL/retenção (item 8, rodada final de fechamento) ----
+  // Definida localmente aqui; a configuração REAL do TTL nativo do
+  // Firestore (console/gcloud, por campo `expiresAt`) é um passo de infra
+  // separado, ainda não executado (ver checklist final). Duas famílias,
+  // políticas OPOSTAS de propósito:
+  //
+  //   TRANSIENTE (tem TTL, apaga sozinho) — `whatsapp_processed_events`
+  //   (dedup, 7 dias, já implementado — WA_WEBHOOK_COMPLETED_RETENTION_MS
+  //   acima) e `whatsapp_routing_quarantine` (inconsistência de roteamento,
+  //   30 dias, implementado logo abaixo). Racional: inação aqui é de baixo
+  //   risco — um evento de dedup expirado só significa "a Meta não vai
+  //   reentregar isso de novo"; uma quarentena que não reaparece há 30 dias
+  //   corrigiu-se sozinha ou nunca mais vai acontecer (o TTL da quarentena
+  //   é medido a partir de `lastSeenAt`, não `firstSeenAt` — um problema
+  //   genuinamente recorrente NUNCA expira, só um que parou de acontecer).
+  //
+  //   PERSISTENTE (SEM TTL, nunca apaga sozinho) — `whatsapp_orphaned_secret_versions`
+  //   e `whatsapp_pending_waba_cleanup`. Deliberado, não esquecido: cada
+  //   registro aqui representa um FATO DE SEGURANÇA ainda verdadeiro (uma
+  //   versão de secret ainda válida no Secret Manager; uma assinatura de
+  //   WABA ainda ativa do lado da Meta) até que o procedimento
+  //   administrativo separado (nunca este runtime) confirme e grave
+  //   `disabledAt`/`cleanedUpAt`. Apagar o REGISTRO não desfaz o fato real
+  //   que ele descreve — só faria a equipe perder a visibilidade de uma
+  //   credencial/assinatura órfã ainda viva, trocando um lembrete
+  //   incômodo por um risco silencioso. TTL aqui seria uma regressão de
+  //   segurança, não uma limpeza.
+  function quarantineRefFor(phoneNumberId: string) {
+    const hash = crypto.createHash("sha256").update(phoneNumberId).digest("hex").slice(0, 32);
+    return adminDb.doc(`whatsapp_routing_quarantine/${hash}`);
+  }
+  const WA_ROUTING_QUARANTINE_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+  async function quarantineRoutingInconsistency(phoneNumberId: string, reason: string): Promise<void> {
+    const ref = quarantineRefFor(phoneNumberId);
+    try {
+      await adminDb.runTransaction(async (tx) => {
+        const snap = await tx.get(ref);
+        const expiresAt = new Date(Date.now() + WA_ROUTING_QUARANTINE_RETENTION_MS);
+        if (!snap.exists) {
+          tx.set(ref, {
+            phoneNumberId, reason,
+            firstSeenAt: AdminFieldValue.serverTimestamp(),
+            lastSeenAt: AdminFieldValue.serverTimestamp(),
+            occurrences: 1,
+            resolvedAt: null,
+            expiresAt,
+          });
+        } else {
+          tx.update(ref, { reason, lastSeenAt: AdminFieldValue.serverTimestamp(), occurrences: AdminFieldValue.increment(1), expiresAt });
+        }
+      });
+    } catch (err) {
+      logSanitizedWaError({ scope: "WA_WEBHOOK_META", errorCode: "WA_QUARANTINE_RECORD_FAILED", phase: "INBOUND_ROUTING", ref: phoneNumberId, err });
+    }
+  }
+  type RoutingOutcome = { ok: true; clinicId: string; integration: any } | { ok: false; recoverable: boolean; reason: string };
+  async function resolveClinicForInboundRouting(phoneNumberId: string): Promise<RoutingOutcome> {
+    let resolution: ClinicResolution;
+    try {
+      resolution = await resolveClinicForPhoneNumberId(phoneNumberId);
+    } catch (err) {
+      logSanitizedWaError({ scope: "WA_WEBHOOK_META", errorCode: "WA_ROUTING_LOOKUP_THREW", phase: "INBOUND_ROUTING", ref: phoneNumberId, err });
+      return { ok: false as const, recoverable: true, reason: "phone_index_lookup_failed" };
+    }
+    if (resolution.ok === false) {
+      logSanitizedWaError({ scope: "WA_WEBHOOK_META", errorCode: `WA_ROUTING_${resolution.reason.toUpperCase()}`, phase: "INBOUND_ROUTING", ref: phoneNumberId });
+      const recoverable = WA_ROUTING_RECOVERABLE_REASONS.has(resolution.reason);
+      if (!recoverable) {
+        await quarantineRoutingInconsistency(phoneNumberId, resolution.reason);
+      }
+      return { ok: false as const, recoverable, reason: resolution.reason };
+    }
+    return resolution;
+  }
+
+  // AI auto-reply for inbound WhatsApp messages — only ever called when the
+  // clinic's integration has aiEnabled!==false AND humanApprovalRequired===
+  // false (see WhatsAppSettings.tsx's "Modo Seguro" toggle, which already
+  // wrote these two fields; this is the first place that actually reads
+  // them). Deliberately narrower than the staff-facing /api/eliza/ask
+  // system prompt: this one talks directly to a real patient over WhatsApp,
+  // so it never sees anamnesis/clinical evolution notes (privacy — no
+  // reason a text-message bot needs to be able to recite someone's medical
+  // history), never proposes/executes an action, and refuses medical advice
+  // outright rather than trying to sound helpful about it.
+  async function generateWhatsAppAutoReply(params: {
+    clinicId: string; clinicName: string; patientId: string | null; patientName: string;
+    incomingText: string; recentHistory: { direction: string; text: string }[];
+  }): Promise<string | null> {
+    const { clinicId, clinicName, patientId, patientName, incomingText, recentHistory } = params;
+    try {
+      let matchedPatient: any = null;
+      if (patientId) {
+        const patient = await getPatientContext(adminDb, clinicId, patientId);
+        matchedPatient = {
+          name: patient.name,
+          upcomingAppointmentsCount: patient.upcomingAppointments.length,
+          upcomingAppointments: patient.upcomingAppointments.map((a) => ({ date: a.label, status: a.detail })),
+          lastAppointment: patient.lastAppointment ? { date: patient.lastAppointment.label, detail: patient.lastAppointment.detail } : null,
+          overdueFinancial: patient.overdueFinancial.count > 0 ? { count: patient.overdueFinancial.count, amount: patient.overdueFinancial.amount } : null,
+        };
+      }
+
+      const modelInput = {
+        clinicName,
+        patientMessage: incomingText,
+        matchedPatient,
+        recentHistory: recentHistory.length > 0 ? recentHistory : undefined,
+      };
+
+      const systemPrompt = `Você é a Eliza, assistente virtual oficial da clínica "${clinicName}", respondendo automaticamente pelo WhatsApp oficial diretamente a pacientes reais.
+
+REGRAS OBRIGATÓRIAS:
+1. Tom acolhedor e direto, 1-3 frases curtas (é WhatsApp, não e-mail) — sem emojis em excesso, no máximo 1.
+2. NUNCA dê conselho clínico, diagnóstico, orientação de dosagem/medicação ou qualquer conteúdo médico. Se a pergunta for clínica, diga que vai encaminhar para a equipe/profissional responder, e nada mais.
+3. Use APENAS os dados fornecidos em "matchedPatient" para falar de agendamento ou financeiro específico deste paciente — nunca invente data, valor, horário ou status que não estejam ali.
+4. Se "matchedPatient" for null, o número não foi identificado como paciente cadastrado — não finja saber quem é; peça nome completo pra localizar o cadastro, ou oriente a falar com a secretaria caso não consiga.
+5. Nunca prometa marcar, remarcar ou cancelar uma consulta sozinha — apenas informe o que já está agendado (se houver) e diga que a equipe vai confirmar qualquer alteração.
+6. Se não conseguir ajudar com segurança e clareza usando só os dados fornecidos, diga que vai encaminhar para a equipe humana responder — nunca invente uma resposta pra parecer útil.
+7. "recentHistory", se presente, são as últimas mensagens reais desta conversa (mistura de mensagens do paciente e respostas já enviadas) — use só para manter continuidade, nunca como fonte de um fato novo.
+
+DADOS REAIS DISPONÍVEIS:
+${JSON.stringify(modelInput, null, 2)}
+
+Responda ESTRITAMENTE em JSON válido, sem markdown, neste formato exato:
+{"reply": "texto da resposta pronta para enviar ao paciente"}`;
+
+      const aiResult = await generateElizaAIResponse({
+        taskType: "whatsapp_auto_reply",
+        contents: [{ role: "user", parts: [{ text: systemPrompt }] }],
+        clinicId,
+      });
+
+      const rawText: string = aiResult?.text || "";
+      const jsonMatch = rawText.match(/\{[\s\S]*\}/);
+      if (!jsonMatch) return null;
+      const parsed = JSON.parse(jsonMatch[0]);
+      const reply = String(parsed.reply || "").trim();
+      return reply || null;
+    } catch (err: any) {
+      logSanitizedWaError({ scope: "WA_AUTO_REPLY", errorCode: "WA_AUTO_REPLY_GENERATION_FAILED", phase: "AI_GENERATION", ref: patientName, err });
+      return null;
+    }
+  }
 
   // POST Webhook Receiver
-  app.post("/api/whatsapp/webhook", async (req, res) => {
-    // 1. ADD WEBHOOK POST HIT LOGS
-    console.log("[WHATSAPP WEBHOOK POST HIT]");
-    console.log(`timestamp: ${new Date().toISOString()}`);
-    console.log(`rawBody: ${JSON.stringify(req.body)}`);
-    console.log(`headers: ${JSON.stringify(req.headers)}`);
+  async function whatsappWebhookPostHandler(req: any, res: any) {
+    // Nunca loga headers completos aqui — X-Hub-Signature/
+    // X-Hub-Signature-256 são valores derivados do App Secret, não
+    // deveriam sair pro Cloud Logging mesmo sendo "só" uma assinatura.
+    logSanitizedWaInfo({ scope: "WA_WEBHOOK", event: "post_received" });
 
-    const body = req.body;
-    console.log("[WA_WEBHOOK] POST received webhook event payload.");
-    console.log("WEBHOOK_RECEIVED", JSON.stringify(body));
+    let body: any;
+    if (Buffer.isBuffer(req.body)) {
+      // Meta: this route's Content-Type branch captured the raw Buffer —
+      // verify X-Hub-Signature-256 over the EXACT bytes before trusting
+      // anything inside them, and only THEN parse JSON.
+      const signatureHeader = req.headers["x-hub-signature-256"];
+      const appSecret = process.env.META_APP_SECRET;
+      if (!appSecret) {
+        console.error("[WA_WEBHOOK_META] META_APP_SECRET not configured — rejecting.");
+        return res.sendStatus(403);
+      }
+      if (typeof signatureHeader !== "string" || !signatureHeader.startsWith("sha256=")) {
+        console.error("[WA_WEBHOOK_META] Missing or malformed X-Hub-Signature-256 — rejecting.");
+        return res.sendStatus(403);
+      }
+      const expectedHex = crypto.createHmac("sha256", appSecret).update(req.body).digest("hex");
+      const providedHex = signatureHeader.slice("sha256=".length);
+      let validSig = false;
+      try {
+        const expectedBuf = Buffer.from(expectedHex, "hex");
+        const providedBuf = Buffer.from(providedHex, "hex");
+        validSig = expectedBuf.length === providedBuf.length && crypto.timingSafeEqual(expectedBuf, providedBuf);
+      } catch {
+        validSig = false;
+      }
+      if (!validSig) {
+        console.error("[WA_WEBHOOK_META] Invalid signature — rejecting.");
+        return res.sendStatus(403);
+      }
+      try {
+        body = JSON.parse(req.body.toString("utf8"));
+      } catch (parseErr) {
+        logSanitizedWaError({ scope: "WA_WEBHOOK_META", errorCode: "WA_BODY_PARSE_FAILED", phase: "PARSE_BODY", ref: "meta_webhook_body", err: parseErr });
+        return res.sendStatus(400);
+      }
+    } else {
+      // Twilio: express.urlencoded() (applied by this route's own
+      // Content-Type branch) already parsed this into an object — the
+      // exact same shape twilio.validateRequest() below has always
+      // expected, unchanged from before this route was registered earlier
+      // in the file.
+      body = req.body;
+    }
+
+    // Nunca loga o payload cru — pode conter telefone, texto de mensagem e
+    // nome de contato. `object` aqui é só a string fixa que a Meta manda
+    // ("whatsapp_business_account"), nunca dado do usuário.
+    logSanitizedWaInfo({ scope: "WA_WEBHOOK", event: "body_parsed", extra: { object: typeof body?.object === "string" ? body.object : null } });
 
     // Twilio posts form-encoded (no `object` field, always has MessageSid —
     // both for inbound messages and for delivery-status callbacks). Meta
@@ -1281,7 +2971,7 @@ Responda APENAS com o nome da intenção em letras maiúsculas (ex: GET_TODAY_AG
         }
 
         if (!matchedClinicId || !matchedIntegration) {
-          console.warn("[WA_WEBHOOK_TWILIO] No clinic matched for To:", body.To);
+          logSanitizedWaInfo({ scope: "WA_WEBHOOK_TWILIO", event: "no_clinic_matched" });
           return res.sendStatus(200);
         }
 
@@ -1315,7 +3005,7 @@ Responda APENAS com o nome da intenção em letras maiúsculas (ex: GET_TODAY_AG
               }
             }
           } catch (statusErr) {
-            console.error("[WA_WEBHOOK_TWILIO] Failed updating message status:", statusErr);
+            logSanitizedWaError({ scope: "WA_WEBHOOK_TWILIO", errorCode: "WA_TWILIO_STATUS_UPDATE_FAILED", phase: "STATUS_PROCESSING", ref: `${matchedClinicId}:${messageSid}`, err: statusErr });
           }
           return res.sendStatus(200);
         }
@@ -1389,10 +3079,48 @@ Responda APENAS com o nome da intenção em letras maiúsculas (ex: GET_TODAY_AG
           createdAt: AdminFieldValue.serverTimestamp()
         });
 
-        console.log(`[WA_WEBHOOK_TWILIO] Saved inbound message. clinic=${matchedClinicId} conversation=${conversationId} sid=${messageSid}`);
+        logSanitizedWaInfo({ scope: "WA_WEBHOOK_TWILIO", event: "inbound_message_saved", clinicId: matchedClinicId, ref: messageSid });
+
+        // AI auto-reply — gated by the clinic's own toggles (WhatsAppSettings.tsx):
+        // aiEnabled must be on AND humanApprovalRequired must be explicitly off.
+        // Any other combination (including the field never having been set,
+        // which defaults humanApprovalRequired to "safe mode" client-side)
+        // leaves today's behavior unchanged — inbound saved, no auto-send.
+        if (matchedIntegration.aiEnabled !== false && matchedIntegration.humanApprovalRequired === false) {
+          try {
+            const clinicSnap = await adminDb.doc(`clinics/${matchedClinicId}`).get();
+            const clinicName = clinicSnap.data()?.name || "a clínica";
+
+            const historySnap = await adminDb
+              .collection(`clinics/${matchedClinicId}/whatsapp_conversations/${conversationId}/messages`)
+              .orderBy("timestamp", "desc")
+              .limit(6)
+              .get();
+            const recentHistory = historySnap.docs
+              .map((d) => ({ direction: d.data().direction, text: String(d.data().text || "").slice(0, 300) }))
+              .reverse();
+
+            const replyText = await generateWhatsAppAutoReply({
+              clinicId: matchedClinicId, clinicName, patientId: patientId || null, patientName,
+              incomingText: textMsg, recentHistory,
+            });
+
+            if (replyText) {
+              await dispatchAndRecordOutboundWhatsAppMessage({
+                clinicId: matchedClinicId, conversationId, text: replyText,
+                sentBy: "ai", aiGenerated: true, source: "ai_auto_reply",
+              });
+            }
+          } catch (autoReplyErr: any) {
+            logSanitizedWaError({ scope: "WA_AUTO_REPLY", errorCode: "WA_AUTO_REPLY_DISPATCH_FAILED", phase: "AUTO_REPLY", ref: messageSid, err: autoReplyErr });
+          }
+        }
+
         return res.sendStatus(200);
       } catch (twilioWebhookErr: any) {
-        console.error("[WA_WEBHOOK_TWILIO] Error handling Twilio webhook:", twilioWebhookErr);
+        // matchedClinicId is block-scoped to the try above, not visible
+        // here — "twilio_webhook" is a fixed, non-identifying ref label.
+        logSanitizedWaError({ scope: "WA_WEBHOOK_TWILIO", errorCode: "WA_TWILIO_WEBHOOK_FAILED", phase: "TWILIO_PROCESSING", ref: "twilio_webhook", err: twilioWebhookErr });
         // Twilio retries aggressively on non-2xx; ack anyway, the error is logged above.
         return res.sendStatus(200);
       }
@@ -1407,6 +3135,12 @@ Responda APENAS com o nome da intenção em letras maiúsculas (ex: GET_TODAY_AG
         console.log("Webhook não está recebendo porque o campo messages não está assinado na Meta.");
       }
 
+      // Set when any individual event's processing genuinely fails below —
+      // drives the final response status (see the end of this try block):
+      // a partial failure must never come back as a plain 200, or the
+      // provider has no reason to redeliver the events that failed.
+      let anyEventFailed = false;
+
       try {
         if (
           body.entry &&
@@ -1417,35 +3151,20 @@ Responda APENAS com o nome da intenção em letras maiúsculas (ex: GET_TODAY_AG
           const changeValue = body.entry[0].changes[0].value;
           const metadata = changeValue.metadata;
           const phoneNumberId = metadata.phone_number_id;
-          
-          // Find clinic with this phoneNumberId
-          const clinicsSnap = await adminDb.collection("clinics").get();
-          let matchedClinicId = null;
-          let matchedIntegration = null;
 
-          for (const clinicDoc of clinicsSnap.docs) {
-            const integrationRef = adminDb.doc(`clinics/${clinicDoc.id}/integrations/whatsapp`);
-            const integrationSnap = await integrationRef.get();
-            if (integrationSnap.exists) {
-              const data = integrationSnap.data() || {};
-              if (
-                data.phoneNumberId === phoneNumberId || 
-                data.phone_number_id === phoneNumberId || 
-                data.metaPhoneId === phoneNumberId ||
-                data.metaPhoneNumberId === phoneNumberId
-              ) {
-                matchedClinicId = clinicDoc.id;
-                matchedIntegration = data;
-                break;
-              }
-            }
+          // Item 2 — roteamento exclusivamente pelo índice global, nunca
+          // mais varrendo todas as clínicas. Nunca cai pra uma busca
+          // ampla, nunca encaminha pra uma clínica presumida — falha
+          // recuperável (leitura falhou, índice 'pending') vira 503 pra
+          // provocar reentrega real do provedor; inconsistência
+          // persistente vai pra quarentena sanitizada + 200 ack (ver
+          // resolveClinicForInboundRouting acima).
+          const routing = await resolveClinicForInboundRouting(phoneNumberId);
+          if (routing.ok === false) {
+            return routing.recoverable ? res.status(503).json({ error: routing.reason }) : res.sendStatus(200);
           }
-
-          if (!matchedClinicId || !matchedIntegration) {
-            console.error("[WHATSAPP CLINIC NOT FOUND]");
-            console.error(`receivedPhoneNumberId: ${phoneNumberId}`);
-            return res.sendStatus(200); 
-          }
+          const matchedClinicId = routing.clinicId;
+          const matchedIntegration = routing.integration;
 
           const messages = changeValue.messages;
           const contacts = changeValue.contacts || [];
@@ -1453,8 +3172,32 @@ Responda APENAS com o nome da intenção em letras maiúsculas (ex: GET_TODAY_AG
           const profileName = contactProfile.profile?.name || "Paciente WhatsApp";
 
           for (const msg of messages) {
-            const fromPhone = msg.from; 
+            const fromPhone = msg.from;
             const messageId = msg.id;
+            const { claimed: msgClaimed, claimId: msgClaimId } = await claimWhatsAppWebhookEvent(matchedClinicId, messageId);
+            if (!msgClaimed || !msgClaimId) continue;
+            try {
+            // Test-only fault injection for the dedup state machine
+            // (scripts/verifyWhatsAppWebhookDedup.mjs) — provides a real,
+            // deterministic way to exercise the genuine failure→retry path,
+            // and the "old claim resumes after being reclaimed" fencing
+            // path, through actual production code, not a synthetic
+            // Firestore write. All three sentinels are inert unless BOTH
+            // the exact text AND an env var never set by any real deploy
+            // are present — cannot fire from a real Meta payload by
+            // accident.
+            if (process.env.WA_WEBHOOK_ALLOW_TEST_FAULT === "1" && msg.type === "text") {
+              if (msg.text?.body === "__WA_TEST_FORCE_FAILURE__") {
+                throw new Error("Injected test failure (WA_WEBHOOK_ALLOW_TEST_FAULT)");
+              }
+              if (msg.text?.body === "__WA_TEST_SLOW_WORKER__") {
+                await new Promise((r) => setTimeout(r, 3000));
+              }
+              if (msg.text?.body === "__WA_TEST_SLOW_THEN_FAIL__") {
+                await new Promise((r) => setTimeout(r, 3000));
+                throw new Error("Injected slow-then-fail test failure (WA_WEBHOOK_ALLOW_TEST_FAULT)");
+              }
+            }
             let textMsg = "";
 
             if (msg.type === "text" && msg.text) {
@@ -1463,17 +3206,10 @@ Responda APENAS com o nome da intenção em letras maiúsculas (ex: GET_TODAY_AG
               textMsg = `[Mensagem tipo: ${msg.type}]`;
             }
 
-            // 2. EXTRACTION AND INBOUND PAYLOAD LOGGING (Item 2)
-            console.log("[WHATSAPP INBOUND PAYLOAD]");
-            console.log(`phone_number_id: ${phoneNumberId}`);
-            console.log(`from: ${fromPhone}`);
-            console.log(`profile.name: ${profileName}`);
-            console.log(`message.id: ${messageId}`);
-            console.log(`message.type: ${msg.type}`);
-            console.log(`text.body: ${textMsg}`);
-            console.log(`timestamp: ${msg.timestamp}`);
-
-            console.log(`[WA_WEBHOOK] Matched clinic ${matchedClinicId}. New msg from ${fromPhone}: ${textMsg}`);
+            // Nunca loga from/profile.name/text.body/message.id — telefone,
+            // nome de contato, texto da mensagem e ID externo, exatamente
+            // o que não pode aparecer em log de infraestrutura.
+            logSanitizedWaInfo({ scope: "WA_WEBHOOK", event: "inbound_message_matched", clinicId: matchedClinicId, extra: { messageType: msg.type } });
 
             // Check ELIZA Interna Professional Access
             const cleanSenderPhone = fromPhone.replace(/\D/g, "");
@@ -1495,10 +3231,13 @@ Responda APENAS com o nome da intenção em letras maiúsculas (ex: GET_TODAY_AG
             }
 
             if (matchedStaffDoc && staffData) {
-              console.log(`[WA_WEBHOOK] [ELIZA_INTERNA] Sender ${fromPhone} identified as staff member ${staffData.name} (Role: ${staffData.role})`);
-              
+              // Nunca loga telefone nem nome do funcionário — staffId
+              // (doc id interno) é a única referência, sem hash nem
+              // valor cru de contato.
+              logSanitizedWaInfo({ scope: "WA_WEBHOOK", event: "eliza_interna_sender_identified", clinicId: matchedClinicId, extra: { staffId: matchedStaffDoc.id } });
+
               const intent = await interpretCommand(textMsg);
-              console.log(`[WA_WEBHOOK] [ELIZA_INTERNA] Interpreted intent: ${intent}`);
+              logSanitizedWaInfo({ scope: "WA_WEBHOOK", event: "eliza_interna_intent_interpreted", clinicId: matchedClinicId, extra: { intent } });
               
               let responseText = "";
               let isAuthorized = true;
@@ -1857,12 +3596,18 @@ Versão polida por ELIZA:`,
                 response: polishedText,
                 errorCode: dispatchResult.errorCode || null,
                 errorMessage: dispatchResult.errorMessage || null,
-                metaResponse: dispatchResult.metaResponse || null,
+                metaResponse: null, // corpo cru da Graph nunca é repassado — ver sendViaMeta/whatsappGraphClient.ts.
                 whatsappMessageId: dispatchResult.whatsappMessageId || null,
                 createdAt: AdminFieldValue.serverTimestamp()
               });
 
-              // Intercept and skip to next incoming webhook message
+              // Intercept and skip to next incoming webhook message.
+              // Not transactional with the dispatch above (that was a real
+              // outbound WhatsApp send over HTTP, already irreversible by
+              // this point) — see markWhatsAppWebhookEventCompleted's own
+              // doc comment for why fencing here can only protect the
+              // bookkeeping, not undo/prevent that external effect.
+              await markWhatsAppWebhookEventCompleted(matchedClinicId, messageId, msgClaimId);
               continue;
             }
 
@@ -1935,7 +3680,9 @@ Versão polida por ELIZA:`,
               }
             }
 
-            console.log(`[WHATSAPP CONVERSATION MATCH] matchedPatient=${matchedPatientDoc ? 'true' : 'false'} patientId=${patientId} patientName=${patientName} phoneNormalized=${phoneNormalized}`);
+            // Nunca loga patientId/patientName/telefone — só o booleano de
+            // se um paciente cadastrado foi encontrado.
+            logSanitizedWaInfo({ scope: "WA_WEBHOOK", event: "conversation_patient_match", clinicId: matchedClinicId, extra: { matchedPatient: !!matchedPatientDoc } });
 
             // Query existing conversations inside Firestore to see if one matches this incoming phone
             const convosSnap = await adminDb.collection(`clinics/${matchedClinicId}/whatsapp_conversations`).get();
@@ -1956,61 +3703,92 @@ Versão polida por ELIZA:`,
 
             const conversationId = fromPhone;
 
-            // Log [WHATSAPP INCOMING] logger
-            console.log(`[WHATSAPP INCOMING] telefone=${fromPhone} messageId=${messageId} texto="${textMsg}" conversationId=${conversationId}`);
+            // Nunca loga telefone/messageId/texto — evento estruturado só
+            // confirma que a mensagem inbound foi recebida e vai ser
+            // processada, sem nenhum dado do paciente.
+            logSanitizedWaInfo({ scope: "WA_WEBHOOK", event: "inbound_message_received", clinicId: matchedClinicId });
 
-            // Create/update conversation
+            // Create/update conversation + save message + mark the event
+            // "completed", all in ONE Firestore transaction, fenced on
+            // msgClaimId — see commitInboundPatientMessage's doc comment.
+            // Either everything above lands together with "completed", or
+            // NONE of it does (claim superseded → StaleClaimError, nothing
+            // written at all). No window exists anymore where the message
+            // is saved but the event isn't marked done, which is exactly
+            // the crash window that used to make a retry double-increment
+            // unreadCount.
             const convoRef = adminDb.doc(`clinics/${matchedClinicId}/whatsapp_conversations/${conversationId}`);
-
-            await convoRef.set({
-              patientId: patientId || "",
-              patientName,
-              patientPhone: fromPhone,
-              status: "aguardando", 
-              lastMessage: textMsg,
-              lastMessageAt: AdminFieldValue.serverTimestamp(),
-              unreadCount: AdminFieldValue.increment(1),
-              assignedTo: "ai",
-              aiEnabled: matchedIntegration.aiEnabled !== false,
-              source: "whatsapp",
-              updatedAt: AdminFieldValue.serverTimestamp()
-            }, { merge: true });
-
-            // Save message
             const msgRef = adminDb.doc(`clinics/${matchedClinicId}/whatsapp_conversations/${conversationId}/messages/${messageId}`);
-            await msgRef.set({
-              direction: "inbound",
-              text: textMsg,
-              timestamp: AdminFieldValue.serverTimestamp(),
-              createdAt: AdminFieldValue.serverTimestamp(),
-              from: fromPhone,
-              to: metadata.display_phone_number || "",
-              phoneNormalized: phoneNormalized || fromPhone.replace(/\D/g, ""),
-              whatsappMessageId: messageId,
-              profileName: profileName,
-              status: "received",
-              aiGenerated: false,
-              sentBy: "whatsapp",
-              source: "whatsapp_webhook"
-            });
+            await commitInboundPatientMessage(
+              matchedClinicId, messageId, msgClaimId,
+              convoRef, {
+                patientId: patientId || "",
+                patientName,
+                patientPhone: fromPhone,
+                status: "aguardando",
+                lastMessage: textMsg,
+                lastMessageAt: AdminFieldValue.serverTimestamp(),
+                unreadCount: AdminFieldValue.increment(1),
+                assignedTo: "ai",
+                aiEnabled: matchedIntegration.aiEnabled !== false,
+                source: "whatsapp",
+                updatedAt: AdminFieldValue.serverTimestamp()
+              },
+              msgRef, {
+                direction: "inbound",
+                text: textMsg,
+                timestamp: AdminFieldValue.serverTimestamp(),
+                createdAt: AdminFieldValue.serverTimestamp(),
+                from: fromPhone,
+                to: metadata.display_phone_number || "",
+                phoneNormalized: phoneNormalized || fromPhone.replace(/\D/g, ""),
+                whatsappMessageId: messageId,
+                profileName: profileName,
+                status: "received",
+                aiGenerated: false,
+                sentBy: "whatsapp",
+                source: "whatsapp_webhook"
+              },
+            );
 
-            // Log [WHATSAPP SAVE] logger
-            console.log(`[WHATSAPP SAVE] documentPath=${msgRef.path} status=success`);
-            console.log(`[WHATSAPP SAVE INBOUND] path=${msgRef.path} status=success`);
+            // Nunca loga msgRef.path — o caminho do documento embute o
+            // telefone (conversationId) e o messageId.
+            logSanitizedWaInfo({ scope: "WA_WEBHOOK", event: "inbound_message_saved", clinicId: matchedClinicId });
 
-            // Log webhook received
-            await adminDb.collection(`clinics/${matchedClinicId}/integration_logs`).add({
-              type: "whatsapp",
-              action: "webhook_received",
-              status: "success",
-              message: `Mensagem recebida de ${patientName} (${fromPhone}): "${textMsg.substring(0, 40)}${textMsg.length > 40 ? '...' : ''}"`,
-              createdAt: AdminFieldValue.serverTimestamp()
-            });
-
-            // Log [WHATSAPP UI UPDATE] logger
-            const messagesSnap = await adminDb.collection(`clinics/${matchedClinicId}/whatsapp_conversations/${conversationId}/messages`).get();
-            const messageCount = messagesSnap.size;
-            console.log(`[WHATSAPP UI UPDATE] conversationId=${conversationId} messageCount=${messageCount}`);
+            // Best-effort telemetry ONLY, deliberately outside the
+            // transaction above and in its own try/catch: the event is
+            // already "completed" by this point (the real effect already
+            // landed), so a failure here must never flip the whole
+            // delivery to look like a processing failure — that would
+            // just cost the provider a pointless retry that dedup would
+            // immediately no-op anyway (claimWhatsAppWebhookEvent sees
+            // "completed" and skips).
+            try {
+              await adminDb.collection(`clinics/${matchedClinicId}/integration_logs`).add({
+                type: "whatsapp",
+                action: "webhook_received",
+                status: "success",
+                message: `Mensagem recebida de ${patientName} (${fromPhone}): "${textMsg.substring(0, 40)}${textMsg.length > 40 ? '...' : ''}"`,
+                createdAt: AdminFieldValue.serverTimestamp()
+              });
+              const messagesSnap = await adminDb.collection(`clinics/${matchedClinicId}/whatsapp_conversations/${conversationId}/messages`).get();
+              // Nunca loga conversationId (é o telefone) — só a métrica de contagem.
+              logSanitizedWaInfo({ scope: "WA_WEBHOOK", event: "conversation_message_count", clinicId: matchedClinicId, extra: { messageCount: messagesSnap.size } });
+            } catch (telemetryErr) {
+              logSanitizedWaError({ scope: "WA_WEBHOOK", errorCode: "WA_TELEMETRY_FAILED", phase: "POST_COMPLETION_TELEMETRY", ref: `${matchedClinicId}:${messageId}`, err: telemetryErr });
+            }
+            } catch (perMessageError: any) {
+              if (perMessageError instanceof WaWebhookStaleClaimError) {
+                // Not a real failure — a newer claim already owns (or
+                // finished) this event; this worker was just slow. Nothing
+                // was written, nothing to mark, no reason to fail the
+                // response for it.
+                logSanitizedWaError({ scope: "WA_WEBHOOK_DEDUP", errorCode: "WA_STALE_CLAIM_DISCARDED", phase: "MESSAGE_PROCESSING", ref: `${matchedClinicId}:${messageId}` });
+              } else {
+                const reallyFailed = await markWhatsAppWebhookEventFailed(matchedClinicId, messageId, msgClaimId, "MESSAGE_PROCESSING", perMessageError);
+                if (reallyFailed) anyEventFailed = true;
+              }
+            }
           }
         }
 
@@ -2028,40 +3806,43 @@ Versão polida por ELIZA:`,
 
           console.log(`[WHATSAPP STATUS UPDATE] Webhook status event received. Total: ${statuses.length}`);
 
-          // Find clinic with this phoneNumberId
-          const clinicsSnap = await adminDb.collection("clinics").get();
-          let matchedClinicId = null;
-          for (const clinicDoc of clinicsSnap.docs) {
-            const integrationSnap = await adminDb.doc(`clinics/${clinicDoc.id}/integrations/whatsapp`).get();
-            if (integrationSnap.exists) {
-              const data = integrationSnap.data() || {};
-              if (data.phoneNumberId === phoneNumberId || data.phone_number_id === phoneNumberId || data.metaPhoneId === phoneNumberId) {
-                matchedClinicId = clinicDoc.id;
-                break;
-              }
-            }
+          // Item 2 — mesma resolução exclusivamente via índice usada no
+          // loop de mensagens acima; nunca varre todas as clínicas, nunca
+          // encaminha pra uma clínica presumida. Nada mais depende do
+          // resultado deste bloco (é o último antes da resposta final),
+          // então o mesmo 503/200 recuperável-vs-persistente se aplica com
+          // um early return direto, igual ao loop de mensagens.
+          const statusRouting = await resolveClinicForInboundRouting(phoneNumberId);
+          if (statusRouting.ok === false) {
+            return statusRouting.recoverable ? res.status(503).json({ error: statusRouting.reason }) : res.sendStatus(200);
           }
+          const matchedClinicId = statusRouting.clinicId;
+          for (const s of statuses) {
+            const metaMessageId = s.id;
+            const newStatus = s.status; // "delivered", "read", "failed", "sent"
+            const recipientId = s.recipient_id; // Normalized phone
+            const eventKey = `${metaMessageId}:${newStatus}`;
+            const { claimed: statusClaimed, claimId: statusClaimId } = await claimWhatsAppWebhookEvent(matchedClinicId, eventKey);
+            if (!statusClaimed || !statusClaimId) continue;
 
-          if (matchedClinicId) {
-            for (const s of statuses) {
-              const metaMessageId = s.id;
-              const newStatus = s.status; // "delivered", "read", "failed", "sent"
-              const recipientId = s.recipient_id; // Normalized phone
-              
-              console.log(`[WA_STATUS] msgId: ${metaMessageId}, status: ${newStatus}, recipient_id: ${recipientId}`);
+              try {
+              // Nunca loga metaMessageId/recipientId (telefone) — só o
+              // status em si, que não é dado do paciente.
+              logSanitizedWaInfo({ scope: "WA_WEBHOOK", event: "status_update_received", clinicId: matchedClinicId, extra: { status: newStatus } });
 
               // Find the message under clinics/{clinicId}/whatsapp_conversations/{recipientId}/messages
               // where whatsappMessageId == metaMessageId
               const folderRef = adminDb.collection(`clinics/${matchedClinicId}/whatsapp_conversations/${recipientId}/messages`);
               const querySnap = await folderRef.where("whatsappMessageId", "==", metaMessageId).get();
-              
+
               if (!querySnap.empty) {
                 for (const doc of querySnap.docs) {
                   await doc.ref.update({
                     status: newStatus,
                     statusUpdatedAt: AdminFieldValue.serverTimestamp()
                   });
-                  console.log(`[WA_STATUS] Updated message ${doc.id} status to '${newStatus}' in conversation ${recipientId}`);
+                  // Nunca loga doc.id (deriva do messageId) nem recipientId (telefone).
+                  logSanitizedWaInfo({ scope: "WA_WEBHOOK", event: "status_update_applied", clinicId: matchedClinicId, extra: { status: newStatus } });
                 }
               } else {
                 // If it wasn't found in recipientId, search in all conversations (fallback)
@@ -2073,27 +3854,737 @@ Versão polida por ELIZA:`,
                       status: newStatus,
                       statusUpdatedAt: AdminFieldValue.serverTimestamp()
                     });
-                    console.log(`[WA_STATUS_FALLBACK] Updated message ${fbDoc.id} status to '${newStatus}'`);
+                    // Nunca loga fbDoc.id (deriva do messageId).
+                    logSanitizedWaInfo({ scope: "WA_WEBHOOK", event: "status_update_applied_fallback", clinicId: matchedClinicId, extra: { status: newStatus } });
                   }
                 }
               }
+              await markWhatsAppWebhookEventCompleted(matchedClinicId, eventKey, statusClaimId);
+              } catch (perStatusError: any) {
+                const reallyFailed = await markWhatsAppWebhookEventFailed(matchedClinicId, eventKey, statusClaimId, "STATUS_PROCESSING", perStatusError);
+                if (reallyFailed) anyEventFailed = true;
+              }
             }
-          }
         }
 
-        return res.sendStatus(200);
+        // A partial failure (some events "completed", others "failed")
+        // must come back as non-2xx — that is what makes the provider's
+        // own redelivery drive the retry for exactly the events that
+        // failed (successful ones already show "completed" and will just
+        // no-op on redelivery via claimWhatsAppWebhookEvent above).
+        return res.sendStatus(anyEventFailed ? 500 : 200);
       } catch (error: any) {
-        console.error("[WA_WEBHOOK_ERROR] Failed handling webhook post:", error);
-        if (body && body.entry && body.entry[0] && body.entry[0].changes && body.entry[0].changes[0] && body.entry[0].changes[0].value && body.entry[0].changes[0].value.messages) {
-          console.error("WEBHOOK_MESSAGES_ERROR");
-          console.error(error.stack || error.message || String(error));
-          console.error("Payload recebido:", JSON.stringify(body));
-        }
-        return res.status(500).json({ error: error.message || "Webhook handling failed" }); 
+        // Deliberately NEVER logs the payload/body here anymore (it used
+        // to — a real violation: the raw webhook body contains message
+        // text, contact names, phone numbers). A crash this far out (
+        // before/outside any single event's own try/catch) has no
+        // eventKey to attach to; "meta_webhook_outer" is a fixed,
+        // non-identifying ref label.
+        logSanitizedWaError({ scope: "WA_WEBHOOK_META", errorCode: "WA_WEBHOOK_OUTER_FAILED", phase: "OUTER_HANDLER", ref: "meta_webhook_outer", err: error });
+        return res.status(500).json({ error: "webhook_handling_failed" });
       }
     }
 
     return res.sendStatus(404);
+  }
+
+  // ---------------------------------------------------------------------
+  // WhatsApp Embedded Signup (Coexistence) — start-attempt / exchange.
+  // Plano vast-yawning-hamster.md v4. Etapa A, fase local, rodada de
+  // paridade/fencing:
+  //   - Secret Manager e Graph API SEMPRE mockados nesta fase
+  //     (getSecretManagerClient()/getWhatsAppGraphClient() só devolvem o
+  //     cliente real quando WA_EMBEDDED_SIGNUP_USE_MOCK_CLIENTS!=='1' — os
+  //     scripts de teste desta fase sempre setam essa env var). O mock do
+  //     Secret Manager tem PARIDADE explícita com o real: nenhum dos dois
+  //     cria o secret sozinho — ver src/lib/secretManager.ts e
+  //     src/lib/whatsappSecretProvisioner.ts pra arquitetura de
+  //     provisionamento (identidade separada, nunca este runtime).
+  //   - candidateConfig só existe dentro do connectionAttempt; a
+  //     integração ATIVA (clinics/{clinicId}/integrations/whatsapp) nunca
+  //     é tocada antes da transação terminal.
+  //   - Token de acesso NUNCA em texto no Firestore — só accessTokenSecretName
+  //     + accessTokenSecretVersionCandidate (um número de versão, nunca
+  //     "latest"). Uma versão criada com sucesso mas nunca promovida (por
+  //     falha numa etapa posterior) é registrada como órfã — ver
+  //     recordOrphanedSecretVersion.
+  //   - Concorrência otimista na transação terminal via
+  //     DocumentSnapshot.updateTime da integração ativa (monotônico,
+  //     atribuído pelo servidor, não pode ser falsificado por quem
+  //     escreve) capturado como baseIntegrationVersion no início da
+  //     tentativa — se mudou entre então e a transação terminal, alguém
+  //     mais já terminou uma conexão mais nova; esta tentativa aborta.
+  //   - whatsapp_phone_index/{phoneNumberId} (top-level, fora de
+  //     clinics/{clinicId}) é reservado atomicamente ('pending', com
+  //     lease) antes de qualquer chamada que dependa do número, e só vira
+  //     'active' dentro da MESMA transação terminal que promove a
+  //     integração — impede duas clínicas DIFERENTES de reivindicarem o
+  //     mesmo número ao mesmo tempo (reconexão pela MESMA clínica é
+  //     permitida). Rollback de uma reserva só remove se ainda pertencer
+  //     ao mesmo attemptId (fencing).
+  //   - Rollback da assinatura da WABA verifica, antes de desassinar, se a
+  //     integração ativa da clínica não passou a depender dela nesse
+  //     meio-tempo (ver isWabaSubscriptionStillNeeded) — createdByThisAttempt
+  //     sozinho não basta, um worker mais lento pode ter sido superado por
+  //     um mais novo que já reaproveitou a mesma assinatura.
+  //   - Depois do POST de assinatura da WABA, um GET de confirmação
+  //     separado precisa confirmar antes da transação terminal — uma
+  //     confirmação inconclusiva (ou ausente) bloqueia a promoção, do
+  //     mesmo jeito que Coexistence não-confirmada bloqueia.
+  //   - O `code` do OAuth é de uso único (ver whatsappGraphClient.ts) —
+  //     uma tentativa que falha depois de já ter trocado o code nunca
+  //     tenta reexecutar a troca; ela se encerra e exige uma tentativa
+  //     nova (com um code novo de um login novo), preservando só a
+  //     referência da versão de secret órfã, nunca o code nem o token cru.
+  // ---------------------------------------------------------------------
+  const WA_ATTEMPT_TTL_MS = 10 * 60 * 1000;
+  const WA_PHONE_INDEX_LEASE_MS = 5 * 60 * 1000;
+
+  // Higiene de esquema: baseIntegrationVersion é o valor CANÔNICO do
+  // DocumentSnapshot.updateTime da integração ativa, capturado como
+  // {seconds, nanoseconds} — não um número de milissegundos. Um
+  // Timestamp do Firestore tem precisão de NANOSSEGUNDOS; reduzir pra
+  // milissegundos (.toMillis()) pode colapsar dois updates genuinamente
+  // diferentes na mesma comparação em tese, o que enfraqueceria a
+  // concorrência otimista exatamente no ponto que ela existe pra proteger.
+  // {seconds, nanoseconds} preserva o valor exato, sem perda, e ainda é
+  // serializável como campo simples no Firestore (nunca comparado como
+  // Timestamp reidratado, que teria o mesmo problema se comparado por
+  // igualdade de objeto).
+  type CanonicalTimestamp = { seconds: number; nanoseconds: number } | null;
+  function canonicalizeTimestamp(ts: FirebaseFirestore.Timestamp | undefined | null): CanonicalTimestamp {
+    if (!ts) return null;
+    return { seconds: ts.seconds, nanoseconds: ts.nanoseconds };
+  }
+  function timestampsEqual(a: CanonicalTimestamp, b: CanonicalTimestamp): boolean {
+    if (a === null || b === null) return a === b;
+    return a.seconds === b.seconds && a.nanoseconds === b.nanoseconds;
+  }
+
+  function attemptRefFor(clinicId: string, attemptId: string) {
+    return adminDb.doc(`clinics/${clinicId}/whatsapp_connection_attempts/${attemptId}`);
+  }
+
+  async function authenticateOwnerOrAdmin(req: any): Promise<{ uid: string; clinicId: string } | { error: true; status: number; code: string }> {
+    let auth;
+    try {
+      auth = await authenticateElizaRequest(req);
+    } catch (err: any) {
+      const isElizaError = err instanceof ElizaError;
+      if (!isElizaError) {
+        // Não deveria acontecer (authenticateElizaRequest só deveria
+        // lançar ElizaError) — se acontecer, log sanitizado em vez de
+        // engolir silenciosamente, senão um 401 genérico não dá nenhuma
+        // pista de diagnóstico.
+        logSanitizedWaError({ scope: "WA_EMBEDDED_SIGNUP", errorCode: "WA_AUTH_UNEXPECTED_ERROR", phase: "AUTHENTICATION", ref: String(req.body?.clinicId || "unknown"), err });
+      }
+      return { error: true, status: isElizaError ? err.statusCode : 401, code: isElizaError ? err.code : "AUTH_ERROR" };
+    }
+    if (!auth.isOwnerOrAdmin) {
+      return { error: true, status: 403, code: "OWNER_OR_ADMIN_REQUIRED" };
+    }
+    return { uid: auth.uid, clinicId: auth.clinicId };
+  }
+
+  // ---- Orphaned secret versions (item 2) ----
+  // clinics/{clinicId}/whatsapp_orphaned_secret_versions/{hash}. Higiene de
+  // esquema: o ID do doc é um hash SHA-256 determinístico de
+  // `secretName + ':' + versionId`, nunca uma concatenação sanitizada por
+  // regex — um regex de "caracteres seguros" pode deixar passar algo
+  // inesperado; um hash é estruturalmente incapaz de conter '/' ou
+  // qualquer outro caractere inválido pra um ID de documento Firestore,
+  // independente do que secretName/versionId contenham.
+  function orphanedVersionRefFor(clinicId: string, secretName: string, versionId: string) {
+    const hash = crypto.createHash("sha256").update(`${secretName}:${versionId}`).digest("hex").slice(0, 32);
+    return adminDb.doc(`clinics/${clinicId}/whatsapp_orphaned_secret_versions/${hash}`);
+  }
+  async function recordOrphanedSecretVersion(clinicId: string, attemptId: string, secretName: string, versionId: string, reason: string): Promise<void> {
+    try {
+      await orphanedVersionRefFor(clinicId, secretName, versionId).set({
+        secretName, versionId, attemptId, clinicId, reason,
+        orphanedAt: AdminFieldValue.serverTimestamp(),
+        // Nunca escrito por este runtime — só pelo procedimento
+        // administrativo de limpeza (identidade separada, ver
+        // whatsappSecretProvisioner.ts). SEM `expiresAt` de propósito —
+        // política de retenção definida acima (item 8, rodada final):
+        // este registro descreve uma versão de secret ainda VÁLIDA no
+        // Secret Manager, TTL aqui apagaria o rastro de uma credencial
+        // órfã ainda viva, não o problema em si.
+        disabledAt: null,
+      });
+    } catch (err) {
+      logSanitizedWaError({ scope: "WA_EMBEDDED_SIGNUP", errorCode: "WA_ORPHAN_RECORD_FAILED", phase: "ORPHAN_TRACKING", ref: `${clinicId}:${attemptId}`, err });
+    }
+  }
+
+  // ---- WABA cleanup vira procedimento administrativo (rodada final) ----
+  // Antes desta rodada, o rollback chamava DELETE /{wabaId}/subscribed_apps
+  // automaticamente quando isWabaSubscriptionStillNeeded(wabaId) dizia
+  // "não". Removido de propósito: mesmo com o fencing GLOBAL (Seção
+  // isWabaSubscriptionStillNeeded acima), uma chamada DELETE automática
+  // continua sendo uma ação IRREVERSÍVEL disparada por uma tentativa que
+  // FALHOU, sobre um recurso (a assinatura da WABA) que pode ser
+  // compartilhado por reconexões futuras da mesma clínica ou por uma
+  // condição de corrida que a checagem, por mais rigorosa que seja, não
+  // elimina 100% (a janela entre a leitura e o DELETE nunca é atômica com
+  // uma chamada de rede externa). Mesma disciplina já aplicada à versão
+  // órfã do secret (nunca desabilitada automaticamente): registra pra
+  // revisão administrativa, nunca executa a ação destrutiva sozinho. O
+  // procedimento de limpeza real (fora desta rodada, nunca executado por
+  // este runtime) deve RECONFIRMAR isWabaSubscriptionStillNeeded no
+  // MOMENTO da limpeza (não confiar no snapshot de quando foi flagged,
+  // que pode estar desatualizado) antes de decidir desassinar.
+  async function recordPendingWabaCleanup(clinicId: string, attemptId: string, wabaId: string, reason: string): Promise<void> {
+    try {
+      await adminDb.doc(`clinics/${clinicId}/whatsapp_pending_waba_cleanup/${attemptId}`).set({
+        wabaId, attemptId, clinicId, reason,
+        flaggedAt: AdminFieldValue.serverTimestamp(),
+        // SEM `expiresAt` de propósito, mesma política do item 8 (rodada
+        // final): a assinatura da WABA pode continuar ativa do lado da
+        // Meta até alguém confirmar e limpar de verdade.
+        cleanedUpAt: null,
+      });
+    } catch (err) {
+      logSanitizedWaError({ scope: "WA_EMBEDDED_SIGNUP", errorCode: "WA_WABA_CLEANUP_RECORD_FAILED", phase: "ROLLBACK", ref: `${clinicId}:${attemptId}`, err });
+    }
+  }
+
+  // ---- Global phone number reservation (item 3) ----
+  // whatsapp_phone_index/{phoneNumberId} — TOP-LEVEL, fora de clinics/{id}.
+  // Fencing por reservationClaimId (imprevisível, gerado a cada reserva/
+  // reclaim bem-sucedido) — não só attemptId: um attemptId sozinho
+  // identifica QUEM fez a última reserva, mas não distingue "esta reserva
+  // específica, ainda viva" de "uma reserva antiga do mesmo attemptId que
+  // já foi reclamada e substituída" (não deveria acontecer com o desenho
+  // atual, já que cada attempt reserva no máximo uma vez, mas o claimId
+  // deixa isso estruturalmente impossível de confundir, mesmo sob mudança
+  // futura, e espelha o mesmo padrão já usado no dedup do webhook).
+  // Confirmação (rodada final, item 5): a reserva grava `wabaId` no MESMO
+  // doc que o roteamento inbound lê (whatsapp_phone_index/{phoneNumberId})
+  // e é o MESMO valor promovido pra `integrations/whatsapp.wabaId` na
+  // transação terminal — os três (reserva, isWabaSubscriptionStillNeeded,
+  // integração final) sempre leem o mesmo `discovery.wabaId` desta mesma
+  // tentativa, nunca reconciliados a posteriori. Isso garante, por
+  // construção (não por checagem em runtime), que
+  // isWabaSubscriptionStillNeeded(wabaId) — que consulta
+  // whatsapp_phone_index.where("wabaId","==",wabaId) — sempre encontra
+  // exatamente as reservas que de fato usam essa WABA, nunca uma reserva
+  // com wabaId desatualizado ou ausente. A promoção pra 'active' (ver
+  // transação terminal) só atualiza status/activatedAt no doc, nunca
+  // reescreve wabaId — não há segundo ponto de escrita que pudesse
+  // divergir.
+  type PhoneReserveResult = { ok: true; reservationClaimId: string } | { ok: false; reason: string };
+  async function reservePhoneIndex(clinicId: string, attemptId: string, phoneNumberId: string, wabaId: string): Promise<PhoneReserveResult> {
+    const ref = adminDb.doc(`whatsapp_phone_index/${phoneNumberId}`);
+    const reservationClaimId = crypto.randomUUID();
+    const leaseExpiresAt = new Date(Date.now() + WA_PHONE_INDEX_LEASE_MS);
+    const freshReservation = { status: "pending", clinicId, attemptId, reservationClaimId, phoneNumberId, wabaId, reservedAt: AdminFieldValue.serverTimestamp(), leaseExpiresAt, activatedAt: null };
+    return adminDb.runTransaction(async (tx): Promise<PhoneReserveResult> => {
+      const snap = await tx.get(ref);
+      if (!snap.exists) {
+        tx.set(ref, freshReservation);
+        return { ok: true as const, reservationClaimId };
+      }
+      const data = snap.data() as any;
+      if (data.status === "active") {
+        if (data.clinicId !== clinicId) {
+          // O requisito é impedir CLÍNICAS DIFERENTES de disputarem o
+          // mesmo número — reconexão pela mesma clínica que já o possui é
+          // legítima e permitida.
+          return { ok: false as const, reason: "phone_connected_to_other_clinic" };
+        }
+        tx.set(ref, freshReservation);
+        return { ok: true as const, reservationClaimId };
+      }
+      // status === "pending": só reclama se a lease expirou.
+      const leaseExpiresAtMs = typeof data.leaseExpiresAt?.toMillis === "function" ? data.leaseExpiresAt.toMillis() : 0;
+      const expired = Date.now() > leaseExpiresAtMs;
+      if (!expired) {
+        return { ok: false as const, reason: data.clinicId === clinicId ? "phone_reservation_in_progress_same_clinic" : "phone_reservation_in_progress_other_clinic" };
+      }
+      tx.set(ref, freshReservation);
+      return { ok: true as const, reservationClaimId };
+    });
+  }
+  async function releasePhoneIndexIfOwnedByClaim(phoneNumberId: string | null | undefined, reservationClaimId: string | null | undefined, clinicId: string, attemptId: string): Promise<void> {
+    if (!phoneNumberId || !reservationClaimId) return;
+    const ref = adminDb.doc(`whatsapp_phone_index/${phoneNumberId}`);
+    try {
+      await adminDb.runTransaction(async (tx) => {
+        const snap = await tx.get(ref);
+        if (!snap.exists) return;
+        const data = snap.data() as any;
+        // Fencing: só remove uma reserva que ainda "pending" E ainda tem o
+        // MESMO reservationClaimId — nunca uma já promovida a 'active',
+        // nunca uma reclamada por outra tentativa/clínica desde então
+        // (mesmo que o attemptId por algum motivo colidisse, o claimId
+        // nunca colide).
+        if (data.status === "pending" && data.reservationClaimId === reservationClaimId) {
+          tx.delete(ref);
+        }
+      });
+    } catch (err) {
+      logSanitizedWaError({ scope: "WA_EMBEDDED_SIGNUP", errorCode: "WA_PHONE_INDEX_RELEASE_FAILED", phase: "ROLLBACK", ref: `${clinicId}:${attemptId}`, err });
+    }
+  }
+  // Item 3 — renova (ou valida) a lease imediatamente antes da transação
+  // terminal: o fluxo inteiro (troca de code, discovery, coexistence,
+  // secret, assinatura+confirmação da WABA) pode levar tempo suficiente
+  // pra uma lease de 5min ficar apertada; renovar aqui, fenced pelo mesmo
+  // reservationClaimId, garante que a checagem final da transação terminal
+  // não rejeite por expiração relativa a quando a reserva foi FEITA, só
+  // por ela ter sido genuinamente perdida/reclamada por outro claim.
+  type LeaseRenewResult = { ok: true } | { ok: false; reason: string };
+  async function renewPhoneIndexLease(phoneNumberId: string, reservationClaimId: string): Promise<LeaseRenewResult> {
+    const ref = adminDb.doc(`whatsapp_phone_index/${phoneNumberId}`);
+    return adminDb.runTransaction(async (tx): Promise<LeaseRenewResult> => {
+      const snap = await tx.get(ref);
+      if (!snap.exists) return { ok: false as const, reason: "phone_reservation_lost" };
+      const data = snap.data() as any;
+      if (data.status !== "pending" || data.reservationClaimId !== reservationClaimId) {
+        return { ok: false as const, reason: "phone_reservation_lost" };
+      }
+      tx.update(ref, { leaseExpiresAt: new Date(Date.now() + WA_PHONE_INDEX_LEASE_MS) });
+      return { ok: true as const };
+    });
+  }
+
+  // ---- WABA subscription rollback fencing (item 4) — GLOBAL ----
+  // createdByThisAttempt=true não basta: se, entre esta tentativa criar a
+  // assinatura e ela falhar depois, uma tentativa MAIS NOVA (em QUALQUER
+  // clínica) já reaproveitou essa mesma assinatura, desassinar agora
+  // quebraria essa conexão — mesmo classe de problema do "worker antigo
+  // retorna atrasado" já resolvido pro dedup do webhook, aplicado aqui à
+  // assinatura da WABA. Checa GLOBALMENTE (não só a clínica da tentativa
+  // que está fazendo rollback), considerando:
+  //   1. Qualquer integração ATIVA (qualquer clínica) usando esta wabaId;
+  //   2. Qualquer reserva PENDING válida (lease não expirada) do índice de
+  //      telefone referenciando esta wabaId — uma conexão ainda em
+  //      andamento, mesmo que não tenha chegado a promover a integração
+  //      ainda, já "reserva" o direito de precisar da assinatura;
+  //   3. Qualquer connectionAttempt PROCESSING (qualquer clínica) cujo
+  //      candidateConfig referencia esta wabaId — mesmo sem reserva de
+  //      telefone ainda (pode estar num passo anterior do fluxo).
+  // Consultas por igualdade de campo único (sem segundo filtro no server)
+  // — filtra o segundo critério (status) no cliente, de propósito: evita
+  // exigir um índice composto de collectionGroup que não existe no
+  // ambiente local/emulador desta fase.
+  async function isWabaSubscriptionStillNeeded(wabaId: string): Promise<boolean> {
+    const [integrationsSnap, phoneIndexSnap, attemptsSnap] = await Promise.all([
+      adminDb.collectionGroup("integrations").where("wabaId", "==", wabaId).get(),
+      adminDb.collection("whatsapp_phone_index").where("wabaId", "==", wabaId).get(),
+      adminDb.collectionGroup("whatsapp_connection_attempts").where("candidateConfig.wabaId", "==", wabaId).get(),
+    ]);
+
+    const anyActiveIntegration = integrationsSnap.docs.some((d) => d.data()?.status === "conectado");
+    if (anyActiveIntegration) return true;
+
+    const now = Date.now();
+    const anyValidPendingReservation = phoneIndexSnap.docs.some((d) => {
+      const data = d.data();
+      if (data.status !== "pending") return false;
+      const leaseExpiresAtMs = typeof data.leaseExpiresAt?.toMillis === "function" ? data.leaseExpiresAt.toMillis() : 0;
+      return now <= leaseExpiresAtMs;
+    });
+    if (anyValidPendingReservation) return true;
+
+    const anyProcessingAttempt = attemptsSnap.docs.some((d) => d.data()?.status === "processing");
+    if (anyProcessingAttempt) return true;
+
+    return false;
+  }
+
+  // Endpoint SÓ-TESTE, registrado condicionalmente — se
+  // WA_EMBEDDED_SIGNUP_USE_MOCK_CLIENTS não estiver setado no boot do
+  // processo, esta rota nunca é registrada no Express, então uma
+  // requisição real cai no 404 padrão. Simula, pro script de teste (que
+  // roda num processo separado do servidor), a ação do provisionador
+  // administrativo separado (whatsappSecretProvisioner.ts) acontecendo
+  // ANTES de qualquer exchange — nunca dentro do fluxo de exchange em si.
+  if (process.env.WA_EMBEDDED_SIGNUP_USE_MOCK_CLIENTS === "1") {
+    app.post("/api/whatsapp/embedded-signup/_test-only/provision-secret", async (req, res) => {
+      const { clinicId } = req.body || {};
+      if (!clinicId || typeof clinicId !== "string") return res.status(400).json({ error: "missing_clinicId" });
+      try {
+        const result = await getWhatsAppSecretProvisioner().provisionSecretForClinic(clinicId);
+        return res.json(result);
+      } catch (err: any) {
+        logSanitizedWaError({ scope: "WA_EMBEDDED_SIGNUP", errorCode: "WA_TEST_PROVISION_FAILED", phase: "TEST_PROVISION", ref: clinicId, err });
+        return res.status(500).json({ error: "provision_failed" });
+      }
+    });
+  }
+
+  app.post("/api/whatsapp/embedded-signup/start-attempt", async (req, res) => {
+    const auth = await authenticateOwnerOrAdmin(req);
+    if ("error" in auth) return res.status(auth.status).json({ error: auth.code });
+
+    try {
+      const attemptId = crypto.randomUUID();
+      const now = Date.now();
+      const expiresAt = new Date(now + WA_ATTEMPT_TTL_MS);
+
+      const integrationRef = adminDb.doc(`clinics/${auth.clinicId}/integrations/whatsapp`);
+      const integrationSnap = await integrationRef.get();
+      const baseIntegrationVersion = canonicalizeTimestamp(integrationSnap.exists ? integrationSnap.updateTime : null);
+
+      await attemptRefFor(auth.clinicId, attemptId).set({
+        attemptId,
+        clinicId: auth.clinicId,
+        userId: auth.uid,
+        createdAt: AdminFieldValue.serverTimestamp(),
+        expiresAt,
+        usedAt: null,
+        status: "pending",
+        errorCode: null,
+        errorClass: null,
+        errorPhase: null,
+        lastFailedAt: null,
+        baseIntegrationVersion,
+        candidateConfig: null,
+      });
+
+      return res.json({ attemptId, expiresAt: expiresAt.toISOString() });
+    } catch (err: any) {
+      logSanitizedWaError({ scope: "WA_EMBEDDED_SIGNUP", errorCode: "WA_START_ATTEMPT_FAILED", phase: "START_ATTEMPT", ref: auth.clinicId, err });
+      return res.status(500).json({ error: "start_attempt_failed" });
+    }
+  });
+
+  app.post("/api/whatsapp/embedded-signup/exchange", async (req, res) => {
+    const auth = await authenticateOwnerOrAdmin(req);
+    if ("error" in auth) return res.status(auth.status).json({ error: auth.code });
+    // Capturados em consts locais (não `auth.clinicId`/`auth.uid` direto)
+    // de propósito: o narrowing do TS da união `auth` acima não atravessa
+    // pra dentro de `failAttempt` (function declaration hoisted, definida
+    // mais abaixo) de forma confiável — usar uma const simples evita o
+    // falso-positivo de tipo sem depender de narrowing através de closure.
+    const clinicId = auth.clinicId;
+    const uid = auth.uid;
+
+    const { attemptId, code } = req.body || {};
+    if (!attemptId || typeof attemptId !== "string" || !code || typeof code !== "string") {
+      return res.status(400).json({ error: "missing_fields" });
+    }
+
+    const attemptRef = attemptRefFor(clinicId, attemptId);
+    const attemptRefLabel = `${clinicId}:${attemptId}`;
+
+    // Step 1 — claim the attempt: single-use, bound to whoever started it,
+    // pending->processing in ONE transaction (closes the replay/race
+    // window — see plano Seção 6). Any check failing here means NOTHING
+    // below ever runs; the active integration is never at risk.
+    type ClaimResult = { ok: true } | { ok: false; status: number; code: string };
+    let claim: ClaimResult;
+    try {
+      claim = await adminDb.runTransaction(async (tx): Promise<ClaimResult> => {
+        const snap = await tx.get(attemptRef);
+        if (!snap.exists) return { ok: false as const, status: 404, code: "attempt_not_found" };
+        const data = snap.data() as any;
+        if (data.userId !== uid) return { ok: false as const, status: 403, code: "attempt_not_owned" };
+        if (data.status === "expired" || (data.expiresAt?.toMillis?.() ?? 0) < Date.now()) {
+          if (data.status === "pending") tx.update(attemptRef, { status: "expired" });
+          return { ok: false as const, status: 410, code: "attempt_expired" };
+        }
+        if (data.status !== "pending" || data.usedAt !== null) {
+          return { ok: false as const, status: 409, code: "attempt_already_used" };
+        }
+        tx.update(attemptRef, { status: "processing", usedAt: AdminFieldValue.serverTimestamp() });
+        return { ok: true as const };
+      });
+    } catch (err: any) {
+      logSanitizedWaError({ scope: "WA_EMBEDDED_SIGNUP", errorCode: "WA_EXCHANGE_CLAIM_FAILED", phase: "CLAIM_ATTEMPT", ref: attemptRefLabel, err });
+      return res.status(500).json({ error: "claim_failed" });
+    }
+    if (claim.ok === false) return res.status(claim.status).json({ error: claim.code });
+
+    // From here on the attempt is "processing" and single-use — a second
+    // call (replay, or a genuinely concurrent request) already failed at
+    // the claim above with 409/410, never reaching any of this.
+    const graphClient = getWhatsAppGraphClient();
+    const secretClient = getSecretManagerClient();
+    let candidateConfig: any = null;
+
+    async function failAttempt(errorCode: string, phase: string, err?: any) {
+      logSanitizedWaError({ scope: "WA_EMBEDDED_SIGNUP", errorCode, phase, ref: attemptRefLabel, err });
+      try {
+        await attemptRef.update({
+          status: "failed",
+          errorCode, errorClass: classifyErrorClass(err), errorPhase: phase,
+          lastFailedAt: AdminFieldValue.serverTimestamp(),
+        });
+      } catch (markErr) {
+        logSanitizedWaError({ scope: "WA_EMBEDDED_SIGNUP", errorCode: "WA_MARK_ATTEMPT_FAILED_FAILED", phase, ref: attemptRefLabel, err: markErr });
+      }
+
+      // Item 2 — uma versão de secret já criada com sucesso, mas que nunca
+      // chega a ser promovida (porque estamos indo pro "failed" aqui),
+      // fica órfã — registrada pra limpeza administrativa, nunca reusada
+      // nem promovida por acidente (a transação terminal só promove o que
+      // está no candidateConfig de uma tentativa que ainda está
+      // "processing" — uma tentativa "failed" nunca chega lá).
+      if (candidateConfig?.accessTokenSecretName && candidateConfig?.accessTokenSecretVersionCandidate) {
+        await recordOrphanedSecretVersion(clinicId, attemptId, candidateConfig.accessTokenSecretName, candidateConfig.accessTokenSecretVersionCandidate, errorCode);
+      }
+
+      // Item 3 — libera a reserva do número, SE ainda tiver o MESMO
+      // reservationClaimId (fencing dentro da própria função — não só
+      // attemptId).
+      if (candidateConfig?.phoneNumberId) {
+        await releasePhoneIndexIfOwnedByClaim(candidateConfig.phoneNumberId, candidateConfig.reservationClaimId, clinicId, attemptId);
+      }
+
+      // Item 1/4 — checagem de fencing GLOBAL da WABA (rodada final:
+      // nunca mais chama DELETE automaticamente — ver
+      // recordPendingWabaCleanup acima). createdByThisAttempt=true é
+      // necessário mas não suficiente — só flag pra limpeza se, ALÉM
+      // disso, NENHUMA clínica (não só a desta tentativa) depende dela
+      // agora.
+      if (candidateConfig?.wabaSubscriptionCreatedByThisAttempt === true && candidateConfig?.wabaId) {
+        try {
+          const stillNeeded = await isWabaSubscriptionStillNeeded(candidateConfig.wabaId);
+          if (stillNeeded) {
+            logSanitizedWaError({ scope: "WA_EMBEDDED_SIGNUP", errorCode: "WA_ROLLBACK_SKIPPED_STILL_IN_USE", phase: "ROLLBACK", ref: attemptRefLabel });
+          } else {
+            await recordPendingWabaCleanup(clinicId, attemptId, candidateConfig.wabaId, errorCode);
+            logSanitizedWaError({ scope: "WA_EMBEDDED_SIGNUP", errorCode: "WA_ROLLBACK_FLAGGED_FOR_ADMIN_CLEANUP", phase: "ROLLBACK", ref: attemptRefLabel });
+          }
+        } catch (rollbackErr) {
+          logSanitizedWaError({ scope: "WA_EMBEDDED_SIGNUP", errorCode: "WA_ROLLBACK_CHECK_FAILED", phase: "ROLLBACK", ref: attemptRefLabel, err: rollbackErr });
+        }
+      }
+    }
+
+    try {
+      // Step 2 — exchange the code (mocked this phase). Own try/catch per
+      // external step from here on, each with its OWN errorPhase — a
+      // single catch-all would collapse "which step failed" into one
+      // generic phase, losing exactly the triage value the sanitized log
+      // schema (errorCode/errorClass/phase) is meant to preserve.
+      let tokenResult;
+      try {
+        tokenResult = await graphClient.exchangeCodeForToken(code);
+      } catch (err: any) {
+        await failAttempt("WA_TOKEN_EXCHANGE_FAILED", "TOKEN_EXCHANGE", err);
+        return res.status(500).json({ error: "exchange_failed" });
+      }
+      // Step 3 — discover phone/WABA (mocked). Never trust the frontend's
+      // FINISH-event phoneNumberId/wabaId — always re-derive server-side.
+      let discovery;
+      try {
+        discovery = await graphClient.discoverPhoneAndWaba(tokenResult.accessToken);
+      } catch (err: any) {
+        await failAttempt("WA_DISCOVERY_FAILED", "DISCOVERY", err);
+        return res.status(500).json({ error: "exchange_failed" });
+      }
+
+      // Step 4 — verify Coexistence (mocked). Anything short of
+      // "confirmed" stops here — never proceeds to touch a secret or the
+      // WABA subscription, never promotes anything.
+      let coexistence;
+      try {
+        coexistence = await graphClient.verifyCoexistence(tokenResult.accessToken, discovery.phoneNumberId);
+      } catch (err: any) {
+        await failAttempt("WA_COEXISTENCE_CHECK_FAILED", "COEXISTENCE_VERIFICATION", err);
+        return res.status(500).json({ error: "exchange_failed" });
+      }
+      if (coexistence.verification !== "confirmed") {
+        await failAttempt(`WA_COEXISTENCE_${coexistence.verification.toUpperCase()}`, "COEXISTENCE_VERIFICATION");
+        return res.status(422).json({ error: "coexistence_not_confirmed", verification: coexistence.verification });
+      }
+
+      // Step 4.5 (item 3) — reserve the global phone number index BEFORE
+      // touching the secret or the WABA subscription. Only after Coexistence
+      // is confirmed — never reserve a real number for a rejected/
+      // inconclusive attempt. Blocks a DIFFERENT clinic from reserving the
+      // same phoneNumberId; the same clinic reconnecting its own already-
+      // active number is allowed.
+      const phoneReserve = await reservePhoneIndex(clinicId, attemptId, discovery.phoneNumberId, discovery.wabaId);
+      if (phoneReserve.ok === false) {
+        await failAttempt(`WA_PHONE_RESERVE_${phoneReserve.reason.toUpperCase()}`, "PHONE_RESERVATION");
+        return res.status(409).json({ error: phoneReserve.reason });
+      }
+      const reservationClaimId = phoneReserve.reservationClaimId;
+
+      // Step 5 — new secret VERSION only (never creates the secret itself
+      // — see secretManager.ts, agora com paridade real: falha exatamente
+      // como o cliente real se o secret não foi provisionado antes por um
+      // caminho administrativo separado). Progressively recorded into
+      // candidateConfig, inside the attempt — accessTokenSecretVersion of
+      // the ACTIVE integration is untouched until the terminal transaction.
+      const secretName = `eliza-wa-token-${clinicId}`;
+      let versionResult;
+      try {
+        versionResult = await secretClient.addSecretVersion(secretName, tokenResult.accessToken);
+      } catch (err: any) {
+        // candidateConfig ainda é null aqui — mas a reserva do telefone já
+        // aconteceu (phoneReserve.ok), então failAttempt precisa saber
+        // disso pra liberar. Constrói um candidateConfig mínimo só com o
+        // phoneNumberId/reservationClaimId pra esse propósito.
+        candidateConfig = { phoneNumberId: discovery.phoneNumberId, reservationClaimId };
+        await failAttempt("WA_SECRET_VERSION_FAILED", "SECRET_VERSION", err);
+        return res.status(500).json({ error: "exchange_failed" });
+      }
+
+      candidateConfig = {
+        provider: "meta",
+        connectionMethod: "embedded_signup_coexistence",
+        phoneNumberId: discovery.phoneNumberId,
+        wabaId: discovery.wabaId,
+        reservationClaimId,
+        businessName: discovery.businessName,
+        displayPhoneNumber: discovery.displayPhoneNumber,
+        accessTokenSecretName: secretName,
+        accessTokenSecretVersionCandidate: versionResult.versionId,
+        tokenExpiresAt: new Date(Date.now() + tokenResult.expiresIn * 1000),
+        coexistenceVerification: coexistence.verification,
+        coexistenceEvidence: coexistence.evidence,
+        wabaSubscriptionConfirmedAt: null,
+        wabaSubscriptionCreatedByThisAttempt: null,
+      };
+      await attemptRef.update({ candidateConfig });
+
+      // Step 6 — WABA subscription sequence (mocked): CHECK first, only
+      // subscribe if not already subscribed, and record whether THIS
+      // attempt is the one that created it — the only thing that governs
+      // whether a later rollback may unsubscribe (plano amendment 4).
+      let createdByThisAttempt = false;
+      try {
+        const alreadySubscribed = await graphClient.getWabaSubscriptionStatus(discovery.wabaId, tokenResult.accessToken);
+        if (!alreadySubscribed) {
+          await graphClient.subscribeWaba(discovery.wabaId, tokenResult.accessToken);
+          createdByThisAttempt = true;
+        }
+      } catch (err: any) {
+        await failAttempt("WA_WABA_SUBSCRIPTION_FAILED", "WABA_SUBSCRIPTION", err);
+        return res.status(500).json({ error: "exchange_failed" });
+      }
+      candidateConfig.wabaSubscriptionCreatedByThisAttempt = createdByThisAttempt;
+
+      // Step 6.5 (item 5) — CONFIRM via a separate GET after the POST (or
+      // after determining it was already subscribed) — never trust the
+      // POST's 2xx alone. An inconclusive/failed confirmation blocks
+      // promotion exactly like a non-confirmed Coexistence check does.
+      let confirmed = false;
+      try {
+        confirmed = await graphClient.confirmWabaSubscription(discovery.wabaId, tokenResult.accessToken);
+      } catch (err: any) {
+        await failAttempt("WA_WABA_SUBSCRIPTION_CONFIRM_FAILED", "WABA_SUBSCRIPTION_CONFIRM", err);
+        return res.status(500).json({ error: "exchange_failed" });
+      }
+      if (!confirmed) {
+        await failAttempt("WA_WABA_SUBSCRIPTION_INCONCLUSIVE", "WABA_SUBSCRIPTION_CONFIRM");
+        return res.status(422).json({ error: "waba_subscription_not_confirmed" });
+      }
+      candidateConfig.wabaSubscriptionConfirmedAt = new Date();
+      await attemptRef.update({
+        "candidateConfig.wabaSubscriptionConfirmedAt": AdminFieldValue.serverTimestamp(),
+        "candidateConfig.wabaSubscriptionCreatedByThisAttempt": createdByThisAttempt,
+      });
+
+      // Test-only hook (mock-clients mode only): lets a test pause HERE,
+      // after the subscription decision is recorded but before the
+      // terminal transaction, to deterministically simulate a competing
+      // attempt finishing first — exercises optimistic concurrency AND
+      // the rollback path together. Inert whenever real clients are wired
+      // (WA_EMBEDDED_SIGNUP_USE_MOCK_CLIENTS!=='1').
+      if (process.env.WA_EMBEDDED_SIGNUP_USE_MOCK_CLIENTS === "1" && code.includes("TEST_SLOW_BEFORE_TERMINAL")) {
+        await new Promise((r) => setTimeout(r, 2500));
+      }
+
+      // Step 6.7 (item 3) — renova a lease da reserva do telefone
+      // imediatamente antes da transação terminal, fenced pelo mesmo
+      // reservationClaimId. Se a reserva já não pertence mais a este
+      // claim (perdida/reclamada por outra tentativa/clínica), aborta
+      // AQUI — não deixa a transação terminal nem tentar.
+      const leaseRenew = await renewPhoneIndexLease(discovery.phoneNumberId, reservationClaimId);
+      if (leaseRenew.ok === false) {
+        await failAttempt(`WA_PHONE_LEASE_${leaseRenew.reason.toUpperCase()}`, "PHONE_RESERVATION");
+        return res.status(409).json({ error: leaseRenew.reason });
+      }
+
+      // Step 7 — terminal transaction: optimistic concurrency + promote
+      // candidateConfig into the ACTIVE integration, all at once. This is
+      // the ONLY place in this whole flow that writes
+      // clinics/{clinicId}/integrations/whatsapp.
+      const integrationRef = adminDb.doc(`clinics/${clinicId}/integrations/whatsapp`);
+      const statusRef = adminDb.doc(`clinics/${clinicId}/integrations/whatsapp_status`);
+      const phoneIndexRef = adminDb.doc(`whatsapp_phone_index/${discovery.phoneNumberId}`);
+      type TerminalResult = { ok: true } | { ok: false; reason: string };
+      const terminal = await adminDb.runTransaction(async (tx): Promise<TerminalResult> => {
+        // Todas as leituras antes de qualquer escrita (regra do Firestore).
+        const attemptSnap = await tx.get(attemptRef);
+        const attemptData = attemptSnap.data() as any;
+        if (!attemptSnap.exists || attemptData.status !== "processing") {
+          return { ok: false as const, reason: "attempt_not_processing" };
+        }
+        const integrationSnap = await tx.get(integrationRef);
+        const currentVersion = canonicalizeTimestamp(integrationSnap.exists ? integrationSnap.updateTime : null);
+        if (!timestampsEqual(currentVersion, attemptData.baseIntegrationVersion ?? null)) {
+          return { ok: false as const, reason: "stale_base_version" };
+        }
+        // Item 3 — fencing da reserva do número: promove pra 'active'
+        // SOMENTE se a reserva ainda tiver o MESMO reservationClaimId E a
+        // lease ainda não tiver expirado (renovada um passo atrás, mas
+        // revalidada aqui de novo — defesa em profundidade, mesma
+        // disciplina do resto deste fluxo).
+        const phoneIndexSnap = await tx.get(phoneIndexRef);
+        const phoneIndexData = phoneIndexSnap.data() as any;
+        const phoneLeaseExpiresAtMs = typeof phoneIndexData?.leaseExpiresAt?.toMillis === "function" ? phoneIndexData.leaseExpiresAt.toMillis() : 0;
+        if (
+          !phoneIndexSnap.exists ||
+          phoneIndexData.status !== "pending" ||
+          phoneIndexData.reservationClaimId !== reservationClaimId ||
+          Date.now() > phoneLeaseExpiresAtMs
+        ) {
+          return { ok: false as const, reason: "phone_reservation_lost" };
+        }
+        const cc = attemptData.candidateConfig;
+        tx.set(integrationRef, {
+          status: "conectado",
+          provider: cc.provider,
+          connectionMethod: cc.connectionMethod,
+          phoneNumberId: cc.phoneNumberId,
+          wabaId: cc.wabaId,
+          businessName: cc.businessName,
+          displayPhoneNumber: cc.displayPhoneNumber,
+          accessTokenSecretName: cc.accessTokenSecretName,
+          accessTokenSecretVersion: cc.accessTokenSecretVersionCandidate,
+          tokenExpiresAt: cc.tokenExpiresAt,
+          coexistenceVerification: cc.coexistenceVerification,
+          coexistenceEvidence: cc.coexistenceEvidence,
+          wabaSubscriptionConfirmedAt: cc.wabaSubscriptionConfirmedAt,
+          updatedAt: AdminFieldValue.serverTimestamp(),
+        }, { merge: true });
+        tx.set(statusRef, {
+          status: "conectado",
+          provider: cc.provider,
+          displayPhoneNumber: cc.displayPhoneNumber,
+          updatedAt: AdminFieldValue.serverTimestamp(),
+        }, { merge: true });
+        tx.update(phoneIndexRef, {
+          status: "active",
+          activatedAt: AdminFieldValue.serverTimestamp(),
+        });
+        tx.update(attemptRef, { status: "completed" });
+        return { ok: true as const };
+      });
+
+      if (terminal.ok === false) {
+        await failAttempt(`WA_TERMINAL_${terminal.reason.toUpperCase()}`, "TERMINAL_TRANSACTION");
+        return res.status(409).json({ error: terminal.reason });
+      }
+
+      // Rodada final — nunca devolve phoneNumberId/wabaId ao client, mesmo
+      // autenticado como owner/admin: são detalhes internos da Meta, não
+      // dado sanitizado (mesmo padrão de exclusão do doc
+      // integrations/whatsapp_status, ver Seção 5 do plano).
+      // displayPhoneNumber já é semi-público (aparece pro paciente).
+      return res.json({ status: "connected", displayPhoneNumber: candidateConfig.displayPhoneNumber });
+    } catch (err: any) {
+      await failAttempt("WA_EXCHANGE_UNEXPECTED_ERROR", "EXCHANGE_PROCESSING", err);
+      return res.status(500).json({ error: "exchange_failed" });
+    }
   });
 
   // GET Health endpoint — real signals for the Super Admin panel: process
@@ -2154,67 +4645,250 @@ Versão polida por ELIZA:`,
     }
   });
 
-  // POST Outbound Secure Sending API
-  app.post("/api/whatsapp/send", async (req, res) => {
-    const { clinicId, conversationId, text, sentByUserId, sentByName, source } = req.body;
+  // ---- Manual configuration (rodada final de fechamento) ----
+  // Único substituto autorizado dos setDoc/deleteDoc diretos que existiam
+  // em NextAdmin.tsx e WhatsAppSettings.tsx — mesma regra de
+  // firestore.rules (`clinics/{id}/integrations/whatsapp`:
+  // allow write: if false) que já bloqueava essas escritas na prática,
+  // agora com um caminho real pra configuração manual continuar
+  // funcionando: só Admin SDK, só owner/admin (authenticateOwnerOrAdmin,
+  // mesmo helper do Embedded Signup).
+  //
+  // Hardening (rodada de correção pré-teste-real): o token Meta digitado
+  // manualmente aqui agora sobe como nova versão do secret
+  // `eliza-wa-token-{clinicId}` (mesmo padrão de nome/versionamento
+  // explícito do Embedded Signup, Seção 8 do plano) — o Firestore só
+  // guarda `accessTokenSecretName`/`accessTokenSecretVersion` (referência
+  // + número da versão, nunca "latest", nunca o valor). Limitação
+  // conhecida, ainda deliberadamente FORA do escopo: credenciais Twilio
+  // (`twilioAuthToken`) continuam gravadas em texto puro — mesmo backlog
+  // já registrado antes, não migrado nesta rodada (a ELIZA só opera com
+  // WhatsApp via Meta hoje).
+  function sanitizeManualConfigInput(body: any) {
+    const str = (v: any) => (typeof v === "string" ? v.trim() : "");
+    return {
+      provider: body?.provider === "twilio" ? "twilio" as const : "meta" as const,
+      phoneNumberId: str(body?.phoneNumberId),
+      wabaId: str(body?.wabaId),
+      businessName: str(body?.businessName),
+      displayPhoneNumber: str(body?.displayPhoneNumber),
+      accessToken: str(body?.accessToken),
+      twilioAccountSid: str(body?.twilioAccountSid),
+      twilioAuthToken: str(body?.twilioAuthToken),
+      twilioWhatsAppNumber: str(body?.twilioWhatsAppNumber) || "+14155238886",
+      aiEnabled: body?.aiEnabled !== false,
+      humanApprovalRequired: body?.humanApprovalRequired !== false,
+      apiNumber: str(body?.apiNumber),
+      legacyClinicNumber: str(body?.legacyClinicNumber),
+      defaultSendMode: body?.defaultSendMode === "open_whatsapp" ? "open_whatsapp" as const : "eliza_api" as const,
+      allowOpenExternalWhatsApp: body?.allowOpenExternalWhatsApp !== false,
+    };
+  }
 
-    if (!clinicId || !conversationId || !text) {
-      return res.status(400).json({ error: "Parâmetros clinicId, conversationId e text são requeridos." });
-    }
-
+  app.get("/api/whatsapp/manual-config", async (req, res) => {
+    const auth = await authenticateOwnerOrAdmin(req);
+    if ("error" in auth) return res.status(auth.status).json({ error: auth.code });
     try {
-      const integrationPath = `clinics/${clinicId}/integrations/whatsapp`;
-      console.log("[WA_FIRESTORE_OP]", { 
-        operation: "READ", 
-        path: integrationPath, 
-        clinicId, 
-        conversationId 
+      const [integrationSnap, configSnap] = await Promise.all([
+        adminDb.doc(`clinics/${auth.clinicId}/integrations/whatsapp`).get(),
+        adminDb.doc(`clinics/${auth.clinicId}/whatsapp_settings/config`).get(),
+      ]);
+      const integration: any = integrationSnap.exists ? integrationSnap.data() : null;
+      const config: any = configSnap.exists ? configSnap.data() : null;
+      // hasAccessToken/hasTwilioAuthToken: só presença, nunca o valor —
+      // é o que o form usa pra decidir se mostra a máscara "••••".
+      return res.json({
+        status: integration?.status || "não conectado",
+        provider: integration?.provider === "twilio" ? "twilio" : "meta",
+        phoneNumberId: integration?.phoneNumberId || "",
+        wabaId: integration?.wabaId || "",
+        businessName: integration?.businessName || "",
+        displayPhoneNumber: integration?.displayPhoneNumber || "",
+        hasAccessToken: !!integration?.accessTokenSecretName,
+        twilioAccountSid: integration?.twilioAccountSid || "",
+        hasTwilioAuthToken: !!integration?.twilioAuthToken,
+        twilioWhatsAppNumber: integration?.twilioWhatsAppNumber || "+14155238886",
+        aiEnabled: integration?.aiEnabled !== false,
+        humanApprovalRequired: integration?.humanApprovalRequired !== false,
+        apiNumber: config?.apiNumber || "",
+        legacyClinicNumber: config?.legacyClinicNumber || "",
+        defaultSendMode: config?.defaultSendMode || "eliza_api",
+        allowOpenExternalWhatsApp: config?.allowOpenExternalWhatsApp !== false,
       });
-      const integrationRef = adminDb.doc(integrationPath);
-      let integrationSnap;
-      let integrationData: any = {};
-      let integrationSnapExists = false;
+    } catch (err: any) {
+      logSanitizedWaError({ scope: "WA_MANUAL_CONFIG", errorCode: "WA_MANUAL_CONFIG_READ_FAILED", phase: "READ", ref: auth.clinicId, err });
+      return res.status(500).json({ error: "manual_config_read_failed" });
+    }
+  });
 
-      try {
-        integrationSnap = await integrationRef.get();
-        integrationData = integrationSnap.data() || {};
-        integrationSnapExists = integrationSnap.exists;
-      } catch (snapErr: any) {
-        console.error(`[WA_SEND_ERROR] Firestore error fetching integration for clinic ${clinicId}:`, snapErr);
-        throw snapErr;
+  app.post("/api/whatsapp/manual-config", async (req, res) => {
+    const auth = await authenticateOwnerOrAdmin(req);
+    if ("error" in auth) return res.status(auth.status).json({ error: auth.code });
+    try {
+      const input = sanitizeManualConfigInput(req.body);
+      const integrationRef = adminDb.doc(`clinics/${auth.clinicId}/integrations/whatsapp`);
+      const existingSnap = await integrationRef.get();
+      const existingData: any = existingSnap.exists ? existingSnap.data() : {};
+
+      // Twilio: fora de escopo desta rodada (backlog explícito já
+      // registrado no plano original, Seção 15) — token mascarado
+      // ("••••") continua significando "não alterar", preserva o valor
+      // já salvo.
+      const twilioAuthToken = input.twilioAuthToken.includes("••••") ? (existingData.twilioAuthToken || "") : input.twilioAuthToken;
+
+      // Meta: hardening desta rodada — accessToken NUNCA é gravado bruto
+      // no Firestore. Só a REFERÊNCIA do secret (nome fixo por clínica,
+      // mesmo padrão já usado pelo /exchange — server.ts, secretName =
+      // `eliza-wa-token-${clinicId}`) + o número EXPLÍCITO da versão nova
+      // (nunca "latest", plano Seção 8) são persistidos. "••••" continua
+      // significando "não alterar" — preserva nome+versão já salvos, sem
+      // tocar o Secret Manager. String vazia limpa a referência (Twilio
+      // já tinha essa semântica; agora replicada aqui). Qualquer outra
+      // string é o token de verdade — sobe como nova versão ANTES de
+      // qualquer escrita no Firestore; se o Secret Manager falhar (ex.:
+      // secret ainda não provisionado), a requisição inteira falha — a
+      // integração nunca fica num estado "conectado" apontando pra uma
+      // versão que não existe.
+      let accessTokenSecretName = existingData.accessTokenSecretName || "";
+      let accessTokenSecretVersion: string | null = existingData.accessTokenSecretVersion ?? null;
+      if (input.provider === "meta") {
+        if (input.accessToken.includes("••••")) {
+          // não alterar — mantém nome+versão já salvos.
+        } else if (input.accessToken === "") {
+          accessTokenSecretName = "";
+          accessTokenSecretVersion = null;
+        } else {
+          const secretName = `eliza-wa-token-${auth.clinicId}`;
+          let versionResult;
+          try {
+            versionResult = await getSecretManagerClient().addSecretVersion(secretName, input.accessToken);
+          } catch (err: any) {
+            logSanitizedWaError({ scope: "WA_MANUAL_CONFIG", errorCode: "WA_MANUAL_CONFIG_SECRET_VERSION_FAILED", phase: "SECRET_VERSION", ref: auth.clinicId, err });
+            return res.status(500).json({ error: "secret_version_failed" });
+          }
+          accessTokenSecretName = secretName;
+          accessTokenSecretVersion = versionResult.versionId;
+        }
       }
 
-      if (!integrationSnapExists) {
-        return res.status(400).json({ error: "A integração com WhatsApp não está configurada para esta clínica." });
+      const isConnected = input.provider === "twilio"
+        ? !!(input.twilioAccountSid && twilioAuthToken && input.twilioWhatsAppNumber)
+        : !!(input.phoneNumberId && input.wabaId && accessTokenSecretName && accessTokenSecretVersion);
+
+      const payload: any = {
+        status: isConnected ? "conectado" : "não conectado",
+        provider: input.provider,
+        connectionMethod: "manual",
+        phoneNumberId: input.phoneNumberId,
+        wabaId: input.wabaId,
+        businessName: input.businessName,
+        displayPhoneNumber: input.displayPhoneNumber,
+        accessTokenSecretName,
+        accessTokenSecretVersion,
+        twilioAccountSid: input.twilioAccountSid,
+        twilioAuthToken,
+        twilioWhatsAppNumber: input.twilioWhatsAppNumber,
+        aiEnabled: input.aiEnabled,
+        humanApprovalRequired: input.humanApprovalRequired,
+        updatedAt: AdminFieldValue.serverTimestamp(),
+      };
+      if (!existingData.createdAt) payload.createdAt = AdminFieldValue.serverTimestamp();
+
+      await integrationRef.set(payload, { merge: true });
+
+      await adminDb.doc(`clinics/${auth.clinicId}/integrations/whatsapp_status`).set({
+        status: payload.status,
+        provider: payload.provider,
+        displayPhoneNumber: payload.displayPhoneNumber,
+        updatedAt: AdminFieldValue.serverTimestamp(),
+      }, { merge: true });
+
+      await adminDb.doc(`clinics/${auth.clinicId}/whatsapp_settings/config`).set({
+        apiNumber: input.apiNumber,
+        legacyClinicNumber: input.legacyClinicNumber,
+        defaultSendMode: input.defaultSendMode,
+        allowOpenExternalWhatsApp: input.allowOpenExternalWhatsApp,
+        updatedAt: AdminFieldValue.serverTimestamp(),
+      }, { merge: true });
+
+      await adminDb.collection(`clinics/${auth.clinicId}/integration_logs`).add({
+        type: "whatsapp", action: "save_config", status: "success",
+        message: "Configurações de integração atualizadas e salvas pela equipe.",
+        createdAt: AdminFieldValue.serverTimestamp(),
+      });
+
+      return res.json({ ok: true, status: payload.status });
+    } catch (err: any) {
+      logSanitizedWaError({ scope: "WA_MANUAL_CONFIG", errorCode: "WA_MANUAL_CONFIG_SAVE_FAILED", phase: "SAVE", ref: auth.clinicId, err });
+      return res.status(500).json({ error: "manual_config_save_failed" });
+    }
+  });
+
+  app.post("/api/whatsapp/manual-disconnect", async (req, res) => {
+    const auth = await authenticateOwnerOrAdmin(req);
+    if ("error" in auth) return res.status(auth.status).json({ error: auth.code });
+    try {
+      await adminDb.doc(`clinics/${auth.clinicId}/integrations/whatsapp`).delete();
+      await adminDb.doc(`clinics/${auth.clinicId}/integrations/whatsapp_status`).set({
+        status: "não conectado", provider: null, displayPhoneNumber: null,
+        updatedAt: AdminFieldValue.serverTimestamp(),
+      }, { merge: true });
+      await adminDb.collection(`clinics/${auth.clinicId}/integration_logs`).add({
+        type: "whatsapp", action: "disconnect", status: "success",
+        message: "A integração com WhatsApp foi desativada e desconectada manualmente.",
+        createdAt: AdminFieldValue.serverTimestamp(),
+      });
+      return res.json({ ok: true });
+    } catch (err: any) {
+      logSanitizedWaError({ scope: "WA_MANUAL_CONFIG", errorCode: "WA_MANUAL_DISCONNECT_FAILED", phase: "DISCONNECT", ref: auth.clinicId, err });
+      return res.status(500).json({ error: "manual_disconnect_failed" });
+    }
+  });
+
+  // Shared outbound dispatch — used by the manual "/api/whatsapp/send" route
+  // below AND by the AI auto-reply path (whatsappWebhookPostHandler), so both
+  // write the exact same message/conversation/log shape. `sentBy`/`aiGenerated`
+  // let the caller mark AI-authored replies distinctly from staff-typed ones.
+  async function dispatchAndRecordOutboundWhatsAppMessage({
+    clinicId, conversationId, text, sentByUserId, sentByName, source, sentBy, aiGenerated,
+  }: {
+    clinicId: string; conversationId: string; text: string;
+    sentByUserId?: string | null; sentByName?: string | null; source?: string;
+    sentBy?: "human" | "ai"; aiGenerated?: boolean;
+  }): Promise<{ success: boolean; error?: string; errorCode?: any; metaResponse?: any; metaStatus?: any; waId?: any; messageId?: string }> {
+    try {
+      const integrationPath = `clinics/${clinicId}/integrations/whatsapp`;
+      logSanitizedWaInfo({ scope: "WA_OUTBOUND", event: "integration_read", clinicId, ref: conversationId });
+      const integrationRef = adminDb.doc(integrationPath);
+      const integrationSnap = await integrationRef.get();
+      const integrationData: any = integrationSnap.data() || {};
+
+      if (!integrationSnap.exists) {
+        return { success: false, error: "A integração com WhatsApp não está configurada para esta clínica." };
       }
 
       const provider = integrationData.provider === "twilio" ? "twilio" : "meta";
       const displayPhoneNumber = integrationData.displayPhoneNumber || integrationData.twilioWhatsAppNumber || "Clínica";
-      console.log("[WA_AUDIT]", `Sending via provider: ${provider}, intended recipient: ${conversationId}`);
+      logSanitizedWaInfo({ scope: "WA_OUTBOUND", event: "send_requested", clinicId, ref: conversationId, extra: { provider } });
 
       const dispatchResult = await sendWhatsAppMessage(integrationData, conversationId, text);
 
       let whatsappMessageId = dispatchResult.providerMessageId || "msg_failed_" + Date.now();
-      let metaResponse: any = dispatchResult.raw || null;
+      let metaResponse: any = null; // corpo cru da Graph nunca chega aqui — ver sendViaMeta/whatsappGraphClient.ts.
       let errorCode: any = dispatchResult.success ? null : (dispatchResult.errorCode || "unknown_error");
       let errorMessage: any = dispatchResult.success ? null : (dispatchResult.errorMessage || "Erro desconhecido na chamada do provedor.");
       let metaStatus: any = null;
       let waId: any = (dispatchResult as any).waId || null;
 
-      console.log(`[WA_AUDIT] Dispatch ${dispatchResult.success ? "successful" : "failed"}. provider=${provider} id=${whatsappMessageId} error=${errorMessage || "none"}`);
+      logSanitizedWaInfo({ scope: "WA_OUTBOUND", event: dispatchResult.success ? "send_dispatch_succeeded" : "send_dispatch_failed", clinicId, ref: conversationId, extra: { provider, errorCode: errorCode ? String(errorCode) : null } });
 
       const isSuccess = !errorCode;
       const messageId = "msg_" + Date.now().toString() + Math.random().toString(36).substring(2, 5);
       const msgPath = `clinics/${clinicId}/whatsapp_conversations/${conversationId}/messages/${messageId}`;
-      
-      console.log("[WA_FIRESTORE_OP]", { 
-        operation: "WRITE", 
-        path: msgPath, 
-        clinicId, 
-        conversationId 
-      });
+
+      logSanitizedWaInfo({ scope: "WA_OUTBOUND", event: "message_doc_write", clinicId, ref: conversationId });
       const msgRef = adminDb.doc(msgPath);
-      
+
       try {
         await msgRef.set({
           direction: "outbound",
@@ -2224,8 +4898,8 @@ Versão polida por ELIZA:`,
           to: conversationId,
           whatsappMessageId: isSuccess ? whatsappMessageId : "msg_failed_" + Date.now(),
           status: isSuccess ? "sent" : "failed",
-          aiGenerated: false,
-          sentBy: "human",
+          aiGenerated: !!aiGenerated,
+          sentBy: sentBy || "human",
           sentByUserId: sentByUserId || null,
           sentByName: sentByName || null,
           source: source || "manual",
@@ -2235,85 +4909,58 @@ Versão polida por ELIZA:`,
           metaStatus: metaStatus || null,
           waId: waId || null
         });
-        console.log(`[WHATSAPP SAVE OUTBOUND] path=${msgRef.path} status=${isSuccess ? 'success' : 'failed'}`);
+        logSanitizedWaInfo({ scope: "WA_OUTBOUND", event: "message_doc_saved", clinicId, ref: conversationId, extra: { success: isSuccess } });
       } catch (dbErr: any) {
-        console.error("[WA_SEND_ERROR] Failed saving outbound message in Firestore (ignoring so sending completes):", dbErr);
+        logSanitizedWaError({ scope: "WA_OUTBOUND", errorCode: "WA_SEND_MESSAGE_DOC_SAVE_FAILED", phase: "MESSAGE_DOC_SAVE", ref: conversationId, err: dbErr });
       }
 
       const convoPath = `clinics/${clinicId}/whatsapp_conversations/${conversationId}`;
-      console.log("[WA_FIRESTORE_OP]", { 
-        operation: "UPDATE", 
-        path: convoPath, 
-        clinicId, 
-        conversationId 
-      });
+      logSanitizedWaInfo({ scope: "WA_OUTBOUND", event: "conversation_doc_update", clinicId, ref: conversationId });
       const convoRef = adminDb.doc(convoPath);
       try {
         await convoRef.set({
           lastMessage: text,
           lastMessageAt: AdminFieldValue.serverTimestamp(),
           lastOutboundAt: AdminFieldValue.serverTimestamp(),
-          unreadCount: 0, 
+          unreadCount: 0,
           status: isSuccess ? "finalizado" : "pendente"
         }, { merge: true });
       } catch (dbErr: any) {
-        console.error("[WA_SEND_ERROR] Failed updating conversation in Firestore (ignoring so sending completes):", dbErr);
+        logSanitizedWaError({ scope: "WA_OUTBOUND", errorCode: "WA_SEND_CONVERSATION_DOC_UPDATE_FAILED", phase: "CONVERSATION_DOC_UPDATE", ref: conversationId, err: dbErr });
       }
 
       try {
         const logsPath = `clinics/${clinicId}/integration_logs`;
-        console.log("[WA_FIRESTORE_OP]", { 
-          operation: "WRITE", 
-          path: logsPath, 
-          clinicId, 
-          conversationId 
-        });
+        logSanitizedWaInfo({ scope: "WA_OUTBOUND", event: "integration_log_write", clinicId, ref: conversationId });
         const logsColl = adminDb.collection(logsPath);
         await logsColl.add({
           type: "whatsapp",
           action: "message_sent",
           status: isSuccess ? "success" : "error",
           recipient: conversationId,
-          message: isSuccess 
-            ? `Mensagem enviada com sucesso para ${conversationId}: "${text.substring(0, 45)}..."`
-            : `Falha no envio de mensagem para ${conversationId}: ${errorMessage}`,
+          message: isSuccess
+            ? `Mensagem${aiGenerated ? " (IA)" : ""} enviada com sucesso para ${conversationId}: "${text.substring(0, 45)}..."`
+            : `Falha no envio de mensagem${aiGenerated ? " (IA)" : ""} para ${conversationId}: ${errorMessage}`,
           errorCode: errorCode || null,
           errorMessage: errorMessage || null,
           metaResponse: metaResponse || null,
           createdAt: AdminFieldValue.serverTimestamp()
         });
       } catch (logErr) {
-        console.warn("[WA_SEND_LOGGER] Failed saving status to integration_logs (ignoring):", logErr);
+        logSanitizedWaError({ scope: "WA_OUTBOUND", errorCode: "WA_SEND_INTEGRATION_LOG_FAILED", phase: "INTEGRATION_LOG", ref: conversationId, err: logErr });
       }
 
       if (!isSuccess) {
-        return res.status(400).json({ 
-          error: errorMessage, 
-          errorCode, 
-          metaResponse, 
-          metaStatus,
-          success: false 
-        });
+        return { success: false, error: errorMessage, errorCode, metaResponse, metaStatus, messageId: whatsappMessageId };
       }
 
-      return res.json({ 
-        success: true, 
-        messageId: whatsappMessageId, 
-        metaResponse, 
-        metaStatus, 
-        waId 
-      });
+      return { success: true, messageId: whatsappMessageId, metaResponse, metaStatus, waId };
     } catch (error: any) {
-      console.error("[WA_SEND_ERROR] Sending error:", error);
-      
+      logSanitizedWaError({ scope: "WA_OUTBOUND", errorCode: "WA_SEND_ENDPOINT_THREW", phase: "OUTER_HANDLER", ref: conversationId, err: error });
+
       try {
         const logsPath = `clinics/${clinicId}/integration_logs`;
-        console.log("[WA_FIRESTORE_OP]", { 
-          operation: "WRITE", 
-          path: logsPath, 
-          clinicId, 
-          conversationId 
-        });
+        logSanitizedWaInfo({ scope: "WA_OUTBOUND", event: "integration_log_write_after_error", clinicId, ref: conversationId });
         const logsColl = adminDb.collection(logsPath);
         await logsColl.add({
           type: "whatsapp",
@@ -2323,11 +4970,32 @@ Versão polida por ELIZA:`,
           createdAt: AdminFieldValue.serverTimestamp()
         });
       } catch (logErr) {
-        console.error("[WA_SEND_ERROR] Logging error failed:", logErr);
+        logSanitizedWaError({ scope: "WA_OUTBOUND", errorCode: "WA_SEND_INTEGRATION_LOG_AFTER_ERROR_FAILED", phase: "INTEGRATION_LOG", ref: conversationId, err: logErr });
       }
 
-      return res.status(500).json({ error: error.message || "Erro interno ao processar envio de mensagem." });
+      return { success: false, error: error.message || "Erro interno ao processar envio de mensagem." };
     }
+  }
+
+  // POST Outbound Secure Sending API
+  app.post("/api/whatsapp/send", async (req, res) => {
+    const { clinicId, conversationId, text, sentByUserId, sentByName, source } = req.body;
+
+    if (!clinicId || !conversationId || !text) {
+      return res.status(400).json({ error: "Parâmetros clinicId, conversationId e text são requeridos." });
+    }
+
+    const result = await dispatchAndRecordOutboundWhatsAppMessage({
+      clinicId, conversationId, text, sentByUserId, sentByName, source, sentBy: "human", aiGenerated: false,
+    });
+
+    if (!result.success) {
+      return res.status(result.error === "A integração com WhatsApp não está configurada para esta clínica." ? 400 : (result.errorCode ? 400 : 500)).json({
+        error: result.error, errorCode: result.errorCode, metaResponse: result.metaResponse, metaStatus: result.metaStatus, success: false,
+      });
+    }
+
+    return res.json({ success: true, messageId: result.messageId, metaResponse: result.metaResponse, metaStatus: result.metaStatus, waId: result.waId });
   });
 
   app.post("/api/whatsapp/send-summary", async (req, res) => {
@@ -2796,6 +5464,73 @@ Versão polida por ELIZA:`,
     }
   });
 
+  // POST /api/internal/scheduler/run-appointment-delay-check
+  // Acompanhamento de atraso da Agenda (sem WhatsApp por enquanto — só
+  // Central de Tarefas/pending_items, como pedido explicitamente pelo
+  // usuário enquanto a Meta ainda bloqueia o WhatsApp). Pra cada clínica,
+  // agendamentos de hoje cujo horário já passou (10-70min de janela — não
+  // fica gerando pra sempre um atraso muito antigo) e o status nunca saiu
+  // de pendente/confirmado ganham UM pending_item pedindo confirmação —
+  // ID determinístico (`agenda_delay_{appointmentId}`) garante que rodar
+  // este job de novo nunca duplica a mesma pendência.
+  // Não wireado a nenhum cron ainda — precisa de um Cloud Scheduler job real
+  // (API nem habilitada neste projeto GCP ainda), decisão separada do usuário.
+  app.post("/api/internal/scheduler/run-appointment-delay-check", verifySchedulerAuth, async (req, res) => {
+    console.log("[SCHEDULER] Running appointment delay check...");
+    try {
+      const sampa = getSampaDate();
+      const todayStr = sampa.toISOString().split("T")[0];
+      const nowMinutes = sampa.getHours() * 60 + sampa.getMinutes();
+      const DELAY_MIN_THRESHOLD = 10;
+      const DELAY_MAX_WINDOW = 70;
+      const UNSTARTED_STATUSES = new Set(["pendente", "confirmado"]);
+
+      const clinicsSnap = await adminDb.collection("clinics").get();
+      let created = 0;
+
+      for (const clinicDoc of clinicsSnap.docs) {
+        const clinicId = clinicDoc.id;
+        const apptsSnap = await adminDb.collection(`clinics/${clinicId}/appointments`)
+          .where("date", "==", todayStr)
+          .get();
+
+        for (const apptDoc of apptsSnap.docs) {
+          const appt: any = apptDoc.data();
+          const status = String(appt.status || "pendente").toLowerCase();
+          if (!UNSTARTED_STATUSES.has(status)) continue;
+
+          const [h, m] = String(appt.time || "00:00").split(":").map((n: string) => parseInt(n, 10) || 0);
+          const apptMinutes = h * 60 + m;
+          const delayMinutes = nowMinutes - apptMinutes;
+          if (delayMinutes < DELAY_MIN_THRESHOLD || delayMinutes > DELAY_MAX_WINDOW) continue;
+
+          const dedupeRef = adminDb.doc(`clinics/${clinicId}/pending_items/agenda_delay_${apptDoc.id}`);
+          const existing = await dedupeRef.get();
+          if (existing.exists) continue;
+
+          await dedupeRef.set({
+            type: "agenda_delay_check",
+            title: `Paciente ${appt.patientName || "sem nome"} está em atendimento?`,
+            description: `Agendamento de ${appt.treatment || "atendimento"} marcado para ${appt.time} ainda consta como "${status}" ${delayMinutes} minuto(s) depois do horário. Confirme se o paciente está em atendimento ou se houve atraso/falta.`,
+            patientId: appt.patientId || null,
+            patientName: appt.patientName || null,
+            appointmentId: apptDoc.id,
+            dueDate: todayStr,
+            priority: "Média",
+            status: "pending",
+            source: "ELIZA — Acompanhamento de atraso",
+            createdAt: AdminFieldValue.serverTimestamp(),
+          });
+          created++;
+        }
+      }
+      return res.json({ success: true, message: `Checagem de atraso concluída. Pendências criadas: ${created}` });
+    } catch (err: any) {
+      console.error("[SCHEDULER_DELAY_CHECK_ERROR] Failed:", err);
+      return res.status(500).json({ error: err.message || "Erro na checagem de atraso da Agenda." });
+    }
+  });
+
   // Helper to convert any date representation to YYYY-MM-DD in America/Sao_Paulo timezone
   const toSampaDateStr = (val: any): string => {
     if (!val) return "";
@@ -3256,6 +5991,62 @@ Versão polida por ELIZA:`,
   });
 
   // ============================================================================
+  // SIMPLES DENTAL BRIDGE INTEGRATION (escrita real, ADR 0003)
+  // ============================================================================
+  // Credencial PRÓPRIA (BRIDGE_SYNC_TOKEN, nunca BRIDGE_INTEGRATION_TOKEN) +
+  // BRIDGE_SYNC_WRITES_ENABLED=true precisam estar setados — ver
+  // src/lib/bridgeSyncAuth.ts. Nunca escreve campo de identidade do
+  // paciente, só agendamento/financeiro referenciando um patientId já
+  // existente.
+  const bridgeSyncAuth = createBridgeSyncAuthMiddleware();
+
+  app.post("/api/bridge/sync/appointments", bridgeSyncAuth, async (req: any, res) => {
+    try {
+      const clinicId: string = req.bridgeSyncClinicId;
+      const { bridgeSourceId, patientId, scheduledDate, scheduledTime, estimatedMinutes, professionalName, chairName } = req.body || {};
+      if (!bridgeSourceId || !patientId || !scheduledDate || !scheduledTime) {
+        return res.status(400).json({ error: "MALFORMED_PAYLOAD", message: "bridgeSourceId, patientId, scheduledDate e scheduledTime são obrigatórios." });
+      }
+      const result = await upsertAppointmentFromBridge(adminDb as any, AdminFieldValue, clinicId, {
+        bridgeSourceId: String(bridgeSourceId), patientId: String(patientId), scheduledDate: String(scheduledDate),
+        scheduledTime: String(scheduledTime), estimatedMinutes: Number(estimatedMinutes) || 30,
+        professionalName: String(professionalName || ""), chairName: chairName ? String(chairName) : null,
+      });
+      console.log(`[BRIDGE_SYNC_APPOINTMENT] clinicId=${clinicId} action=${result.action} docId=${result.docId}`);
+      return res.json(result);
+    } catch (err: any) {
+      if (err instanceof BridgePatientNotFoundError) {
+        return res.status(404).json({ error: "PATIENT_NOT_FOUND", message: err.message });
+      }
+      console.error("[BRIDGE_SYNC_APPOINTMENT_ERROR]", err instanceof Error ? err.message : err);
+      return res.status(500).json({ error: "Erro interno ao sincronizar agendamento." });
+    }
+  });
+
+  app.post("/api/bridge/sync/financial-entries", bridgeSyncAuth, async (req: any, res) => {
+    try {
+      const clinicId: string = req.bridgeSyncClinicId;
+      const { bridgeIdempotencyKey, patientId, tipo, categoria, valor, situacao, dataPagamento, valorPago } = req.body || {};
+      if (!bridgeIdempotencyKey || !patientId || !tipo || typeof valor !== "number" || !situacao) {
+        return res.status(400).json({ error: "MALFORMED_PAYLOAD", message: "bridgeIdempotencyKey, patientId, tipo, valor e situacao são obrigatórios." });
+      }
+      const result = await upsertFinancialEntryFromBridge(adminDb as any, AdminFieldValue, clinicId, {
+        bridgeIdempotencyKey: String(bridgeIdempotencyKey), patientId: String(patientId), tipo: String(tipo),
+        categoria: categoria ? String(categoria) : null, valor: Number(valor), situacao: String(situacao),
+        dataPagamento: dataPagamento ? String(dataPagamento) : null, valorPago: typeof valorPago === "number" ? valorPago : null,
+      });
+      console.log(`[BRIDGE_SYNC_FINANCIAL] clinicId=${clinicId} action=${result.action} docId=${result.docId}`);
+      return res.json(result);
+    } catch (err: any) {
+      if (err instanceof BridgePatientNotFoundError) {
+        return res.status(404).json({ error: "PATIENT_NOT_FOUND", message: err.message });
+      }
+      console.error("[BRIDGE_SYNC_FINANCIAL_ERROR]", err instanceof Error ? err.message : err);
+      return res.status(500).json({ error: "Erro interno ao sincronizar lançamento financeiro." });
+    }
+  });
+
+  // ============================================================================
   // AUTHENTICATION ROUTES
   // ============================================================================
 
@@ -3368,7 +6159,7 @@ Versão polida por ELIZA:`,
    * POST /api/intelligence/approve-action
    * Approves a pending action proposal
    */
-  app.post("/api/intelligence/approve-action", elizaAuthMiddleware, async (req, res) => {
+  app.post("/api/intelligence/approve-action", elizaAuthMiddleware, async (req: any, res) => {
     try {
       const { actionId } = req.body;
       const clinicId = req.elizaAuth.clinicId;
@@ -3431,6 +6222,1359 @@ Versão polida por ELIZA:`,
 
   console.log("[ELIZA] Intelligence Layer routes initialized (/api/intelligence/*)");
 
+  // ============================================================================
+  // PATIENT PORTAL ROUTES (NEW)
+  // ============================================================================
+  // A patient has no Firebase account and firestore.rules blocks every read/
+  // write under clinics/{clinicId}/** to non-members (isClinicMember(...)),
+  // by design. So this whole surface talks to Firestore exclusively through
+  // adminDb (Admin SDK, bypasses rules) with its own opaque, hash-stored
+  // session tokens — never Firebase Auth, never the elizaAuthMiddleware/JWT
+  // layer above (that one is bootstrapped from a staff Firebase ID token and
+  // isn't a fit for a patient who has no such token to begin with). Session
+  // and link tokens are never stored in plaintext, and URLs handed to
+  // patients never carry patientId, CPF, or phone — only an opaque token or
+  // the clinic's existing `slug` field.
+
+  const PATIENT_PORTAL_OTP_TTL_MS = 10 * 60 * 1000; // 10 minutes
+  const PATIENT_PORTAL_SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days, sliding
+  const PATIENT_PORTAL_OTP_MAX_ATTEMPTS = 5;
+
+  function portalNormalizeName(s: string): string {
+    return (s || "").normalize("NFD").replace(/[̀-ͯ]/g, "").toLowerCase().replace(/\s+/g, " ").trim();
+  }
+  function portalNormalizePhone(s: string): string {
+    const digits = (s || "").replace(/\D/g, "");
+    return digits.startsWith("55") && digits.length > 11 ? digits.substring(2) : digits;
+  }
+  function portalGenerateToken(): string {
+    return crypto.randomBytes(32).toString("hex");
+  }
+  function portalHash(value: string): string {
+    return crypto.createHash("sha256").update(value).digest("hex");
+  }
+  function portalGenerateOtpCode(): string {
+    return String(crypto.randomInt(100000, 1000000));
+  }
+  function portalToMs(v: any): number {
+    if (!v) return 0;
+    if (typeof v.toMillis === "function") return v.toMillis();
+    if (v instanceof Date) return v.getTime();
+    const parsed = new Date(v).getTime();
+    return isNaN(parsed) ? 0 : parsed;
+  }
+
+  async function createPortalSession(clinicId: string, patientId: string) {
+    const rawToken = portalGenerateToken();
+    const tokenHash = portalHash(rawToken);
+    await adminDb.collection("patient_portal_sessions").doc(tokenHash).set({
+      clinicId,
+      patientId,
+      tokenHash,
+      createdAt: AdminFieldValue.serverTimestamp(),
+      lastSeenAt: AdminFieldValue.serverTimestamp(),
+      expiresAt: new Date(Date.now() + PATIENT_PORTAL_SESSION_TTL_MS),
+    });
+    return { rawToken };
+  }
+
+  async function createPortalPendingItem(
+    clinicId: string,
+    patientId: string,
+    patientName: string,
+    payload: { type: string; title: string; description: string; extra?: Record<string, any> }
+  ) {
+    const ref = await adminDb.collection(`clinics/${clinicId}/pending_items`).add({
+      type: payload.type,
+      title: payload.title,
+      description: payload.description,
+      patientId,
+      patientName,
+      priority: "Média",
+      status: "pending",
+      category: "Portal do Paciente",
+      source: "Portal do Paciente",
+      createdAt: AdminFieldValue.serverTimestamp(),
+      ...(payload.extra || {}),
+    });
+    // Single choke point for all 5 Portal request types — the event log's
+    // "solicitação do Portal" family is written here once instead of
+    // repeated in each route below.
+    adminDb.collection(`clinics/${clinicId}/status_events`).add({
+      entityType: "pending_item",
+      entityId: ref.id,
+      eventType: "pending_item_created",
+      patientId,
+      fromStatus: null,
+      toStatus: "pending",
+      professionalId: null,
+      professionalName: null,
+      metadata: { type: payload.type, title: payload.title, source: "Portal do Paciente" },
+      createdBy: null,
+      occurredAt: AdminFieldValue.serverTimestamp(),
+    }).catch((e: any) => console.warn("[STATUS_EVENTS] Failed to log portal request event:", e.message || e));
+    return ref;
+  }
+
+  // Shared by GET /home (display) and the portal messaging AI auto-reply
+  // (context for "quando é minha consulta"-type questions) — one query/sort,
+  // not reimplemented twice.
+  async function getPatientNextAppointment(clinicId: string, patientId: string) {
+    const apptsSnap = await adminDb.collection(`clinics/${clinicId}/appointments`).where("patientId", "==", patientId).get();
+    const now = Date.now();
+    return apptsSnap.docs
+      .map(d => d.data() as any)
+      .filter(a => !["cancelado", "faltou", "finalizado"].includes(a.status) && portalToMs(new Date(`${a.date}T${a.time || "00:00"}:00`)) >= now)
+      .sort((a, b) => portalToMs(new Date(`${a.date}T${a.time || "00:00"}:00`)) - portalToMs(new Date(`${b.date}T${b.time || "00:00"}:00`)))[0] || null;
+  }
+
+  // Public-facing rate limiter (no session yet) — a blunt IP-based safety
+  // net; the real per-patient throttling for OTP lives in the route logic
+  // below (query-based, since express-rate-limit's default store keys by IP,
+  // not by patient/phone).
+  const portalPublicLimiter = rateLimit({ windowMs: 60_000, max: 20, standardHeaders: true, legacyHeaders: false });
+  const portalSessionLimiter = rateLimit({ windowMs: 60_000, max: 60, standardHeaders: true, legacyHeaders: false });
+
+  async function patientPortalAuth(req: any, res: any, next: any) {
+    try {
+      const authHeader = req.headers.authorization || "";
+      if (!authHeader.startsWith("Bearer ")) {
+        return res.status(401).json({ success: false, error: "Sessão ausente." });
+      }
+      const tokenHash = portalHash(authHeader.substring(7));
+      const sessionRef = adminDb.collection("patient_portal_sessions").doc(tokenHash);
+      const sessionSnap = await sessionRef.get();
+      if (!sessionSnap.exists) {
+        return res.status(401).json({ success: false, error: "Sessão inválida." });
+      }
+      const session: any = sessionSnap.data();
+      if (portalToMs(session.expiresAt) < Date.now()) {
+        return res.status(401).json({ success: false, error: "Sessão expirada. Acesse o link novamente." });
+      }
+      await sessionRef.update({
+        lastSeenAt: AdminFieldValue.serverTimestamp(),
+        expiresAt: new Date(Date.now() + PATIENT_PORTAL_SESSION_TTL_MS),
+      });
+      req.patientPortal = { clinicId: session.clinicId, patientId: session.patientId };
+      next();
+    } catch (err: any) {
+      console.error("[PATIENT_PORTAL_AUTH_ERROR]", err);
+      return res.status(500).json({ success: false, error: "Erro ao validar sessão." });
+    }
+  }
+
+  // Staff-side auth for the "generate portal link" / "revoke access" actions
+  // triggered from inside the real (Firebase-authenticated) app — same
+  // Firebase ID Token + clinic-membership check already used by
+  // authController.ts's /api/auth/login, just inlined here since it's the
+  // only two routes that need it.
+  async function patientPortalStaffAuth(req: any, res: any, next: any) {
+    try {
+      const authHeader = req.headers.authorization || "";
+      if (!authHeader.startsWith("Bearer ")) {
+        return res.status(401).json({ success: false, error: "Autenticação necessária." });
+      }
+      const decoded = await getAdminAuth().verifyIdToken(authHeader.substring(7));
+      const clinicId = req.body?.clinicId;
+      if (!clinicId) {
+        return res.status(400).json({ success: false, error: "clinicId é obrigatório." });
+      }
+      const memberSnap = await adminDb.doc(`clinics/${clinicId}/members/${decoded.uid}`).get();
+      if (!memberSnap.exists || memberSnap.data()?.active === false) {
+        return res.status(403).json({ success: false, error: "Você não tem acesso a esta clínica." });
+      }
+      req.staffAuth = { uid: decoded.uid, clinicId };
+      next();
+    } catch (err: any) {
+      return res.status(401).json({ success: false, error: "Token inválido." });
+    }
+  }
+
+  // --- Access (link + OTP) ---------------------------------------------
+
+  app.post("/api/patient-portal/link/redeem", portalPublicLimiter, async (req, res) => {
+    try {
+      const { token } = req.body || {};
+      if (!token || typeof token !== "string") {
+        return res.status(400).json({ success: false, error: "Link inválido." });
+      }
+      const linkSnap = await adminDb.collection("patient_portal_links").doc(portalHash(token)).get();
+      if (!linkSnap.exists || linkSnap.data()?.active === false) {
+        return res.status(404).json({ success: false, error: "Link inválido ou revogado. Peça um novo link à clínica." });
+      }
+      const link: any = linkSnap.data();
+      const patientSnap = await adminDb.doc(`clinics/${link.clinicId}/patients/${link.patientId}`).get();
+      if (!patientSnap.exists) {
+        return res.status(404).json({ success: false, error: "Paciente não encontrado." });
+      }
+      const clinicSnap = await adminDb.doc(`clinics/${link.clinicId}`).get();
+      const session = await createPortalSession(link.clinicId, link.patientId);
+      await linkSnap.ref.update({ lastUsedAt: AdminFieldValue.serverTimestamp() });
+      return res.json({
+        success: true,
+        data: {
+          sessionToken: session.rawToken,
+          patientName: patientSnap.data()?.name || "",
+          clinicName: clinicSnap.data()?.name || "",
+        },
+      });
+    } catch (err: any) {
+      console.error("[PATIENT_PORTAL_LINK_REDEEM_ERROR]", err);
+      return res.status(500).json({ success: false, error: "Erro ao validar link." });
+    }
+  });
+
+  app.post("/api/patient-portal/auth/request-otp", portalPublicLimiter, async (req, res) => {
+    try {
+      const { clinicSlug, name, phone } = req.body || {};
+      if (!clinicSlug || !name || !phone) {
+        return res.status(400).json({ success: false, error: "Preencha nome completo e telefone." });
+      }
+      const clinicsSnap = await adminDb.collection("clinics").where("slug", "==", String(clinicSlug).toLowerCase().trim()).limit(1).get();
+      if (clinicsSnap.empty) {
+        return res.status(404).json({ success: false, error: "Clínica não encontrada." });
+      }
+      const clinicDoc = clinicsSnap.docs[0];
+      const clinicId = clinicDoc.id;
+
+      // Full-collection scan: acceptable at this clinic's current scale
+      // (thousands of patients, login is an infrequent action) since phone
+      // isn't stored in a normalized, query-friendly format today. Revisit
+      // with a phoneNormalized index field if a much larger clinic adopts
+      // the portal.
+      const targetName = portalNormalizeName(name);
+      const patientsSnap = await adminDb.collection(`clinics/${clinicId}/patients`).get();
+      const match = patientsSnap.docs.find(d => {
+        const p: any = d.data();
+        return portalNormalizeName(p.name || "") === targetName && portalNormalizePhone(p.phone || "") &&
+          portalNormalizePhone(p.phone || "").slice(-8) === portalNormalizePhone(phone).slice(-8);
+      });
+
+      // Always respond success-shaped even without a match, so this endpoint
+      // can't be used to enumerate a clinic's patient names/phones.
+      if (!match) {
+        return res.json({ success: true, data: { requestId: null } });
+      }
+      const patientId = match.id;
+      const matchPhone = (match.data() as any).phone || phone;
+
+      const recentSnap = await adminDb.collection("patient_otp_requests")
+        .where("clinicId", "==", clinicId)
+        .where("patientId", "==", patientId)
+        .orderBy("createdAt", "desc")
+        .limit(20)
+        .get();
+      const now = Date.now();
+      if (recentSnap.docs.some(d => now - portalToMs(d.data().createdAt) < 60_000)) {
+        return res.status(429).json({ success: false, error: "Aguarde 1 minuto antes de solicitar um novo código." });
+      }
+      if (recentSnap.docs.filter(d => now - portalToMs(d.data().createdAt) < 24 * 60 * 60 * 1000).length >= 5) {
+        return res.status(429).json({ success: false, error: "Limite diário de códigos atingido. Fale com a clínica." });
+      }
+
+      const code = portalGenerateOtpCode();
+      const reqRef = await adminDb.collection("patient_otp_requests").add({
+        clinicId,
+        patientId,
+        phone: matchPhone,
+        codeHash: portalHash(code),
+        attempts: 0,
+        consumed: false,
+        createdAt: AdminFieldValue.serverTimestamp(),
+        expiresAt: new Date(now + PATIENT_PORTAL_OTP_TTL_MS),
+      });
+
+      const clinicName = clinicDoc.data()?.name || "sua clínica";
+      const waResult = await dispatchWhatsAppMessage(clinicId, matchPhone, `${clinicName}: seu código de acesso ao Portal do Paciente é ${code}. Válido por 10 minutos. Não compartilhe com ninguém.`);
+
+      return res.json({ success: true, data: { requestId: reqRef.id, whatsappSent: !!waResult.success } });
+    } catch (err: any) {
+      console.error("[PATIENT_PORTAL_REQUEST_OTP_ERROR]", err);
+      return res.status(500).json({ success: false, error: "Erro ao solicitar código." });
+    }
+  });
+
+  app.post("/api/patient-portal/auth/verify-otp", portalPublicLimiter, async (req, res) => {
+    try {
+      const { requestId, code } = req.body || {};
+      if (!requestId || !code) {
+        return res.status(400).json({ success: false, error: "Código inválido." });
+      }
+      const reqRef = adminDb.collection("patient_otp_requests").doc(requestId);
+      const reqSnap = await reqRef.get();
+      if (!reqSnap.exists) {
+        return res.status(400).json({ success: false, error: "Código inválido ou expirado." });
+      }
+      const data: any = reqSnap.data();
+      if (data.consumed) {
+        return res.status(400).json({ success: false, error: "Este código já foi usado." });
+      }
+      if (portalToMs(data.expiresAt) < Date.now()) {
+        return res.status(400).json({ success: false, error: "Código expirado. Solicite um novo." });
+      }
+      if ((data.attempts || 0) >= PATIENT_PORTAL_OTP_MAX_ATTEMPTS) {
+        return res.status(429).json({ success: false, error: "Muitas tentativas. Solicite um novo código." });
+      }
+      if (portalHash(String(code).trim()) !== data.codeHash) {
+        await reqRef.update({ attempts: AdminFieldValue.increment(1) });
+        return res.status(400).json({ success: false, error: "Código incorreto." });
+      }
+
+      await reqRef.update({ consumed: true, consumedAt: AdminFieldValue.serverTimestamp() });
+      const session = await createPortalSession(data.clinicId, data.patientId);
+
+      // Lazy upsert of the future cross-clinic patient account, keyed by
+      // normalized phone — seeds the global-identity architecture without
+      // touching clinics/{clinicId}/patients at all.
+      const phoneNorm = portalNormalizePhone(data.phone || "");
+      if (phoneNorm) {
+        const accountRef = adminDb.collection("patient_accounts").doc(phoneNorm);
+        const accountSnap = await accountRef.get();
+        await accountRef.set({
+          phoneNormalized: phoneNorm,
+          [`clinicLinks.${data.clinicId}`]: data.patientId,
+          updatedAt: AdminFieldValue.serverTimestamp(),
+          ...(accountSnap.exists ? {} : { createdAt: AdminFieldValue.serverTimestamp() }),
+        }, { merge: true });
+      }
+
+      const [patientSnap, clinicSnap] = await Promise.all([
+        adminDb.doc(`clinics/${data.clinicId}/patients/${data.patientId}`).get(),
+        adminDb.doc(`clinics/${data.clinicId}`).get(),
+      ]);
+      return res.json({
+        success: true,
+        data: {
+          sessionToken: session.rawToken,
+          patientName: patientSnap.data()?.name || "",
+          clinicName: clinicSnap.data()?.name || "",
+        },
+      });
+    } catch (err: any) {
+      console.error("[PATIENT_PORTAL_VERIFY_OTP_ERROR]", err);
+      return res.status(500).json({ success: false, error: "Erro ao verificar código." });
+    }
+  });
+
+  // --- Authenticated portal data -----------------------------------------
+
+  app.get("/api/patient-portal/home", portalSessionLimiter, patientPortalAuth, async (req: any, res) => {
+    try {
+      const { clinicId, patientId } = req.patientPortal;
+      const [patientSnap, clinicSnap, anamnesisSnap, convoSnap, upcoming] = await Promise.all([
+        adminDb.doc(`clinics/${clinicId}/patients/${patientId}`).get(),
+        adminDb.doc(`clinics/${clinicId}`).get(),
+        adminDb.doc(`clinics/${clinicId}/patients/${patientId}/anamnesis/current`).get(),
+        adminDb.doc(`clinics/${clinicId}/portal_conversations/${patientId}`).get(),
+        getPatientNextAppointment(clinicId, patientId),
+      ]);
+      if (!patientSnap.exists) {
+        return res.status(404).json({ success: false, error: "Paciente não encontrado." });
+      }
+      const patientData: any = patientSnap.data() || {};
+
+      return res.json({
+        success: true,
+        data: {
+          patientName: patientData.name || "",
+          photoUrl: patientData.photoUrl || null,
+          clinicName: clinicSnap.data()?.name || "",
+          nextAppointment: upcoming ? {
+            date: upcoming.date, time: upcoming.time, treatment: upcoming.treatment || null,
+            dentistName: upcoming.dentistName || null, status: upcoming.status,
+          } : null,
+          anamnesisSubmitted: !!anamnesisSnap.data()?.submittedByPatient,
+          missingBasicInfo: {
+            birthDate: !patientData.birthDate,
+            email: !patientData.email,
+          },
+          hasUnreadPortalMessages: !!convoSnap.data()?.unreadByPatient,
+        },
+      });
+    } catch (err: any) {
+      console.error("[PATIENT_PORTAL_HOME_ERROR]", err);
+      return res.status(500).json({ success: false, error: "Erro ao carregar dados." });
+    }
+  });
+
+  app.get("/api/patient-portal/appointments", portalSessionLimiter, patientPortalAuth, async (req: any, res) => {
+    try {
+      const { clinicId, patientId } = req.patientPortal;
+      const snap = await adminDb.collection(`clinics/${clinicId}/appointments`).where("patientId", "==", patientId).get();
+      const appointments = snap.docs
+        .map(d => {
+          const a: any = d.data();
+          return {
+            id: d.id, date: a.date || null, time: a.time || null, treatment: a.treatment || null,
+            dentistName: a.dentistName || null, status: a.status || null, duration: a.duration || null,
+          };
+        })
+        .sort((a, b) => `${b.date}T${b.time}`.localeCompare(`${a.date}T${a.time}`));
+      return res.json({ success: true, data: { appointments } });
+    } catch (err: any) {
+      console.error("[PATIENT_PORTAL_APPOINTMENTS_ERROR]", err);
+      return res.status(500).json({ success: false, error: "Erro ao carregar agendamentos." });
+    }
+  });
+
+  // Never returns internalNotes, staff recados, ELIZA intelligence output,
+  // costs, commissions, or any administrative field — only the explicit
+  // patientVisible entries, mapped to a narrow, patient-safe shape.
+  app.get("/api/patient-portal/history", portalSessionLimiter, patientPortalAuth, async (req: any, res) => {
+    try {
+      const { clinicId, patientId } = req.patientPortal;
+      const [treatmentsSnap, imagesSnap] = await Promise.all([
+        adminDb.collection(`clinics/${clinicId}/patients/${patientId}/treatments`).get(),
+        adminDb.collection(`clinics/${clinicId}/patients/${patientId}/images`).get(),
+      ]);
+
+      const entries: any[] = [];
+      treatmentsSnap.docs.forEach(tDoc => {
+        const t: any = tDoc.data();
+        (t.evolutions || []).forEach((ev: any) => {
+          if (ev.voided) return;
+          // patientVisible (a evolução em si) e postOpReleasedToPortal (só
+          // as instruções de pós-operatório) são liberações INDEPENDENTES —
+          // uma evolução pode ficar oculta enquanto só o pós-operatório dela
+          // é liberado, ou vice-versa.
+          const showEvolution = !!ev.patientVisible;
+          const showPostOp = !!ev.postOpReleasedToPortal && !!ev.postOpInstructions;
+          if (!showEvolution && !showPostOp) return;
+          entries.push({
+            type: "evolution", date: ev.date || null, procedure: t.description || null,
+            professional: ev.professional || t.professional || null,
+            notes: showEvolution ? (ev.text || null) : null,
+            postOpInstructions: showPostOp ? ev.postOpInstructions : null,
+          });
+        });
+      });
+      imagesSnap.docs.forEach(d => {
+        const img: any = d.data();
+        if (!img.patientVisible) return;
+        entries.push({
+          type: "image", date: img.date || null, title: img.title || null,
+          category: img.category || null, url: img.url || null, description: img.description || null,
+        });
+      });
+      entries.sort((a, b) => portalToMs(b.date) - portalToMs(a.date));
+
+      return res.json({ success: true, data: { history: entries } });
+    } catch (err: any) {
+      console.error("[PATIENT_PORTAL_HISTORY_ERROR]", err);
+      return res.status(500).json({ success: false, error: "Erro ao carregar histórico." });
+    }
+  });
+
+  app.get("/api/patient-portal/quotations", portalSessionLimiter, patientPortalAuth, async (req: any, res) => {
+    try {
+      const { clinicId, patientId } = req.patientPortal;
+      const snap = await adminDb.collection(`clinics/${clinicId}/patients/${patientId}/quotations`).get();
+      const quotations = snap.docs
+        .map(d => ({ id: d.id, ...(d.data() as any) }))
+        .filter((q: any) => q.status && q.status !== "draft")
+        .map((q: any) => ({
+          id: q.id, title: q.title || "Orçamento", totalValue: q.totalValue || 0, status: q.status,
+          createdAt: q.createdAt || null,
+          items: (q.items || []).map((it: any) => ({ description: it.description, value: it.value, quantity: it.quantity })),
+        }));
+      return res.json({ success: true, data: { quotations } });
+    } catch (err: any) {
+      console.error("[PATIENT_PORTAL_QUOTATIONS_ERROR]", err);
+      return res.status(500).json({ success: false, error: "Erro ao carregar orçamentos." });
+    }
+  });
+
+  // Patient-submitted anamnesis — reuses the exact same document
+  // (clinics/{clinicId}/patients/{patientId}/anamnesis/current) and field
+  // shape the staff-side Prontuário already reads/writes (NextMedicalRecord.tsx),
+  // plus two new fields (chiefComplaint, proceduresOfInterest). After saving,
+  // calls the same AI gateway used by the rest of the app (generateElizaAIResponse,
+  // defined above) with taskType 'anamnese_dossie' — already a recognized
+  // critical task type in that gateway — to prepare a pre-consult dossiê for
+  // whoever attends the patient. A failed AI call never blocks the save.
+  app.post("/api/patient-portal/anamnesis", portalSessionLimiter, patientPortalAuth, async (req: any, res) => {
+    try {
+      const { clinicId, patientId } = req.patientPortal;
+      const {
+        chiefComplaint, proceduresOfInterest, medicalTreatment, allergies,
+        medications, conditions, healingIssues, hemorrhage, habits, birthDate, email,
+      } = req.body || {};
+
+      const patientSnap = await adminDb.doc(`clinics/${clinicId}/patients/${patientId}`).get();
+      if (!patientSnap.exists) return res.status(404).json({ success: false, error: "Paciente não encontrado." });
+      const patientData: any = patientSnap.data() || {};
+      const patientName = patientData.name || "Paciente";
+
+      const anamnesisPayload: Record<string, any> = {
+        chiefComplaint: chiefComplaint || "", proceduresOfInterest: proceduresOfInterest || "",
+        medicalTreatment: medicalTreatment || "", allergies: allergies || "", medications: medications || "",
+        conditions: conditions || "", healingIssues: healingIssues || "", hemorrhage: hemorrhage || "", habits: habits || "",
+        submittedByPatient: true,
+        submittedAt: AdminFieldValue.serverTimestamp(),
+        updatedAt: AdminFieldValue.serverTimestamp(),
+      };
+      const anamnesisRef = adminDb.doc(`clinics/${clinicId}/patients/${patientId}/anamnesis/current`);
+      await anamnesisRef.set(anamnesisPayload, { merge: true });
+
+      // Only fills genuinely missing cadastral fields — never overwrites
+      // what the clinic staff already has on file.
+      const patientUpdate: Record<string, any> = {};
+      if (birthDate && !patientData.birthDate) patientUpdate.birthDate = birthDate;
+      if (email && !patientData.email) patientUpdate.email = email;
+      if (Object.keys(patientUpdate).length > 0) {
+        await patientSnap.ref.update(patientUpdate);
+      }
+
+      let aiPreConsultSummary: any = null;
+      try {
+        const prompt = `Você é a Eliza, inteligência clínica odontológica/estética sênior de apoio à equipe. O paciente "${patientName}" preencheu a anamnese pelo Portal do Paciente antes da consulta. Monte um resumo pré-consulta objetivo para o profissional que vai atendê-lo.
+
+Queixa principal do paciente: "${chiefComplaint || "não informada"}"
+Procedimentos de interesse informados pelo paciente: "${proceduresOfInterest || "não informado"}"
+Respostas de anamnese (fonte da verdade, não invente nada além disso):
+- Tratamento médico: ${medicalTreatment || "não informado"}
+- Alergias: ${allergies || "não informado"}
+- Medicação contínua: ${medications || "não informado"}
+- Condições (diabetes/cardíaco): ${conditions || "não informado"}
+- Cicatrização: ${healingIssues || "não informado"}
+- Hemorragia: ${hemorrhage || "não informado"}
+- Hábitos (fumo/álcool): ${habits || "não informado"}
+
+Responda ESTRITAMENTE em JSON válido, sem markdown, sem texto fora do JSON, exatamente neste formato:
+{"summary":"resumo em 2-3 frases do que o profissional precisa saber antes de atender","alerts":[{"type":"danger|warning|info","title":"...","description":"..."}],"suggestedFocus":["ponto de atenção ou sugestão 1"]}
+Nunca invente alergias, condições, achados ou históricos que não foram informados pelo paciente acima.`;
+
+        const aiResult = await generateElizaAIResponse({
+          taskType: "anamnese_dossie",
+          contents: [{ role: "user", parts: [{ text: prompt }] }],
+          clinicId,
+        });
+        const rawText: string = aiResult?.text || "";
+        const jsonMatch = rawText.match(/\{[\s\S]*\}/);
+        if (jsonMatch) {
+          const parsed = JSON.parse(jsonMatch[0]);
+          aiPreConsultSummary = {
+            summary: String(parsed.summary || ""),
+            alerts: Array.isArray(parsed.alerts) ? parsed.alerts.map((a: any) => ({ type: String(a?.type || "info"), title: String(a?.title || ""), description: String(a?.description || "") })) : [],
+            suggestedFocus: Array.isArray(parsed.suggestedFocus) ? parsed.suggestedFocus.map(String) : [],
+            generatedAt: new Date().toISOString(),
+          };
+          await anamnesisRef.set({ aiPreConsultSummary }, { merge: true });
+        }
+      } catch (aiErr: any) {
+        console.error("[PATIENT_PORTAL_ANAMNESIS_AI_ERROR]", aiErr?.message || aiErr);
+      }
+
+      await createPortalPendingItem(clinicId, patientId, patientName, {
+        type: "patient_portal_anamnesis_submitted",
+        title: `Anamnese respondida — ${patientName}`,
+        description: `Queixa principal: ${chiefComplaint || "não informada"}.${aiPreConsultSummary?.summary ? ` Resumo da Eliza: ${aiPreConsultSummary.summary}` : " Revisar anamnese completa no prontuário antes do atendimento."}`,
+      });
+
+      return res.json({ success: true });
+    } catch (err: any) {
+      console.error("[PATIENT_PORTAL_ANAMNESIS_ERROR]", err);
+      return res.status(500).json({ success: false, error: "Erro ao enviar anamnese." });
+    }
+  });
+
+  // Foto de perfil enviada pelo próprio paciente — mesmo padrão de storage
+  // do resto do app (base64 direto no doc, sem Storage), mas com teto mais
+  // apertado (é só um avatar, não um exame): ~700KB de base64 já cobre uma
+  // foto de celular bem comprimida.
+  app.post("/api/patient-portal/profile-photo", portalSessionLimiter, patientPortalAuth, async (req: any, res) => {
+    try {
+      const { clinicId, patientId } = req.patientPortal;
+      const { photoBase64 } = req.body || {};
+      if (!photoBase64 || typeof photoBase64 !== "string" || !photoBase64.startsWith("data:image/")) {
+        return res.status(400).json({ success: false, error: "Envie uma foto válida." });
+      }
+      if (photoBase64.length > 700_000) {
+        return res.status(400).json({ success: false, error: "Foto muito grande — escolha uma imagem menor." });
+      }
+      const patientRef = adminDb.doc(`clinics/${clinicId}/patients/${patientId}`);
+      const patientSnap = await patientRef.get();
+      if (!patientSnap.exists) return res.status(404).json({ success: false, error: "Paciente não encontrado." });
+      await patientRef.update({ photoUrl: photoBase64, photoUpdatedAt: AdminFieldValue.serverTimestamp() });
+      return res.json({ success: true });
+    } catch (err: any) {
+      console.error("[PATIENT_PORTAL_PROFILE_PHOTO_ERROR]", err);
+      return res.status(500).json({ success: false, error: "Erro ao enviar foto." });
+    }
+  });
+
+  // --- Patient-initiated requests → real pending_items -------------------
+
+  app.post("/api/patient-portal/requests/schedule", portalSessionLimiter, patientPortalAuth, async (req: any, res) => {
+    try {
+      const { clinicId, patientId } = req.patientPortal;
+      const { reason, preferredDays, period, notes } = req.body || {};
+      if (!reason) return res.status(400).json({ success: false, error: "Informe o motivo/procedimento." });
+      const patientSnap = await adminDb.doc(`clinics/${clinicId}/patients/${patientId}`).get();
+      const patientName = patientSnap.data()?.name || "Paciente";
+      await createPortalPendingItem(clinicId, patientId, patientName, {
+        type: "patient_portal_schedule_request",
+        title: `Solicitação de horário — ${patientName}`,
+        description: `Motivo: ${reason}. Dias preferidos: ${preferredDays || "sem preferência"}. Período: ${period || "sem preferência"}.${notes ? ` Obs: ${notes}` : ""}`,
+      });
+      return res.json({ success: true });
+    } catch (err: any) {
+      console.error("[PATIENT_PORTAL_REQ_SCHEDULE_ERROR]", err);
+      return res.status(500).json({ success: false, error: "Erro ao enviar solicitação." });
+    }
+  });
+
+  app.post("/api/patient-portal/requests/return", portalSessionLimiter, patientPortalAuth, async (req: any, res) => {
+    try {
+      const { clinicId, patientId } = req.patientPortal;
+      const { notes } = req.body || {};
+      const patientSnap = await adminDb.doc(`clinics/${clinicId}/patients/${patientId}`).get();
+      const patientName = patientSnap.data()?.name || "Paciente";
+
+      const treatmentsSnap = await adminDb.collection(`clinics/${clinicId}/patients/${patientId}/treatments`).get();
+      let lastTreatment: { description: string; professional: string | null; date: any } | null = null;
+      treatmentsSnap.docs.forEach(d => {
+        const t: any = d.data();
+        const evs = (t.evolutions || []).slice().sort((a: any, b: any) => portalToMs(b.date) - portalToMs(a.date));
+        const latestDate = evs[0]?.date;
+        if (latestDate && (!lastTreatment || portalToMs(latestDate) > portalToMs(lastTreatment.date))) {
+          lastTreatment = { description: t.description, professional: evs[0]?.professional || t.professional || null, date: latestDate };
+        }
+      });
+
+      await createPortalPendingItem(clinicId, patientId, patientName, {
+        type: "patient_portal_return_request",
+        title: `Solicitação de retorno — ${patientName}`,
+        description: `${lastTreatment ? `Relacionado ao tratamento "${(lastTreatment as any).description}" (profissional: ${(lastTreatment as any).professional || "não identificado"}).` : "Sem tratamento anterior identificado."}${notes ? ` Obs do paciente: ${notes}` : ""}`,
+      });
+      return res.json({ success: true });
+    } catch (err: any) {
+      console.error("[PATIENT_PORTAL_REQ_RETURN_ERROR]", err);
+      return res.status(500).json({ success: false, error: "Erro ao enviar solicitação." });
+    }
+  });
+
+  app.post("/api/patient-portal/requests/quotation-interest", portalSessionLimiter, patientPortalAuth, async (req: any, res) => {
+    try {
+      const { clinicId, patientId } = req.patientPortal;
+      const { quotationId, action } = req.body || {}; // action: 'interest' | 'talk' | 'schedule'
+      if (!quotationId || !action) return res.status(400).json({ success: false, error: "Dados incompletos." });
+      const [patientSnap, quotationSnap] = await Promise.all([
+        adminDb.doc(`clinics/${clinicId}/patients/${patientId}`).get(),
+        adminDb.doc(`clinics/${clinicId}/patients/${patientId}/quotations/${quotationId}`).get(),
+      ]);
+      if (!quotationSnap.exists) return res.status(404).json({ success: false, error: "Orçamento não encontrado." });
+      const patientName = patientSnap.data()?.name || "Paciente";
+      const quotation: any = quotationSnap.data();
+      const actionLabel = action === "interest" ? "tem interesse no orçamento" : action === "talk" ? "quer conversar sobre o orçamento" : "quer agendar o orçamento";
+      await createPortalPendingItem(clinicId, patientId, patientName, {
+        type: "patient_portal_quotation_interest",
+        title: `${patientName} ${actionLabel}`,
+        description: `Orçamento "${quotation.title || quotationId}" — total ${quotation.totalValue || 0}.`,
+        extra: { quotationId },
+      });
+      return res.json({ success: true });
+    } catch (err: any) {
+      console.error("[PATIENT_PORTAL_REQ_QUOTATION_ERROR]", err);
+      return res.status(500).json({ success: false, error: "Erro ao enviar solicitação." });
+    }
+  });
+
+  // --- Patient <-> clinic messaging (real thread, not fire-and-forget) ---
+  // clinics/{clinicId}/portal_conversations/{patientId} is the conversation
+  // doc (same shape as the whatsapp_conversations/{id} pattern already used
+  // elsewhere in this file) with a messages/ subcollection. Staff read/reply
+  // directly via the Firestore client SDK — already covered by the
+  // clinic-member wildcard rule, no new firestore.rules entry needed. Only
+  // the patient side goes through these REST routes, since a patient has no
+  // Firebase account and therefore no direct Firestore access.
+
+  app.get("/api/patient-portal/messages", portalSessionLimiter, patientPortalAuth, async (req: any, res) => {
+    try {
+      const { clinicId, patientId } = req.patientPortal;
+      const convoRef = adminDb.doc(`clinics/${clinicId}/portal_conversations/${patientId}`);
+      const msgsSnap = await convoRef.collection("messages").orderBy("createdAt", "asc").limit(200).get();
+      convoRef.set({ unreadByPatient: false }, { merge: true }).catch(() => {});
+      return res.json({
+        success: true,
+        data: {
+          messages: msgsSnap.docs.map(d => {
+            const m: any = d.data();
+            return { id: d.id, text: m.text, sender: m.sender, createdAt: m.createdAt?.toDate?.()?.toISOString?.() || null };
+          }),
+        },
+      });
+    } catch (err: any) {
+      console.error("[PATIENT_PORTAL_MESSAGES_GET_ERROR]", err);
+      return res.status(500).json({ success: false, error: "Erro ao carregar mensagens." });
+    }
+  });
+
+  app.post("/api/patient-portal/messages", portalSessionLimiter, patientPortalAuth, async (req: any, res) => {
+    try {
+      const { clinicId, patientId } = req.patientPortal;
+      const text = String(req.body?.text || "").trim();
+      if (!text) return res.status(400).json({ success: false, error: "Escreva uma mensagem." });
+      if (text.length > 2000) return res.status(400).json({ success: false, error: "Mensagem muito longa." });
+
+      const [patientSnap, clinicSnap] = await Promise.all([
+        adminDb.doc(`clinics/${clinicId}/patients/${patientId}`).get(),
+        adminDb.doc(`clinics/${clinicId}`).get(),
+      ]);
+      const patientName = patientSnap.data()?.name || "Paciente";
+      const clinicData: any = clinicSnap.data() || {};
+
+      const convoRef = adminDb.doc(`clinics/${clinicId}/portal_conversations/${patientId}`);
+      const convoSnap = await convoRef.get();
+      await convoRef.set({
+        patientId,
+        patientName,
+        lastMessage: text,
+        lastMessageAt: AdminFieldValue.serverTimestamp(),
+        lastMessageSender: "patient",
+        unreadByStaff: true,
+        unreadByPatient: false,
+        ...(convoSnap.exists ? {} : { createdAt: AdminFieldValue.serverTimestamp() }),
+      }, { merge: true });
+      await convoRef.collection("messages").add({
+        text, sender: "patient", createdAt: AdminFieldValue.serverTimestamp(),
+      });
+
+      // Still one pending_item per message (not deduped) — this is what
+      // makes ElizaAssistantContext's proactive-open listener (which only
+      // reacts to newly-ADDED pending_items) fire for every message, not
+      // just the first one of a conversation.
+      const pendingRef = await createPortalPendingItem(clinicId, patientId, patientName, {
+        type: "patient_portal_message",
+        title: `Mensagem do paciente — ${patientName}`,
+        description: text,
+      });
+
+      // Conversational auto-reply — always answers (unless the clinic
+      // turned it off in Painel Admin) instead of only the narrow set of
+      // "basic factual" questions the first version handled. It still
+      // never invents anything: contact info, the patient's own next
+      // appointment, and post-op guidance all come from real clinic data
+      // passed in below; pricing/scheduling are explicitly off-limits and
+      // routed to staff, and the pending_item above already guarantees the
+      // "estou encaminhando" claim is true.
+      try {
+        if (clinicData.portalAiEnabled !== false) {
+          const [nextAppointment, membersSnap, historySnap, knowledgeSnap] = await Promise.all([
+            getPatientNextAppointment(clinicId, patientId),
+            adminDb.collection(`clinics/${clinicId}/members`).get(),
+            convoRef.collection("messages").orderBy("createdAt", "desc").limit(12).get(),
+            adminDb.collection(`clinics/${clinicId}/portal_ai_knowledge`).orderBy("createdAt", "desc").limit(40).get(),
+          ]);
+
+          const activeMembers = membersSnap.docs.map(d => d.data() as any).filter(m => m.active !== false);
+          const namesByRole = (roles: string[]) => activeMembers.filter(m => roles.includes(m.role)).map(m => m.name).filter(Boolean).join(", ");
+          const secretaryNames = namesByRole(["Secretária", "Recepção"]);
+          const financeNames = namesByRole(["Financeiro"]);
+          const doctorNames = namesByRole(["Dentista", "Médico"]);
+
+          const history = historySnap.docs.map(d => d.data() as any).reverse();
+          const transcript = history.map(m => `${m.sender === "patient" ? "Paciente" : m.sender === "staff" ? "Equipe" : "Eliza"}: ${m.text}`).join("\n");
+          const postOp = String(clinicData.portalAiPostOpInstructions || "").trim();
+
+          // Every real staff reply in the chat gets captured as a learned
+          // Q&A pair (see the "Aprovar"/reply flow in NextPortalActivity.tsx)
+          // — this is that memory. Reusing one verbatim without a human
+          // re-checking it is exactly what "peça autorização antes de
+          // enviar" ruled out, so the model is only allowed to treat these
+          // as a *suggestion* requiring approval, never an auto-send.
+          const knowledgeEntries = knowledgeSnap.docs.map(d => d.data() as any);
+          const knowledgeBlock = knowledgeEntries.length
+            ? knowledgeEntries.map((k, i) => `${i + 1}. Pergunta parecida: "${k.question}" → Resposta que a equipe deu: "${k.answer}"`).join("\n")
+            : "nenhuma resposta ensinada pela equipe ainda";
+
+          const prompt = `Você é a Eliza, assistente de atendimento do Portal do Paciente da clínica "${clinicData.name || "a clínica"}". Converse com o paciente de forma natural, calorosa e breve, como uma secretária atenciosa faria pelo WhatsApp — cumprimente, pergunte o motivo do contato quando não estiver claro, e mantenha o fio da conversa usando o histórico abaixo.
+
+O que você PODE fazer:
+- Bater papo, tirar dúvidas simples e dar boas-vindas.
+- Informar os dados reais de contato da clínica (endereço/telefone/whatsapp/e-mail) e a próxima consulta do paciente, listados abaixo.
+- Compartilhar SOMENTE as orientações pós-operatórias abaixo quando perguntarem sobre cuidados pós-procedimento — nunca invente instrução clínica além do que está escrito ali.
+- Direcionar o paciente para usar a opção "Solicitar horário" do próprio Portal quando ele quiser agendar.
+
+O que você NUNCA pode fazer:
+- Nunca informe, negocie ou estime valores/preços/orçamentos — se perguntarem, diga que vai encaminhar para a equipe.
+- Nunca confirme, marque ou remarque um horário você mesma.
+- Nunca invente diagnóstico, orientação clínica não listada abaixo, ou qualquer dado que não esteja nos blocos abaixo.
+- Nunca envie diretamente ao paciente uma resposta baseada nas "respostas ensinadas pela equipe" abaixo — mesmo que a pergunta atual seja muito parecida com uma delas, isso sempre precisa de aprovação humana antes (veja "suggestedReplyForApproval" abaixo).
+
+Quando o assunto for importante e precisar mesmo da equipe (dúvida clínica específica, reclamação, urgência, pedido de valores, ou algo fora do que você sabe responder), diga com naturalidade que já está encaminhando a mensagem para a secretária da clínica cuidar — isso é verdade, a equipe já foi avisada.
+
+Dados reais da clínica:
+- Endereço: ${clinicData.address || "não cadastrado"}
+- Telefone: ${clinicData.phone || "não cadastrado"}
+- WhatsApp: ${clinicData.whatsapp || "não cadastrado"}
+- E-mail: ${clinicData.email || "não cadastrado"}
+
+Próxima consulta deste paciente: ${nextAppointment ? `${nextAppointment.date} às ${nextAppointment.time || "horário não definido"}${nextAppointment.treatment ? ` (${nextAppointment.treatment})` : ""}` : "nenhuma consulta futura agendada"}
+
+Equipe real desta clínica (para saber a quem encaminhar; mencione pelo nome só se soar natural):
+- Secretária(s)/Recepção: ${secretaryNames || "não identificada no cadastro"}
+- Financeiro: ${financeNames || "não identificado no cadastro"}
+- Dentista(s)/Médico(s): ${doctorNames || "não identificado no cadastro"}
+
+Orientações pós-operatórias autorizadas pela clínica (use somente isto, nada além):
+${postOp || "nenhuma orientação cadastrada ainda pela clínica — se perguntarem, diga que vai confirmar com a equipe"}
+
+Respostas reais que a equipe já deu para perguntas de pacientes no passado (memória da Eliza — use só como referência de como responder, NUNCA envie direto ao paciente sem aprovação):
+${knowledgeBlock}
+
+Histórico recente da conversa (mais recente por último; a última linha "Paciente:" é a mensagem que você deve responder agora):
+${transcript}
+
+Responda ESTRITAMENTE em JSON válido, sem markdown, exatamente neste formato:
+{"reply": "sua resposta em português, curta e natural", "needsHumanAttention": true ou false, "suggestedReplyForApproval": "string vazia, ou uma resposta pronta baseada numa das perguntas ensinadas acima quando a pergunta atual for bem parecida com uma delas"}
+"needsHumanAttention" deve ser true quando o assunto realmente precisa de alguém da equipe (valores, agendamento, dúvida clínica específica, reclamação, urgência, ou quando você preencheu "suggestedReplyForApproval"). "reply" nesse caso é só a mensagem imediata avisando que vai confirmar — nunca o conteúdo de "suggestedReplyForApproval".`;
+
+          const aiResult = await generateElizaAIResponse({
+            taskType: "portal_message_autoreply",
+            contents: [{ role: "user", parts: [{ text: prompt }] }],
+            clinicId,
+          });
+          const rawText: string = aiResult?.text || "";
+          const jsonMatch = rawText.match(/\{[\s\S]*\}/);
+          let reply = "";
+          let needsHumanAttention = false;
+          let suggestedReplyForApproval = "";
+          if (jsonMatch) {
+            const parsed = JSON.parse(jsonMatch[0]);
+            reply = String(parsed.reply || "").trim();
+            needsHumanAttention = parsed.needsHumanAttention === true;
+            suggestedReplyForApproval = String(parsed.suggestedReplyForApproval || "").trim();
+          }
+          if (!reply) { reply = "Recebi sua mensagem! Já avisei nossa equipe e alguém vai te responder em breve."; needsHumanAttention = true; }
+
+          await convoRef.collection("messages").add({ text: reply, sender: "ai", createdAt: AdminFieldValue.serverTimestamp() });
+          await convoRef.set({
+            lastMessage: reply,
+            lastMessageAt: AdminFieldValue.serverTimestamp(),
+            lastMessageSender: "ai",
+            unreadByPatient: true,
+            // A learned answer never reaches the patient on its own — it
+            // waits here for a human to approve/reject from the thread
+            // panel (NextPortalActivity.tsx). Overwrites any older draft;
+            // only the latest question needs an answer.
+            ...(suggestedReplyForApproval ? { pendingAiDraft: { text: suggestedReplyForApproval, basedOnQuestion: text, createdAt: AdminFieldValue.serverTimestamp() } } : {}),
+          }, { merge: true });
+          if (needsHumanAttention) await pendingRef.update({ priority: "Alta" });
+        }
+      } catch (aiErr: any) {
+        console.error("[PATIENT_PORTAL_MESSAGE_AI_ERROR]", aiErr?.message || aiErr);
+        // The "always responds" promise still holds even if the AI call
+        // itself failed — a generic, non-invented acknowledgment, backed by
+        // the pending_item above which really was created either way.
+        try {
+          const fallback = "Recebi sua mensagem! Já avisei nossa equipe e alguém vai te responder em breve.";
+          await convoRef.collection("messages").add({ text: fallback, sender: "ai", createdAt: AdminFieldValue.serverTimestamp() });
+          await convoRef.set({ lastMessage: fallback, lastMessageAt: AdminFieldValue.serverTimestamp(), lastMessageSender: "ai", unreadByPatient: true }, { merge: true });
+        } catch { /* best-effort fallback only */ }
+      }
+
+      return res.json({ success: true });
+    } catch (err: any) {
+      console.error("[PATIENT_PORTAL_MESSAGE_POST_ERROR]", err);
+      return res.status(500).json({ success: false, error: "Erro ao enviar mensagem." });
+    }
+  });
+
+  app.post("/api/patient-portal/reviews", portalSessionLimiter, patientPortalAuth, async (req: any, res) => {
+    try {
+      const { clinicId, patientId } = req.patientPortal;
+      const { appointmentId, stars, comment } = req.body || {};
+      const starsNum = Number(stars);
+      if (!appointmentId || !starsNum || starsNum < 1 || starsNum > 5) {
+        return res.status(400).json({ success: false, error: "Selecione de 1 a 5 estrelas para um atendimento válido." });
+      }
+      const apptSnap = await adminDb.doc(`clinics/${clinicId}/appointments/${appointmentId}`).get();
+      if (!apptSnap.exists) return res.status(404).json({ success: false, error: "Atendimento não encontrado." });
+      const appt: any = apptSnap.data();
+      if (appt.patientId !== patientId) {
+        return res.status(403).json({ success: false, error: "Este atendimento não pertence a este paciente." });
+      }
+      if (appt.status !== "finalizado") {
+        return res.status(400).json({ success: false, error: "Só é possível avaliar atendimentos finalizados." });
+      }
+      const existingSnap = await adminDb.collection(`clinics/${clinicId}/patient_reviews`).where("appointmentId", "==", appointmentId).limit(1).get();
+      if (!existingSnap.empty) {
+        return res.status(409).json({ success: false, error: "Este atendimento já foi avaliado." });
+      }
+      await adminDb.collection(`clinics/${clinicId}/patient_reviews`).add({
+        patientId, clinicId, appointmentId,
+        professional: appt.dentistName || null,
+        stars: starsNum,
+        comment: (comment || "").trim() || null,
+        createdAt: AdminFieldValue.serverTimestamp(),
+      });
+      return res.json({ success: true });
+    } catch (err: any) {
+      console.error("[PATIENT_PORTAL_REVIEW_ERROR]", err);
+      return res.status(500).json({ success: false, error: "Erro ao enviar avaliação." });
+    }
+  });
+
+  // --- Staff-side: generate / revoke portal access ------------------------
+
+  app.post("/api/patient-portal/admin/generate-link", patientPortalStaffAuth, async (req: any, res) => {
+    try {
+      const { clinicId } = req.staffAuth;
+      const { patientId } = req.body || {};
+      if (!patientId) return res.status(400).json({ success: false, error: "patientId é obrigatório." });
+      const patientSnap = await adminDb.doc(`clinics/${clinicId}/patients/${patientId}`).get();
+      if (!patientSnap.exists) return res.status(404).json({ success: false, error: "Paciente não encontrado." });
+
+      const rawToken = portalGenerateToken();
+      await adminDb.collection("patient_portal_links").doc(portalHash(rawToken)).set({
+        clinicId, patientId, active: true,
+        createdBy: req.staffAuth.uid,
+        createdAt: AdminFieldValue.serverTimestamp(),
+      });
+      return res.json({ success: true, data: { token: rawToken } });
+    } catch (err: any) {
+      console.error("[PATIENT_PORTAL_GENERATE_LINK_ERROR]", err);
+      return res.status(500).json({ success: false, error: "Erro ao gerar link." });
+    }
+  });
+
+  app.post("/api/patient-portal/admin/revoke-access", patientPortalStaffAuth, async (req: any, res) => {
+    try {
+      const { clinicId } = req.staffAuth;
+      const { patientId } = req.body || {};
+      if (!patientId) return res.status(400).json({ success: false, error: "patientId é obrigatório." });
+      const [sessionsSnap, linksSnap] = await Promise.all([
+        adminDb.collection("patient_portal_sessions").where("clinicId", "==", clinicId).where("patientId", "==", patientId).get(),
+        adminDb.collection("patient_portal_links").where("clinicId", "==", clinicId).where("patientId", "==", patientId).get(),
+      ]);
+      const batch = adminDb.batch();
+      sessionsSnap.docs.forEach(d => batch.delete(d.ref));
+      linksSnap.docs.forEach(d => batch.update(d.ref, { active: false }));
+      await batch.commit();
+      return res.json({ success: true, data: { sessionsRevoked: sessionsSnap.size, linksRevoked: linksSnap.size } });
+    } catch (err: any) {
+      console.error("[PATIENT_PORTAL_REVOKE_ERROR]", err);
+      return res.status(500).json({ success: false, error: "Erro ao revogar acessos." });
+    }
+  });
+
+  // ==========================================================================
+  // Cadastro → Checkout (Asaas) + 4 modalidades comerciais
+  // ==========================================================================
+  // Every write to `signups/{uid}` and `clinics/{id}/billing/subscription`
+  // goes through here (Admin SDK) — firestore.rules blocks the client from
+  // writing either directly, on purpose (see the rules file comments): a
+  // clinic's own owner/admin must never be able to self-grant a paid status
+  // via the browser console.
+
+  async function checkoutAuth(req: any, res: any, next: any) {
+    try {
+      const authHeader = req.headers.authorization || "";
+      if (!authHeader.startsWith("Bearer ")) {
+        return res.status(401).json({ error: "Autenticação necessária." });
+      }
+      const decoded = await getAdminAuth().verifyIdToken(authHeader.substring(7));
+      req.checkoutAuth = { uid: decoded.uid, email: decoded.email || "", name: decoded.name || decoded.email?.split("@")[0] || "Cliente" };
+      next();
+    } catch (err: any) {
+      return res.status(401).json({ error: "Token inválido." });
+    }
+  }
+
+  app.post("/api/auth/send-verification-email", checkoutAuth, async (req: any, res) => {
+    try {
+      const { email, name } = req.checkoutAuth;
+      if (!email) return res.status(400).json({ error: "Conta sem e-mail." });
+      const link = await getAdminAuth().generateEmailVerificationLink(email, {
+        url: `${req.protocol}://${req.get("host")}/`,
+      });
+      await sendVerificationEmail(email, name, link);
+      return res.json({ success: true });
+    } catch (err: any) {
+      console.error("[CHECKOUT_SEND_VERIFICATION_ERROR]", err);
+      return res.status(500).json({ error: "Falha ao enviar e-mail de verificação." });
+    }
+  });
+
+  app.post("/api/checkout/create-session", checkoutAuth, async (req: any, res) => {
+    try {
+      const { uid, email, name } = req.checkoutAuth;
+      const { planId, phone, cpfCnpj } = req.body || {};
+      if (!planId || !phone || !cpfCnpj) {
+        return res.status(400).json({ error: "planId, phone e cpfCnpj são obrigatórios." });
+      }
+
+      const signupRef = adminDb.doc(`signups/${uid}`);
+      const existingSignup = (await signupRef.get()).data();
+
+      // Idempotent retry: a checkout session already in flight just gets
+      // re-returned, never re-created (avoids double-charging and
+      // double-claiming a founder slot on page refresh / back-button).
+      if (existingSignup?.status === "payment_processing" && existingSignup?.asaasCheckoutUrl) {
+        return res.json({ checkoutUrl: existingSignup.asaasCheckoutUrl });
+      }
+
+      const planSnap = await adminDb.doc(`platform_plans/${planId}`).get();
+      if (!planSnap.exists) return res.status(404).json({ error: "Plano não encontrado." });
+      const plan = planSnap.data() as any;
+      if (plan.salesEnabled === false) return res.status(400).json({ error: "Esta modalidade ainda não está disponível para venda." });
+
+      // Price decision is a plain read here — NOT the atomic slot claim.
+      // The slot is only actually consumed after the Asaas call below
+      // succeeds (see the transaction further down). Deciding the price
+      // this early (before calling Asaas, since Asaas needs a value) but
+      // deferring the counter increment until after success is what stops a
+      // failed/erroring Asaas call — bad CPF, network blip, missing API key
+      // during setup, anything — from silently burning a founder slot that
+      // never became a real subscription. This is exactly the bug a live
+      // test caught: an early version claimed the slot before calling Asaas
+      // and left it consumed on failure.
+      const nowMs = Date.now();
+      const promoRef = adminDb.doc("platform_config/founding_promo");
+      const promoSnap = await promoRef.get();
+      const promo = promoSnap.exists ? promoSnap.data() : null;
+      const tentativeFounderOffer = !!promo?.active && (promo!.slotsClaimed || 0) < (promo!.totalSlots || 0) && plan.founderPriceCents != null;
+      const contractedPriceCents = tentativeFounderOffer ? plan.founderPriceCents : plan.regularPriceCents;
+
+      await signupRef.set({
+        uid, name, email, phone, cpfCnpj,
+        authProvider: existingSignup?.authProvider || "unknown",
+        planRoleSelected: plan.planRole,
+        status: "pending_payment",
+        regularPriceCents: plan.regularPriceCents,
+        contractedPriceCents,
+        clinicId: existingSignup?.clinicId || null,
+        createdAt: existingSignup?.createdAt || AdminFieldValue.serverTimestamp(),
+        updatedAt: AdminFieldValue.serverTimestamp(),
+      }, { merge: true });
+
+      const customer = await findOrCreateAsaasCustomer({ name, email, cpfCnpj, phone, externalReference: uid });
+      const subscription = await createAsaasSubscription({
+        customerId: customer.id,
+        valueCents: contractedPriceCents,
+        description: `ELIZA — ${PLAN_ROLE_LABELS[plan.planRole as PlanRole] || plan.name}`,
+        externalReference: uid,
+      });
+
+      // Only now — after Asaas actually confirmed a real subscription at
+      // the founder price — does the slot get atomically claimed for real.
+      // Known residual edge case: if two requests tie for the exact last
+      // slot AND this one's Asaas call finishes first, the Asaas
+      // subscription was already created at the founder price by the time
+      // this transaction runs — if it then loses the re-check, the
+      // customer keeps the founder price (contractedPriceCents already
+      // sent to Asaas) but `founderOffer` here would read false. Rare
+      // (requires a true simultaneous tie), doesn't shortchange the
+      // customer, only risks the quota display being off by one in that
+      // exact scenario — acceptable trade-off vs. the alternative of
+      // burning a slot on every ordinary failure, which is the bug this
+      // whole restructure exists to fix.
+      let founderOffer = false;
+      let founderPosition: number | null = null;
+      if (tentativeFounderOffer) {
+        const claimResult = await adminDb.runTransaction(async (tx: any) => {
+          const freshPromoSnap = await tx.get(promoRef);
+          const freshPromo = freshPromoSnap.exists ? freshPromoSnap.data() : null;
+          const stillAvailable = !!freshPromo?.active && (freshPromo!.slotsClaimed || 0) < (freshPromo!.totalSlots || 0);
+          if (stillAvailable) {
+            tx.update(promoRef, { slotsClaimed: (freshPromo!.slotsClaimed || 0) + 1 });
+          }
+          return { claimed: stillAvailable, position: stillAvailable ? (freshPromo!.slotsClaimed || 0) + 1 : null };
+        });
+        founderOffer = claimResult.claimed;
+        founderPosition = claimResult.position;
+      }
+
+      await signupRef.update({
+        status: "payment_processing",
+        founderOffer,
+        founderPosition,
+        promotionalStartAt: founderOffer ? new Date(nowMs).toISOString() : null,
+        promotionalEndAt: founderOffer ? new Date(nowMs + 365 * 24 * 60 * 60 * 1000).toISOString() : null,
+        asaasCustomerId: customer.id,
+        asaasSubscriptionId: subscription.subscriptionId,
+        asaasCheckoutUrl: subscription.checkoutUrl,
+        updatedAt: AdminFieldValue.serverTimestamp(),
+      });
+
+      return res.json({ checkoutUrl: subscription.checkoutUrl });
+    } catch (err: any) {
+      console.error("[CHECKOUT_CREATE_SESSION_ERROR]", err);
+      return res.status(500).json({ error: err?.message || "Falha ao iniciar o pagamento." });
+    }
+  });
+
+  app.post("/api/asaas/webhook", express.json(), async (req, res) => {
+    try {
+      const token = req.headers["asaas-access-token"];
+      if (!token || token !== process.env.ASAAS_WEBHOOK_TOKEN) {
+        return res.status(403).json({ error: "Token de webhook inválido." });
+      }
+
+      const { event, payment } = req.body || {};
+      if (!payment?.id) return res.sendStatus(200);
+
+      // Idempotency: Asaas can redeliver the same event on timeout/retry —
+      // process a given payment id's confirmation exactly once.
+      const eventLogRef = adminDb.doc(`asaas_webhook_events/${payment.id}`);
+      const eventLogSnap = await eventLogRef.get();
+      if (eventLogSnap.exists && eventLogSnap.data()?.processed) {
+        return res.sendStatus(200);
+      }
+      await eventLogRef.set({ event, paymentId: payment.id, receivedAt: AdminFieldValue.serverTimestamp(), processed: false }, { merge: true });
+
+      const isConfirmed = event === "PAYMENT_CONFIRMED" || event === "PAYMENT_RECEIVED";
+      if (!isConfirmed || !payment.subscription) {
+        return res.sendStatus(200);
+      }
+
+      const signupsSnap = await adminDb.collection("signups").where("asaasSubscriptionId", "==", payment.subscription).limit(1).get();
+      if (signupsSnap.empty) {
+        console.warn("[ASAAS_WEBHOOK] No signup found for subscription:", payment.subscription);
+        return res.sendStatus(200);
+      }
+      const signupDoc = signupsSnap.docs[0];
+      const signup = signupDoc.data() as any;
+
+      await signupDoc.ref.update({ status: "paid", paidAt: AdminFieldValue.serverTimestamp(), updatedAt: AdminFieldValue.serverTimestamp() });
+      await eventLogRef.update({ processed: true });
+
+      try {
+        await sendPaymentConfirmationEmail(signup.email, signup.name, {
+          planLabel: PLAN_ROLE_LABELS[signup.planRoleSelected as PlanRole] || signup.planRoleSelected,
+          priceCents: signup.contractedPriceCents,
+          founderOffer: !!signup.founderOffer,
+        });
+      } catch (mailErr) {
+        console.error("[ASAAS_WEBHOOK] Failed to send confirmation e-mail:", mailErr);
+      }
+
+      return res.sendStatus(200);
+    } catch (err: any) {
+      console.error("[ASAAS_WEBHOOK_ERROR]", err);
+      return res.sendStatus(200); // never make Asaas retry-storm on our own bug
+    }
+  });
+
+  app.post("/api/onboarding/finalize-billing", checkoutAuth, async (req: any, res) => {
+    try {
+      const { uid } = req.checkoutAuth;
+      const { clinicId } = req.body || {};
+      if (!clinicId) return res.status(400).json({ error: "clinicId é obrigatório." });
+
+      const clinicSnap = await adminDb.doc(`clinics/${clinicId}`).get();
+      if (!clinicSnap.exists || clinicSnap.data()?.ownerId !== uid) {
+        return res.status(403).json({ error: "Você não é o proprietário desta clínica." });
+      }
+
+      const signupSnap = await adminDb.doc(`signups/${uid}`).get();
+      const signup = signupSnap.data() as any;
+      if (!signup || signup.status !== "paid") {
+        return res.status(400).json({ error: "Nenhum pagamento confirmado encontrado para este usuário." });
+      }
+
+      await adminDb.doc(`clinics/${clinicId}/billing/subscription`).set({
+        asaasCustomerId: signup.asaasCustomerId || null,
+        asaasSubscriptionId: signup.asaasSubscriptionId || null,
+        planRole: signup.planRoleSelected || null,
+        status: "active",
+        isFoundingClinic: !!signup.founderOffer,
+        foundingPromoEndsAt: signup.promotionalEndAt || null,
+        contractedPriceCents: signup.contractedPriceCents || null,
+        createdAt: AdminFieldValue.serverTimestamp(),
+        updatedAt: AdminFieldValue.serverTimestamp(),
+      });
+      await adminDb.doc(`signups/${uid}`).update({ clinicId, updatedAt: AdminFieldValue.serverTimestamp() });
+
+      return res.json({ success: true });
+    } catch (err: any) {
+      console.error("[FINALIZE_BILLING_ERROR]", err);
+      return res.status(500).json({ error: "Falha ao vincular assinatura à clínica." });
+    }
+  });
+
+  // Setting another user's password requires the Admin SDK — the client
+  // SDK's secondary-auth-app trick (used elsewhere for creating accounts)
+  // only works for account creation, never for updating an existing user's
+  // credentials. This is the one Super Admin write that genuinely needs a
+  // server endpoint rather than a direct client Firestore/Auth call.
+  const PLATFORM_SUPER_ADMIN_EMAILS = ["janioteixeiracd@gmail.com", "juninhoteixeiraofc@gmail.com"];
+  async function platformAdminAuth(req: any, res: any, next: any) {
+    try {
+      const authHeader = req.headers.authorization;
+      if (!authHeader?.startsWith("Bearer ")) return res.status(401).json({ error: "Token ausente." });
+      const decoded = await getAdminAuth().verifyIdToken(authHeader.substring(7));
+      const emailLower = (decoded.email || "").toLowerCase();
+      let isAdmin = PLATFORM_SUPER_ADMIN_EMAILS.includes(emailLower);
+      if (!isAdmin) {
+        const adminSnap = await adminDb.doc(`platform_admins/${decoded.uid}`).get();
+        isAdmin = adminSnap.exists && adminSnap.data()?.active === true;
+      }
+      if (!isAdmin) return res.status(403).json({ error: "Acesso restrito a administradores da plataforma." });
+      req.platformAdmin = { uid: decoded.uid, email: emailLower };
+      next();
+    } catch (err: any) {
+      return res.status(401).json({ error: "Token inválido." });
+    }
+  }
+
+  app.post("/api/admin/clinics/:clinicId/set-owner-password", platformAdminAuth, async (req: any, res) => {
+    try {
+      const { clinicId } = req.params;
+      const { newPassword } = req.body || {};
+      if (!newPassword || String(newPassword).length < 6) {
+        return res.status(400).json({ error: "A senha precisa ter pelo menos 6 caracteres." });
+      }
+      const clinicSnap = await adminDb.doc(`clinics/${clinicId}`).get();
+      if (!clinicSnap.exists) return res.status(404).json({ error: "Clínica não encontrada." });
+      const clinicData = clinicSnap.data() || {};
+      const ownerId = clinicData.ownerId;
+      if (!ownerId) return res.status(400).json({ error: "Esta clínica não tem um proprietário definido." });
+
+      await getAdminAuth().updateUser(ownerId, { password: String(newPassword) });
+
+      await adminDb.collection("platform_audit_logs").add({
+        adminId: req.platformAdmin.uid,
+        action: "[SUPER_ADMIN_OWNER_PASSWORD_RESET]",
+        targetId: clinicId,
+        targetType: "clinic",
+        details: { ownerId, performedByEmail: req.platformAdmin.email },
+        createdAt: AdminFieldValue.serverTimestamp(),
+      });
+
+      try {
+        const ownerRecord = await getAdminAuth().getUser(ownerId);
+        if (ownerRecord.email) {
+          await sendAdminPasswordChangedEmail(ownerRecord.email, ownerRecord.displayName || clinicData.ownerName || "Cliente", clinicData.name || "sua clínica");
+        }
+      } catch (mailErr) {
+        console.warn("[ADMIN_SET_OWNER_PASSWORD_MAIL_WARN]", mailErr);
+      }
+
+      return res.json({ success: true });
+    } catch (err: any) {
+      console.error("[ADMIN_SET_OWNER_PASSWORD_ERROR]", err);
+      return res.status(500).json({ error: err?.message || "Falha ao redefinir a senha." });
+    }
+  });
+
+  // Server-side (not the client secondary-auth-app trick used elsewhere)
+  // because this needs to look up an EXISTING Auth account by e-mail —
+  // something only the Admin SDK can do. Necessary because archiving a
+  // clinic (soft delete) never touches the owner's Auth account, so
+  // re-creating a clinic for someone who already has a login (e.g. lost
+  // access to their old clinic) must reuse that account, not collide with
+  // it via auth/email-already-in-use.
+  app.post("/api/admin/create-clinic", platformAdminAuth, async (req: any, res) => {
+    try {
+      const { name, ownerName, ownerEmail, phone, planId, status, password } = req.body || {};
+      if (!name || !ownerEmail || !password || String(password).length < 6) {
+        return res.status(400).json({ error: "Nome, e-mail e senha (mín. 6 caracteres) são obrigatórios." });
+      }
+      const emailLower = String(ownerEmail).toLowerCase();
+
+      let ownerId: string;
+      let reusedExistingAccount = false;
+      try {
+        const existing = await getAdminAuth().getUserByEmail(emailLower);
+        ownerId = existing.uid;
+        reusedExistingAccount = true;
+        await getAdminAuth().updateUser(ownerId, { password: String(password) });
+      } catch (lookupErr: any) {
+        if (lookupErr?.code !== "auth/user-not-found") throw lookupErr;
+        const created = await getAdminAuth().createUser({
+          email: emailLower,
+          password: String(password),
+          displayName: ownerName || undefined,
+        });
+        ownerId = created.uid;
+      }
+
+      const clinicRef = adminDb.collection("clinics").doc();
+      const clinicId = clinicRef.id;
+
+      await clinicRef.set({
+        name,
+        slug: String(name).toLowerCase().replace(/\s+/g, "-"),
+        ownerId,
+        ownerName: ownerName || "",
+        ownerEmail: emailLower,
+        phone: phone || "",
+        planId: planId || "",
+        status: status || "trial",
+        active: true,
+        createdAt: AdminFieldValue.serverTimestamp(),
+        updatedAt: AdminFieldValue.serverTimestamp(),
+      });
+
+      await clinicRef.collection("members").doc(ownerId).set({
+        uid: ownerId,
+        role: "owner",
+        active: true,
+        joinedAt: AdminFieldValue.serverTimestamp(),
+      });
+
+      await adminDb.doc(`users/${ownerId}`).set({
+        uid: ownerId,
+        email: emailLower,
+        name: ownerName || "",
+        defaultClinicId: clinicId,
+        updatedAt: AdminFieldValue.serverTimestamp(),
+      }, { merge: true });
+
+      await adminDb.doc(`platform_clinics/${clinicId}`).set({
+        name,
+        ownerEmail: emailLower,
+        planId: planId || "",
+        status: status || "trial",
+        createdAt: new Date().toISOString(),
+        updatedAt: AdminFieldValue.serverTimestamp(),
+      }, { merge: true });
+
+      await adminDb.collection("platform_audit_logs").add({
+        adminId: req.platformAdmin.uid,
+        action: reusedExistingAccount ? "[SUPER_ADMIN_CLINIC_CREATED_EXISTING_OWNER]" : "[SUPER_ADMIN_CLINIC_CREATED]",
+        targetId: clinicId,
+        targetType: "clinic",
+        details: { ownerEmail: emailLower, ownerId, reusedExistingAccount },
+        createdAt: AdminFieldValue.serverTimestamp(),
+      });
+
+      return res.json({ success: true, clinicId, uid: ownerId, reusedExistingAccount });
+    } catch (err: any) {
+      console.error("[ADMIN_CREATE_CLINIC_ERROR]", err);
+      const friendly = err?.code === "auth/invalid-email" ? "E-mail inválido." : (err?.message || "Falha ao criar clínica.");
+      return res.status(500).json({ error: friendly });
+    }
+  });
+
+  app.post("/api/admin/notify-clinic", platformAdminAuth, async (req: any, res) => {
+    try {
+      const { to, name, clinicName, type, planLabel } = req.body || {};
+      if (!to || !name || !clinicName || !type) {
+        return res.status(400).json({ error: "Campos obrigatórios ausentes." });
+      }
+      if (type === "created") {
+        await sendClinicCreatedEmail(to, name, clinicName);
+      } else if (type === "plan_changed") {
+        await sendPlanChangedEmail(to, name, clinicName, planLabel || "nova modalidade");
+      } else {
+        return res.status(400).json({ error: "Tipo de notificação desconhecido." });
+      }
+      return res.json({ success: true });
+    } catch (err: any) {
+      console.error("[ADMIN_NOTIFY_CLINIC_ERROR]", err);
+      return res.status(500).json({ error: err?.message || "Falha ao enviar notificação." });
+    }
+  });
+
+  console.log("[ELIZA] Platform Admin routes initialized (/api/admin/*)");
+
+  console.log("[ELIZA] Checkout/Asaas routes initialized (/api/checkout/*, /api/asaas/webhook)");
+
+  console.log("[ELIZA] Patient Portal routes initialized (/api/patient-portal/*)");
+
   // Serve static assets or mount Vite dev server
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
@@ -3440,8 +7584,35 @@ Versão polida por ELIZA:`,
     app.use(vite.middlewares);
   } else {
     const distPath = path.join(process.cwd(), 'dist');
-    app.use(express.static(distPath));
+    app.use(express.static(distPath, {
+      setHeaders: (res, filePath) => {
+        // Vite content-hashes everything under /assets/ (the filename
+        // changes whenever the content does), so it's safe to tell every
+        // layer (browser, CDN, the service worker) to cache it forever.
+        if (filePath.includes(`${path.sep}assets${path.sep}`)) {
+          res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+          return;
+        }
+        // sw.js, manifest.json and index.html drive the PWA's update
+        // detection — the browser re-checks sw.js on every navigation by
+        // byte-comparing it, and a stale cached copy (from an aggressive
+        // CDN/proxy cache) would silently block updates from ever being
+        // noticed. Same risk for manifest.json/index.html referencing a
+        // stale icon or stale bundle path after a deploy.
+        const base = path.basename(filePath);
+        if (base === 'sw.js' || base === 'manifest.json' || base === 'index.html' || base === 'offline.html') {
+          res.setHeader('Cache-Control', 'no-cache');
+          return;
+        }
+        // Everything else static (brand assets, icons, splash screens):
+        // moderate cache, revalidated daily — these rarely change, but
+        // aren't content-hashed, so "immutable" would be unsafe if the
+        // source art is ever swapped without renaming the file.
+        res.setHeader('Cache-Control', 'public, max-age=86400');
+      },
+    }));
     app.get('*', (req, res) => {
+      res.setHeader('Cache-Control', 'no-cache');
       res.sendFile(path.join(distPath, 'index.html'));
     });
   }

@@ -54,7 +54,16 @@
       "PowerShell(npx --version)",
       "PowerShell(npm list -g firebase-tools --depth=0 2>&1)",
       "Bash(npx --yes firebase-tools emulators:start --only firestore,auth)",
-      "Bash(FIRESTORE_EMULATOR_HOST=127.0.0.1:8080 FIREBASE_AUTH_EMULATOR_HOST=127.0.0.1:9099 node scripts/seedEmulator.mjs)"
+      "Bash(FIRESTORE_EMULATOR_HOST=127.0.0.1:8080 FIREBASE_AUTH_EMULATOR_HOST=127.0.0.1:9099 node scripts/seedEmulator.mjs)",
+      "Bash(npm run *)",
+      "Bash(export CLOUDSDK_PYTHON=\"C:/Users/ACER/AppData/Local/Google/Cloud SDK/google-cloud-sdk/platform/bundledpython/python.exe\")",
+      "Bash(gcloud run *)",
+      "Bash(echo \"EXIT:$?\")",
+      "Bash(npx firebase *)",
+      "Bash(npx --yes firebase-tools --version)",
+      "Bash(npx --yes firebase-tools emulators:start --only firestore --project elisa-494703-test)",
+      "Bash(echo \"started with pid $!\")",
+      "Bash(node -e \"const p=require\\('./package.json'\\); console.log\\(JSON.stringify\\(p.scripts,null,2\\)\\)\")"
     ]
   }
 }

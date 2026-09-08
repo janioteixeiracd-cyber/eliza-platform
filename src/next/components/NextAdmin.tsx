@@ -4,15 +4,19 @@ import {
   Settings2, Building2, Users, UserCog, FileText, Wand2, Camera,
   Loader2, Save, Upload, Trash2, Check, X, AlertTriangle, ShieldAlert,
   Plus, Eye, EyeOff, Sparkles, RefreshCw, Lock, Landmark, GraduationCap, Pencil,
-  Smartphone, CheckCircle2, XCircle, Copy, Send
+  Smartphone, CheckCircle2, XCircle, Copy, Send, Stethoscope, Clock
 } from 'lucide-react';
 import { useAuth } from '../../contexts/AuthContext';
 import { useNextReadOnly } from '../context/NextReadOnlyContext';
-import { secureGetDocs, secureGetDoc } from '../services/next-db';
+import { secureGetDocs } from '../services/next-db';
 import { collection, query, doc as fsDoc, setDoc, updateDoc, deleteDoc, addDoc, orderBy, limit, serverTimestamp } from 'firebase/firestore';
 import { db } from '../../lib/firebase';
 import { getGenAI } from '../../lib/gemini';
 import { InviteService } from '../../services/inviteService';
+import { WhatsAppEmbeddedSignupButton } from './WhatsAppEmbeddedSignupButton';
+import { isClinicOwnerOrAdmin } from '../../lib/clinicRole';
+import NextTreatmentCatalogAdmin from './NextTreatmentCatalogAdmin';
+import NextProcedureCatalogAdmin from './NextProcedureCatalogAdmin';
 
 interface MemberPermissionFlags {
   accessFinancial: boolean;
@@ -47,7 +51,13 @@ const PERMISSION_FIELDS: { key: keyof MemberPermissionFlags; label: string; desc
 ];
 
 const COURSE_ROLE_OPTIONS = [
-  { value: 'administrador', label: 'Administrador do Curso' },
+  // 'admin_curso' is the exact value firestore.rules' isAdminCurso() checks
+  // for — this used to be the (never-matching) string 'administrador', which
+  // meant choosing "Administrador do Curso" here silently never granted the
+  // admin_curso permission it promised. Fixed as part of building the
+  // equivalent professor/monitor creation flow inside Eliza Academy, which
+  // relies on this same convention.
+  { value: 'admin_curso', label: 'Administrador do Curso' },
   { value: 'professor', label: 'Professor / Orientador' },
   { value: 'auxiliar', label: 'Auxiliar / Monitor' },
   { value: 'somente_visualizacao', label: 'Somente Visualização' },
@@ -58,7 +68,7 @@ const DEFAULT_PERMISSIONS: MemberPermissionFlags = {
   accessInventory: true, accessSettings: false, accessReports: true, accessCourses: false,
 };
 
-type AdminTab = 'clinica' | 'equipe' | 'documentos' | 'identidade_ia' | 'integracoes';
+export type AdminTab = 'clinica' | 'equipe' | 'catalogo' | 'documentos' | 'identidade_ia' | 'integracoes';
 
 interface ExtractedClinicFields {
   name?: string;
@@ -86,33 +96,41 @@ const ROLE_OPTIONS = ['Dentista', 'Médico', 'Secretária', 'Financeiro', 'Marke
 
 const TWILIO_SANDBOX_NUMBER = '+14155238886';
 
-// Real security token sent to Meta's webhook config — uses the Web Crypto
-// API (cryptographically secure) rather than Math.random(), which is not
-// suitable for anything security-relevant.
-function generateVerifyToken(): string {
-  return crypto.randomUUID().replace(/-/g, '').slice(0, 12).toUpperCase();
-}
-
 // A real Firebase Auth account is created with this password — must not be
 // a fixed, guessable default shared by every new team member.
 function generateTempPassword(): string {
   return `Eliza${crypto.randomUUID().replace(/-/g, '').slice(0, 10)}`;
 }
 
+const WEEKDAYS: { key: string; label: string }[] = [
+  { key: 'seg', label: 'Segunda' }, { key: 'ter', label: 'Terça' }, { key: 'qua', label: 'Quarta' },
+  { key: 'qui', label: 'Quinta' }, { key: 'sex', label: 'Sexta' }, { key: 'sab', label: 'Sábado' }, { key: 'dom', label: 'Domingo' },
+];
+const DEFAULT_BUSINESS_HOURS: Record<string, { enabled: boolean; start: string; end: string }> = {
+  seg: { enabled: true, start: '08:00', end: '19:00' },
+  ter: { enabled: true, start: '08:00', end: '19:00' },
+  qua: { enabled: true, start: '08:00', end: '19:00' },
+  qui: { enabled: true, start: '08:00', end: '19:00' },
+  sex: { enabled: true, start: '08:00', end: '19:00' },
+  sab: { enabled: false, start: '08:00', end: '12:00' },
+  dom: { enabled: false, start: '08:00', end: '12:00' },
+};
+
 const TABS: { id: AdminTab; label: string; icon: any }[] = [
   { id: 'clinica', label: 'Clínica', icon: Building2 },
   { id: 'equipe', label: 'Equipe', icon: Users },
+  { id: 'catalogo', label: 'Catálogo', icon: Stethoscope },
   { id: 'documentos', label: 'Documentos', icon: FileText },
   { id: 'identidade_ia', label: 'Identidade com IA', icon: Wand2 },
   { id: 'integracoes', label: 'WhatsApp', icon: Smartphone },
 ];
 
-export default function NextAdmin() {
+export default function NextAdmin({ initialTab }: { initialTab?: AdminTab } = {}) {
   const { clinic, user, profile } = useAuth();
   const { addAuditLog } = useNextReadOnly();
-  const isAdmin = profile?.role === 'admin' || profile?.role === 'owner' || clinic?.ownerId === user?.uid;
+  const isAdmin = isClinicOwnerOrAdmin({ profileRole: profile?.role, clinicOwnerId: clinic?.ownerId, userId: user?.uid });
 
-  const [activeTab, setActiveTab] = useState<AdminTab>('clinica');
+  const [activeTab, setActiveTab] = useState<AdminTab>(initialTab || 'clinica');
   const [message, setMessage] = useState<string | null>(null);
   const showMessage = (msg: string) => { setMessage(msg); setTimeout(() => setMessage(null), 4500); };
 
@@ -122,6 +140,18 @@ export default function NextAdmin() {
   const [savingAcademyToggle, setSavingAcademyToggle] = useState(false);
   const logoInputRef = useRef<HTMLInputElement>(null);
   const [uploadingLogo, setUploadingLogo] = useState(false);
+
+  // --- Assistente IA do Portal do Paciente -----------------------------
+  const [portalAiForm, setPortalAiForm] = useState({ enabled: true, postOpInstructions: '' });
+  const [savingPortalAi, setSavingPortalAi] = useState(false);
+
+  // --- Horário de Funcionamento -----------------------------------------
+  // Novo no Next — o bloco parecido no app legado (SettingsView.tsx) nunca
+  // foi ligado a lugar nenhum (defaultValue sem value/onChange, nunca
+  // salvava). Sem configuração aqui, a Agenda usa um padrão razoável
+  // (08:00-19:00 todo dia) — nunca trava o uso por falta de configuração.
+  const [businessHours, setBusinessHours] = useState<Record<string, { enabled: boolean; start: string; end: string }>>(DEFAULT_BUSINESS_HOURS);
+  const [savingBusinessHours, setSavingBusinessHours] = useState(false);
 
   // --- Documentos -----------------------------------------------------
   const [docsForm, setDocsForm] = useState({ technicalDirectorCouncilNumber: '', documentName: '', institutionalFooter: '', textSignature: '', defaultObservationText: '' });
@@ -134,6 +164,11 @@ export default function NextAdmin() {
       phone: clinic.phone || '', whatsapp: clinic.whatsapp || '', email: clinic.email || '',
       address: clinic.address || '', logoBase64: clinic.logoBase64 || '', academyEnabled: !!clinic.academyEnabled,
     });
+    setPortalAiForm({
+      enabled: clinic.portalAiEnabled !== false,
+      postOpInstructions: clinic.portalAiPostOpInstructions || '',
+    });
+    setBusinessHours({ ...DEFAULT_BUSINESS_HOURS, ...(clinic.businessHours || {}) });
     setDocsForm({
       technicalDirectorCouncilNumber: clinic.technicalDirectorCouncilNumber || '', documentName: clinic.documentName || '',
       institutionalFooter: clinic.institutionalFooter || '', textSignature: clinic.textSignature || '',
@@ -157,6 +192,38 @@ export default function NextAdmin() {
       showMessage(`Falha ao gravar: ${err?.message || err}`);
     } finally {
       setSavingClinic(false);
+    }
+  };
+
+  const handleSavePortalAi = async () => {
+    if (!clinic?.id) return;
+    setSavingPortalAi(true);
+    try {
+      await setDoc(fsDoc(db, 'clinics', clinic.id), {
+        portalAiEnabled: portalAiForm.enabled,
+        portalAiPostOpInstructions: portalAiForm.postOpInstructions.trim() || null,
+        updatedAt: serverTimestamp(),
+      }, { merge: true });
+      addAuditLog({ collection: 'clinics', action: 'WRITE', status: 'SUCCESS', details: 'Configuração da IA do Portal do Paciente atualizada (escrita real).' });
+      showMessage('Configuração da IA do Portal salva de verdade.');
+    } catch (err: any) {
+      showMessage(`Falha ao gravar: ${err?.message || err}`);
+    } finally {
+      setSavingPortalAi(false);
+    }
+  };
+
+  const handleSaveBusinessHours = async () => {
+    if (!clinic?.id) return;
+    setSavingBusinessHours(true);
+    try {
+      await setDoc(fsDoc(db, 'clinics', clinic.id), { businessHours, updatedAt: serverTimestamp() }, { merge: true });
+      addAuditLog({ collection: 'clinics', action: 'WRITE', status: 'SUCCESS', details: 'Horário de funcionamento da clínica atualizado (escrita real).' });
+      showMessage('Horário de funcionamento salvo de verdade.');
+    } catch (err: any) {
+      showMessage(`Falha ao gravar: ${err?.message || err}`);
+    } finally {
+      setSavingBusinessHours(false);
     }
   };
 
@@ -366,7 +433,6 @@ export default function NextAdmin() {
   const [waWabaId, setWaWabaId] = useState('');
   const [waBusinessName, setWaBusinessName] = useState('');
   const [waDisplayPhoneNumber, setWaDisplayPhoneNumber] = useState('');
-  const [waVerifyToken, setWaVerifyToken] = useState('');
   const [waAccessToken, setWaAccessToken] = useState('');
   const [waTwilioAccountSid, setWaTwilioAccountSid] = useState('');
   const [waTwilioAuthToken, setWaTwilioAuthToken] = useState('');
@@ -383,38 +449,53 @@ export default function NextAdmin() {
 
   const waWebhookUrl = (typeof window !== 'undefined' ? window.location.origin : '') + '/api/whatsapp/webhook';
 
+  // Rodada final de fechamento — nenhum setDoc/deleteDoc direto pra
+  // configuração do WhatsApp: só Admin SDK, via /api/whatsapp/manual-*
+  // (authenticateOwnerOrAdmin no backend, mesmo helper do Embedded
+  // Signup). Este componente inteiro só monta pra quem já passou no gate
+  // `isAdmin` (owner||admin) mais abaixo, mas o endpoint reforça o mesmo
+  // gate no servidor — nunca confia só na UI.
+  async function whatsappManualFetch(path: string, method: 'GET' | 'POST', body?: Record<string, any>): Promise<{ status: number; body: any }> {
+    if (!user || !clinic?.id) throw new Error('session_not_loaded');
+    const idToken = await user.getIdToken();
+    const url = method === 'GET' ? `${path}?clinicId=${encodeURIComponent(clinic.id)}` : path;
+    const response = await fetch(url, {
+      method,
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${idToken}`,
+      },
+      ...(method === 'POST' ? { body: JSON.stringify({ clinicId: clinic.id, ...(body || {}) }) } : {}),
+    });
+    let json: any = null;
+    try { json = await response.json(); } catch { /* corpo vazio/não-JSON */ }
+    return { status: response.status, body: json || {} };
+  }
+
   const fetchWhatsAppConfig = async () => {
     if (!clinic?.id) return;
     setWaLoading(true);
     try {
-      const integrationSnap = await secureGetDoc(fsDoc(db, 'clinics', clinic.id, 'integrations', 'whatsapp'), { addAuditLog });
-      if (integrationSnap.exists()) {
-        const data: any = integrationSnap.data();
+      const { status, body: data } = await whatsappManualFetch('/api/whatsapp/manual-config', 'GET');
+      if (status === 200) {
         setWaStatus(data.status || 'não conectado');
         setWaProvider(data.provider === 'twilio' ? 'twilio' : 'meta');
         setWaPhoneNumberId(data.phoneNumberId || '');
         setWaWabaId(data.wabaId || '');
         setWaBusinessName(data.businessName || '');
         setWaDisplayPhoneNumber(data.displayPhoneNumber || '');
-        setWaVerifyToken(data.verifyToken || '');
-        setWaAccessToken(data.accessTokenSecretName ? '••••••••••••••••••••••••••••••••' : '');
+        setWaAccessToken(data.hasAccessToken ? '••••••••••••••••••••••••••••••••' : '');
         setWaTwilioAccountSid(data.twilioAccountSid || '');
-        setWaTwilioAuthToken(data.twilioAuthToken ? '••••••••••••••••••••••••••••••••' : '');
+        setWaTwilioAuthToken(data.hasTwilioAuthToken ? '••••••••••••••••••••••••••••••••' : '');
         setWaTwilioWhatsAppNumber(data.twilioWhatsAppNumber || TWILIO_SANDBOX_NUMBER);
         setWaAiEnabled(data.aiEnabled !== false);
         setWaHumanApprovalRequired(data.humanApprovalRequired !== false);
-      } else {
-        setWaStatus('não conectado');
-        setWaVerifyToken(generateVerifyToken());
-      }
-
-      const configSnap = await secureGetDoc(fsDoc(db, 'clinics', clinic.id, 'whatsapp_settings', 'config'), { addAuditLog });
-      if (configSnap.exists()) {
-        const data: any = configSnap.data();
         setWaApiNumber(data.apiNumber || '');
         setWaLegacyClinicNumber(data.legacyClinicNumber || '');
         setWaDefaultSendMode(data.defaultSendMode || 'eliza_api');
         setWaAllowOpenExternalWhatsApp(data.allowOpenExternalWhatsApp !== false);
+      } else {
+        console.warn('Failed to load WhatsApp integration config:', data?.error || status);
       }
 
       const logsSnap = await secureGetDocs(
@@ -437,61 +518,26 @@ export default function NextAdmin() {
     setWaSaving(true);
     setWaTestResult(null);
     try {
-      const integrationRef = fsDoc(db, 'clinics', clinic.id, 'integrations', 'whatsapp');
-
-      let tokenToSave = waAccessToken;
-      const isMasked = waAccessToken.includes('••••');
-      let twilioTokenToSave = waTwilioAuthToken;
-      const isTwilioTokenMasked = waTwilioAuthToken.includes('••••');
-
-      let existingData: any = {};
-      if (isMasked || isTwilioTokenMasked) {
-        const snap = await secureGetDoc(integrationRef, { addAuditLog });
-        existingData = snap.data() || {};
-        if (isMasked) tokenToSave = existingData.accessTokenSecretName || '';
-        if (isTwilioTokenMasked) twilioTokenToSave = existingData.twilioAuthToken || '';
-      }
-
-      const isConnected = waProvider === 'twilio'
-        ? !!(waTwilioAccountSid && twilioTokenToSave && waTwilioWhatsAppNumber)
-        : !!(waPhoneNumberId && waWabaId && tokenToSave);
-
-      const payload: any = {
-        status: isConnected ? 'conectado' : 'não conectado',
+      const { status, body: resBody } = await whatsappManualFetch('/api/whatsapp/manual-config', 'POST', {
         provider: waProvider,
         phoneNumberId: waPhoneNumberId,
         wabaId: waWabaId,
         businessName: waBusinessName,
         displayPhoneNumber: waDisplayPhoneNumber,
-        verifyToken: waVerifyToken,
-        accessTokenSecretName: tokenToSave,
+        accessToken: waAccessToken,
         twilioAccountSid: waTwilioAccountSid,
-        twilioAuthToken: twilioTokenToSave,
+        twilioAuthToken: waTwilioAuthToken,
         twilioWhatsAppNumber: waTwilioWhatsAppNumber,
         aiEnabled: waAiEnabled,
         humanApprovalRequired: waHumanApprovalRequired,
-        webhookUrl: waWebhookUrl,
-        updatedAt: serverTimestamp(),
-      };
-      if (!existingData.createdAt) payload.createdAt = serverTimestamp();
-
-      await setDoc(integrationRef, payload, { merge: true });
-
-      await setDoc(fsDoc(db, 'clinics', clinic.id, 'whatsapp_settings', 'config'), {
         apiNumber: waApiNumber,
         legacyClinicNumber: waLegacyClinicNumber,
         defaultSendMode: waDefaultSendMode,
         allowOpenExternalWhatsApp: waAllowOpenExternalWhatsApp,
-        updatedAt: serverTimestamp(),
-      }, { merge: true });
-
-      await addDoc(collection(db, 'clinics', clinic.id, 'integration_logs'), {
-        type: 'whatsapp', action: 'save_config', status: 'success',
-        message: 'Configurações de integração atualizadas e salvas pela equipe.',
-        createdAt: serverTimestamp(),
       });
+      if (status !== 200) throw new Error(resBody?.error || `http_${status}`);
 
-      addAuditLog({ collection: 'integrations', action: 'WRITE', status: 'SUCCESS', details: `Integração WhatsApp (${waProvider === 'twilio' ? 'Twilio' : 'Meta'}) salva (escrita real).` });
+      addAuditLog({ collection: 'integrations', action: 'WRITE', status: 'SUCCESS', details: `Integração WhatsApp (${waProvider === 'twilio' ? 'Twilio' : 'Meta'}) salva via /api/whatsapp/manual-config.` });
       showMessage('Configurações de WhatsApp salvas de verdade.');
       await fetchWhatsAppConfig();
     } catch (err: any) {
@@ -506,19 +552,15 @@ export default function NextAdmin() {
     setWaSaving(true);
     setWaTestResult(null);
     try {
-      await deleteDoc(fsDoc(db, 'clinics', clinic.id, 'integrations', 'whatsapp'));
+      const { status, body: resBody } = await whatsappManualFetch('/api/whatsapp/manual-disconnect', 'POST');
+      if (status !== 200) throw new Error(resBody?.error || `http_${status}`);
+
       setWaPhoneNumberId(''); setWaWabaId(''); setWaBusinessName(''); setWaDisplayPhoneNumber('');
       setWaAccessToken(''); setWaTwilioAccountSid(''); setWaTwilioAuthToken('');
       setWaTwilioWhatsAppNumber(TWILIO_SANDBOX_NUMBER);
-      setWaVerifyToken(generateVerifyToken());
       setWaStatus('não conectado');
 
-      await addDoc(collection(db, 'clinics', clinic.id, 'integration_logs'), {
-        type: 'whatsapp', action: 'disconnect', status: 'success',
-        message: 'A integração com WhatsApp foi desativada e desconectada manualmente.',
-        createdAt: serverTimestamp(),
-      });
-      addAuditLog({ collection: 'integrations', action: 'WRITE', status: 'SUCCESS', details: 'Integração WhatsApp desconectada (escrita real).' });
+      addAuditLog({ collection: 'integrations', action: 'WRITE', status: 'SUCCESS', details: 'Integração WhatsApp desconectada via /api/whatsapp/manual-disconnect.' });
       showMessage('Integração de WhatsApp desconectada.');
       await fetchWhatsAppConfig();
     } catch (err: any) {
@@ -776,6 +818,88 @@ Deixe o campo como string vazia "" quando a informação não estiver legível o
       )}
 
       {activeTab === 'clinica' && (
+        <div className="next-glass-panel rounded-next-2xl p-5 space-y-3">
+          <div className="flex items-center gap-3">
+            <div className="w-10 h-10 rounded-xl bg-next-purple-neon/15 border border-next-purple-neon/25 flex items-center justify-center flex-shrink-0">
+              <Clock className="w-5 h-5 text-next-purple-light" />
+            </div>
+            <div>
+              <p className="text-xs font-bold text-slate-200">Horário de Funcionamento</p>
+              <p className="text-[11px] text-slate-500 mt-0.5">Usado pela Agenda pra calcular os horários realmente livres ao criar um agendamento. Sem configurar, ela assume 08:00-19:00 todo dia.</p>
+            </div>
+          </div>
+          <div className="space-y-1.5">
+            {WEEKDAYS.map(({ key, label }) => {
+              const day = businessHours[key] || DEFAULT_BUSINESS_HOURS[key];
+              return (
+                <div key={key} className="flex items-center gap-3 bg-slate-900/40 border border-next-border rounded-lg p-2.5">
+                  <button
+                    type="button"
+                    onClick={() => setBusinessHours(v => ({ ...v, [key]: { ...day, enabled: !day.enabled } }))}
+                    className={`relative w-9 h-5 rounded-full flex-shrink-0 transition-colors ${day.enabled ? 'next-brand-gradient-bg' : 'bg-slate-800 border border-next-border'}`}
+                  >
+                    <span className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-transform ${day.enabled ? 'translate-x-4' : 'translate-x-0.5'}`} />
+                  </button>
+                  <span className="text-[11px] font-bold text-slate-300 w-16 flex-shrink-0">{label}</span>
+                  {day.enabled ? (
+                    <div className="flex items-center gap-2 flex-1">
+                      <input type="time" value={day.start} onChange={(e) => setBusinessHours(v => ({ ...v, [key]: { ...day, start: e.target.value } }))} className="bg-slate-950 border border-next-border rounded-lg text-[11px] text-slate-200 px-2 py-1.5" />
+                      <span className="text-slate-600 text-[10px]">até</span>
+                      <input type="time" value={day.end} onChange={(e) => setBusinessHours(v => ({ ...v, [key]: { ...day, end: e.target.value } }))} className="bg-slate-950 border border-next-border rounded-lg text-[11px] text-slate-200 px-2 py-1.5" />
+                    </div>
+                  ) : (
+                    <span className="text-[10.5px] text-slate-600 flex-1">Fechado</span>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+          <button onClick={handleSaveBusinessHours} disabled={savingBusinessHours} className="inline-flex items-center gap-2 px-3.5 py-2.5 next-brand-gradient-bg text-white font-bold text-xs rounded-xl shadow-next-glow-purple disabled:opacity-60" style={{ minHeight: '40px' }}>
+            {savingBusinessHours ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-3.5 h-3.5" />}
+            <span>{savingBusinessHours ? 'Gravando...' : 'Salvar horário de funcionamento'}</span>
+          </button>
+        </div>
+      )}
+
+      {activeTab === 'clinica' && (
+        <div className="next-glass-panel rounded-next-2xl p-5 space-y-4">
+          <div className="flex items-start justify-between gap-4">
+            <div className="flex items-start gap-3">
+              <div className="w-10 h-10 rounded-xl bg-next-purple-neon/15 border border-next-purple-neon/25 flex items-center justify-center flex-shrink-0">
+                <Smartphone className="w-5 h-5 text-next-purple-light" />
+              </div>
+              <div>
+                <p className="text-xs font-bold text-slate-200">Assistente IA do Portal do Paciente</p>
+                <p className="text-[11px] text-slate-500 mt-0.5">A Eliza conversa com o paciente no chat do Portal em tempo real — cumprimenta, pergunta o motivo do contato, responde dados reais da clínica e as orientações abaixo. Nunca fala de valores/orçamento nem confirma horário sozinha; quando o assunto exige a equipe, ela avisa o paciente que está encaminhando a mensagem.</p>
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={() => setPortalAiForm(v => ({ ...v, enabled: !v.enabled }))}
+              className={`relative w-12 h-7 rounded-full flex-shrink-0 transition-colors ${portalAiForm.enabled ? 'next-brand-gradient-bg' : 'bg-slate-800 border border-next-border'}`}
+            >
+              <span className={`absolute top-1 w-5 h-5 rounded-full bg-white transition-transform ${portalAiForm.enabled ? 'translate-x-6' : 'translate-x-1'}`} />
+            </button>
+          </div>
+          <div>
+            <label className="text-[10px] font-mono text-slate-500 uppercase">Orientações pós-operatórias que a IA pode compartilhar</label>
+            <textarea
+              value={portalAiForm.postOpInstructions}
+              onChange={(e) => setPortalAiForm(v => ({ ...v, postOpInstructions: e.target.value }))}
+              rows={5}
+              placeholder="Ex: Após aplicação de toxina botulínica, evite deitar-se ou fazer exercícios físicos nas primeiras 4 horas. Após preenchimento labial, aplique gelo local nas primeiras 24h..."
+              className="w-full bg-slate-900 border border-next-border rounded-lg text-xs text-slate-200 px-3 py-2.5 mt-1"
+            />
+            <p className="text-[10px] text-slate-600 mt-1">A IA só compartilha o que estiver escrito aqui — não inventa orientação clínica nenhuma. Deixe em branco se ainda não quiser que ela responda sobre pós-operatório.</p>
+          </div>
+          <button onClick={handleSavePortalAi} disabled={savingPortalAi} className="inline-flex items-center gap-2 px-3.5 py-2.5 next-brand-gradient-bg text-white font-bold text-xs rounded-xl shadow-next-glow-purple disabled:opacity-60" style={{ minHeight: '40px' }}>
+            {savingPortalAi ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-3.5 h-3.5" />}
+            <span>{savingPortalAi ? 'Gravando...' : 'Salvar configuração da IA do Portal'}</span>
+          </button>
+        </div>
+      )}
+
+      {activeTab === 'clinica' && (
         <div className="next-glass-panel rounded-next-2xl p-5">
           <label className="flex items-center justify-between gap-4 cursor-pointer">
             <div className="flex items-start gap-3">
@@ -864,6 +988,14 @@ Deixe o campo como string vazia "" quando a informação não estiver legível o
               <p className="text-[10px] text-slate-500">Compartilhe com o profissional agora — esta senha não fica salva em texto simples em nenhum outro lugar do sistema.</p>
             </div>
           )}
+        </div>
+      )}
+
+      {/* CATÁLOGO DE TRATAMENTOS (Orçamento) + CATÁLOGO DE PROCEDIMENTOS (Planejamento IA) */}
+      {activeTab === 'catalogo' && (
+        <div className="space-y-4">
+          <NextTreatmentCatalogAdmin />
+          <NextProcedureCatalogAdmin />
         </div>
       )}
 
@@ -1001,6 +1133,14 @@ Deixe o campo como string vazia "" quando a informação não estiver legível o
             </div>
             <p className="text-[11px] text-slate-500 -mt-2">Conecte via Meta WhatsApp Cloud API ou via Twilio (Sandbox ou número aprovado) para enviar e receber mensagens reais de pacientes.</p>
 
+            {/* Embedded Signup (Coexistence) — método oficial recomendado.
+                Renderizado FORA do bloco waLoading/form de propósito: o
+                badge de status acima e este bloco nunca dependem do
+                estado de uma tentativa nova em andamento — a integração
+                ativa continua visível o tempo todo, mesmo enquanto
+                preparing/awaiting_meta/connecting rodam aqui embaixo. */}
+            <WhatsAppEmbeddedSignupButton canConnect={isAdmin} onConnected={fetchWhatsAppConfig} />
+
             {waLoading ? (
               <div className="flex justify-center py-8"><Loader2 className="w-5 h-5 animate-spin text-next-purple-neon" /></div>
             ) : (
@@ -1062,12 +1202,9 @@ Deixe o campo como string vazia "" quando a informação não estiver legível o
                 )}
 
                 {waProvider === 'meta' ? (
-                  <div className="bg-slate-900/60 border border-next-border rounded-xl p-3 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-                    <div>
-                      <span className="text-[10px] font-mono text-slate-500 uppercase block">Segurança do Webhook (Verify Token)</span>
-                      <span className="font-mono text-xs text-slate-200 font-bold bg-slate-950 px-2 py-1 border border-next-border rounded mt-1 inline-block">{waVerifyToken}</span>
-                    </div>
-                    <p className="text-[9.5px] text-slate-500 leading-relaxed sm:max-w-xs">Este token é gerado aleatoriamente e deve ser copiado para o painel da Meta ao configurar o Webhook para autenticar a conexão.</p>
+                  <div className="bg-slate-900/60 border border-next-border rounded-xl p-3">
+                    <span className="text-[10px] font-mono text-slate-500 uppercase block mb-1">Segurança do Webhook (Verify Token)</span>
+                    <p className="text-[9.5px] text-slate-500 leading-relaxed">O verify token do webhook Meta é global (uma única URL de webhook cadastrada uma vez no painel do app, não por clínica) — configurado como variável de ambiente do servidor, nunca gerado ou editado por aqui. Fale com quem administra a infraestrutura se precisar do valor pra colar no painel da Meta.</p>
                   </div>
                 ) : (
                   <div className="bg-slate-900/60 border border-next-border rounded-xl p-3">

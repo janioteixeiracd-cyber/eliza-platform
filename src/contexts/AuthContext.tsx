@@ -4,13 +4,18 @@ import {
   User, 
   signOut, 
   signInWithPopup,
+  signInWithRedirect,
+  getRedirectResult,
   signInWithEmailAndPassword,
   createUserWithEmailAndPassword,
-  sendPasswordResetEmail
+  sendPasswordResetEmail,
+  updateProfile,
+  updatePassword
 } from 'firebase/auth';
 import { doc, getDoc, setDoc, updateDoc, onSnapshot, serverTimestamp, query, collection, where, getDocs, limit, getDocFromServer, collectionGroup, deleteDoc } from 'firebase/firestore';
 import { auth, db, googleProvider, handleFirestoreError, OperationType, FIRESTORE_DATABASE_ID } from '../lib/firebase';
 import { ENABLE_PLATFORM_ADMIN } from '../config';
+import { PlatformAdminService } from '../services/platformAdminService';
 
 interface UserProfile {
   uid: string;
@@ -27,6 +32,14 @@ interface UserProfile {
   updatedAt?: any;
   userType?: string;
   clinicId?: string;
+  // Dual-role (Clinic + Academy): additive-only academic fields, present when
+  // this uid ALSO has an active education_students doc while being resolved
+  // primarily as staff (role/clinicId above stay the staff identity — see
+  // findActiveMembership() and the case-C branch in syncProfile()).
+  hasEducationAccess?: boolean;
+  educationStudentId?: string;
+  educationCourseId?: string | null;
+  educationClassId?: string | null;
 }
 
 interface ClinicData {
@@ -55,20 +68,39 @@ interface ClinicData {
   [key: string]: any;
 }
 
+// Cadastro → Checkout (Asaas): "authenticated, hasn't paid yet" state, read
+// from clinics/{id}-sibling top-level `signups/{uid}` (never `users/{uid}` —
+// see the comment on that collection's firestore.rules entry for why).
+// Client only ever reads this; server.ts is the only writer.
+export interface SignupData {
+  id: string;
+  status: 'pending_payment' | 'payment_processing' | 'paid' | 'expired';
+  planRoleSelected?: 'assistant' | 'secretary' | 'manager';
+  clinicId?: string | null;
+  asaasCheckoutUrl?: string | null;
+  [key: string]: any;
+}
+
 interface AuthContextType {
   user: User | null;
   profile: UserProfile | null;
   clinic: ClinicData | null;
+  signup: SignupData | null;
   isPlatformAdmin: boolean;
   platformRole: string | null;
   loading: boolean;
   isQuotaExceeded: boolean;
   authError: string | null;
   bootstrapTime: number;
+  supportMode: { active: boolean; clinicId: string | null; clinicData: ClinicData | null };
+  enterSupportMode: (clinicId: string) => Promise<void>;
+  exitSupportMode: () => void;
   loginWithGoogle: () => Promise<void>;
   loginWithEmail: (email: string, pass: string) => Promise<void>;
+  registerWithEmail: (name: string, email: string, pass: string) => Promise<void>;
   logout: () => Promise<void>;
   refreshProfile: () => Promise<void>;
+  changeStudentPassword: (newPassword: string) => Promise<void>;
 }
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
@@ -94,16 +126,100 @@ export function removeUndefinedFields(obj: any): any {
   return result;
 }
 
+// Dual-role support (Clinic + Academy): a single Firebase Auth uid can hold
+// an active `members` doc AND an active `education_students` doc at the same
+// time (see CEREBRO: identidade-unica-membro-e-aluna-simultaneos). This is
+// the ONE place that answers "is this uid an active clinic staff member?" —
+// both syncProfile() and loginWithEmail() call it independently of whatever
+// education_students lookup they also run, so neither path can short-circuit
+// the other and mistake "found a student doc" for "this whole identity is a
+// student, not staff too".
+async function findActiveMembership(uid: string): Promise<{ clinicId: string; role: string } | null> {
+  try {
+    const q = query(collectionGroup(db, 'members'), where('uid', '==', uid));
+    const snap = await getDocs(q);
+    if (!snap.empty) {
+      const mDoc = snap.docs[0];
+      const mData = mDoc.data();
+      if (mData.status === 'active' || mData.active === true || mData.status === 'ativo') {
+        const clinicId = mData.clinicId || mDoc.ref.parent.parent?.id;
+        if (clinicId) return { clinicId, role: mData.role };
+      }
+    }
+  } catch (e: any) {
+    console.warn('[ELIZA] Error checking clinical memberships:', e.message || e);
+  }
+  return null;
+}
+
 export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [user, setUser] = useState<User | null>(null);
   const [profile, setProfile] = useState<UserProfile | null>(null);
   const [clinic, setClinic] = useState<ClinicData | null>(null);
+  const [signup, setSignup] = useState<SignupData | null>(null);
   const [isPlatformAdmin, setIsPlatformAdmin] = useState(false);
   const [platformRole, setPlatformRole] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [isQuotaExceeded, setIsQuotaExceeded] = useState(false);
   const [authError, setAuthError] = useState<string | null>(null);
   const [bootstrapTime, setBootstrapTime] = useState(0);
+  // Platform-admin "support mode": lets a super admin temporarily view a
+  // different clinic's real data for support/debugging. Lives here (not in
+  // AdminContext) so the override reaches every consumer of useAuth().clinic
+  // across both the legacy app and Eliza Next automatically — those ~20+
+  // components each call useAuth() directly, they don't receive clinic via
+  // props from a shared layout.
+  const [supportMode, setSupportMode] = useState<{ active: boolean; clinicId: string | null; clinicData: ClinicData | null }>({
+    active: false,
+    clinicId: null,
+    clinicData: null,
+  });
+  const effectiveClinic = supportMode.active && supportMode.clinicData ? supportMode.clinicData : clinic;
+
+  // Cadastro → Checkout: read-only listener on the caller's own signups/{uid}
+  // doc. Independent of the clinic/membership resolution below — a brand new
+  // signup has neither yet, and AppLayout.tsx branches on `signup?.status`
+  // before it ever reaches the "no clinic" fallback.
+  useEffect(() => {
+    if (!user?.uid) { setSignup(null); return; }
+    const unsub = onSnapshot(doc(db, 'signups', user.uid), (snap) => {
+      setSignup(snap.exists() ? ({ id: snap.id, ...snap.data() } as SignupData) : null);
+    }, () => setSignup(null));
+    return () => unsub();
+  }, [user?.uid]);
+
+  const enterSupportMode = async (clinicId: string) => {
+    if (!isPlatformAdmin || !user) return;
+    try {
+      const clinicSnap = await getDoc(doc(db, 'clinics', clinicId));
+      if (clinicSnap.exists()) {
+        const clinicData = { id: clinicSnap.id, ...clinicSnap.data() } as ClinicData;
+        setSupportMode({ active: true, clinicId, clinicData });
+        await PlatformAdminService.logAdminAction(
+          user.uid,
+          '[SUPER_ADMIN_SUPPORT_ACCESS] Entrou em modo suporte para depuração',
+          clinicId,
+          'clinic',
+          { clinicName: clinicData.name }
+        );
+      }
+    } catch (error) {
+      console.error('[AuthContext] Error entering support mode:', error);
+      throw error;
+    }
+  };
+
+  const exitSupportMode = () => {
+    if (user && supportMode.clinicId) {
+      PlatformAdminService.logAdminAction(
+        user.uid,
+        'support_mode_exit',
+        supportMode.clinicId,
+        'clinic'
+      );
+    }
+    setSupportMode({ active: false, clinicId: null, clinicData: null });
+  };
 
   // Safety loading timeout - never get stuck for more than 8 seconds
   useEffect(() => {
@@ -176,19 +292,24 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         }
       }
 
-      // 2. Handle Student Alignment & Profile Creation
+      // 2. Auto-relink & fail-safe clinicId resolution for the student doc,
+      // if one was found — done unconditionally here (before we know whether
+      // this uid is ALSO staff) because relinking the academic doc's own
+      // authUid/id is a data-integrity fix orthogonal to which role wins the
+      // profile below.
+      let resolvedStudentClinicId: string | null = null;
       if (studentDocObj && studentRef) {
         const currentUid = firebaseUser.uid;
-        let resolvedClinicId = studentDocObj.clinicId || studentRef.parent?.parent?.id;
-        
-        // Contextual clinic assignment fallback (Harmo Orofacial clinicId in active context)
-        if (!resolvedClinicId) {
-          resolvedClinicId = "l9GzEcXT7uhcYHgRVVhe";
-        }
+        resolvedStudentClinicId = studentDocObj.clinicId || studentRef.parent?.parent?.id || null;
 
-        if (!resolvedClinicId) {
-          console.warn("[EDUCATION_ACCESS_DENIED] Student missing clinicId link.");
-          throw new Error("Aluno encontrado, mas sem clínica vinculada. Revise o cadastro.");
+        // Fail-safe: no hardcoded fallback clinic. A student whose doc doesn't
+        // resolve to a real clinic path must never be silently associated
+        // with a real production clinic — that was the previous behavior
+        // (see CEREBRO: "Fallback hardcoded de clinicId em login de aluno").
+        if (!resolvedStudentClinicId) {
+          console.error("[EDUCATION_ACCESS_DENIED] Student doc missing resolvable clinicId — refusing to guess.", { uid: firebaseUser.uid, studentRefPath: studentRef?.path });
+          await signOut(auth);
+          throw new Error("Aluno encontrado, mas sem clínica vinculada corretamente. Contate a secretaria da clínica.");
         }
 
         // Auto-relink student record in education_students if ID or authUid doesn't match current UID
@@ -205,7 +326,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
             const newStudentRef = doc(db, studentRef.parent.path, currentUid);
             await setDoc(newStudentRef, cleanStudentData, { merge: true });
-            
+
             if (studentRef.id !== currentUid) {
               await deleteDoc(studentRef);
             }
@@ -217,8 +338,28 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
             console.error("Failed to auto-migrate student link:", migrateErr);
           }
         }
+      }
 
-        // Build and save the users/{uid} document with precise fields
+      // 3. Resolve clinical/operational membership — ALWAYS runs, regardless
+      // of whether an education_students doc was also found. This is the fix
+      // for the mutually-exclusive resolution bug: previously this lookup
+      // only ran when NO student doc existed, so a uid with both an active
+      // members doc AND an active education_students doc (dual role: Clinic
+      // staff + Academy student, see CEREBRO decision) was always resolved
+      // as student-only, silently losing operational access.
+      console.log("[ELIZA] Scanning for clinical memberships (independently of education_students lookup)...");
+      const activeMembership = await findActiveMembership(firebaseUser.uid);
+      const foundClinicId = activeMembership?.clinicId ?? null;
+      const foundRole = activeMembership?.role ?? null;
+      const isStaffMember = !!activeMembership;
+      if (isStaffMember) {
+        console.log(`[ELIZA] Found clinical membership in clinic ${foundClinicId}`);
+      }
+
+      // 4. Case B — student ONLY (no active staff membership): exact
+      // pre-existing student-only behavior, unchanged.
+      if (studentDocObj && studentRef && !isStaffMember) {
+        const currentUid = firebaseUser.uid;
         const studentBaseline = {
           uid: currentUid,
           email: firebaseUser.email || '',
@@ -227,12 +368,17 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           name: studentDocObj.name || firebaseUser.displayName || 'Aluno',
           role: "student",
           userType: "education_student",
-          clinicId: resolvedClinicId,
-          defaultClinicId: resolvedClinicId,
+          clinicId: resolvedStudentClinicId,
+          defaultClinicId: resolvedStudentClinicId,
           courseId: studentDocObj.courseId || null,
           classId: studentDocObj.classId || null,
           educationStudentId: studentDocObj.id || studentDocObj.authUid || currentUid,
           status: "active",
+          // Propagated so ElizaNextLayout can gate the student portal behind
+          // a mandatory change-password screen — this field was being written
+          // at student creation (inviteService.ts) but never read anywhere,
+          // so a temporary password never actually had to be changed.
+          mustChangePassword: studentDocObj.mustChangePassword === true,
           createdAt: studentDocObj.createdAt || serverTimestamp(),
           updatedAt: serverTimestamp()
         };
@@ -251,25 +397,33 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         }
       }
 
-      // If we got here, they are NOT an education student. Search clinical memberships.
-      console.log("[EDUCATION_STUDENT_PROFILE_MISSING] User not registered in education_students. Scanning for company memberships...");
-      let foundClinicId = null;
-      let foundRole = null;
+      // 5. Case A (staff only) and Case C (staff + student, dual role) both
+      // fall through here. The academic side is layered ADDITIVELY on top of
+      // the normal staff profile resolution below — role/clinicId/defaultClinicId
+      // always come from the staff membership (foundRole/foundClinicId), never
+      // overwritten by the academic doc. This guarantees adding or removing an
+      // education_students link can never change operational permissions.
+      // Deliberately NOT included: studentDocObj.mustChangePassword. That
+      // field exists to force a change on a temporary password issued when a
+      // BRAND NEW student account is created — a dual-role person already
+      // has a working, self-chosen staff password, so an academic temp-
+      // password flag (however it got set) must never gate their login. Since
+      // `role` above always resolves to the staff role for case C, the
+      // top-level `isStudentRole && mustChangePassword` gate in
+      // ElizaNextLayout.tsx can never fire for a dual-role profile by
+      // construction — no separate check needed here.
+      const academicPatch: { hasEducationAccess: boolean; educationStudentId: string | null; educationCourseId: string | null; educationClassId: string | null } | null =
+        (studentDocObj && studentRef && isStaffMember)
+          ? {
+              hasEducationAccess: true,
+              educationStudentId: studentDocObj.id || studentDocObj.authUid || firebaseUser.uid,
+              educationCourseId: studentDocObj.courseId || null,
+              educationClassId: studentDocObj.classId || null,
+            }
+          : null;
 
-      try {
-        const q = query(collectionGroup(db, 'members'), where('uid', '==', firebaseUser.uid));
-        const querySnapshot = await getDocs(q);
-        if (!querySnapshot.empty) {
-          const mDoc = querySnapshot.docs[0];
-          const mData = mDoc.data();
-          if (mData.status === 'active' || mData.active === true || mData.status === 'ativo') {
-            foundClinicId = mData.clinicId || mDoc.ref.parent.parent?.id;
-            foundRole = mData.role;
-            console.log(`[ELIZA] Found clinical membership in clinic ${foundClinicId}`);
-          }
-        }
-      } catch (e: any) {
-        console.warn("[ELIZA] Error checking clinical memberships:", e.message || e);
+      if (!studentDocObj) {
+        console.log("[EDUCATION_STUDENT_PROFILE_MISSING] User not registered in education_students.");
       }
 
       // Verify if they have an existing users profile already
@@ -283,18 +437,22 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         console.warn("Failed to check existing profile:", err.message || err);
       }
 
-      // If no clinical membership is found, and they are not predefined platform admin
-      // and they have an orphan student role or simply are trying to connect, throw friendly block
+      // If no clinical membership is found and they are not a platform admin,
+      // only block access when they were previously a student whose
+      // education_students record has since gone missing/orphaned — a
+      // genuinely new user (no prior profile, not a student) must fall
+      // through to the baseline-profile branch below so Cadastro→Checkout
+      // and first-time Google sign-up both work.
       const isPlatformUser = firebaseUser.uid === 'PnEUUeLkWIVyIdIbcynwqBa6Wv72';
       const superAdminEmails = ['janioteixeiracd@gmail.com', 'juninhoteixeiraofc@gmail.com'];
-      const isSuperAdmin = isPlatformUser || 
-                           superAdminEmails.includes(emailLower) || 
-                           existingProfileData?.platformRole === 'super_admin' || 
+      const isSuperAdmin = isPlatformUser ||
+                           superAdminEmails.includes(emailLower) ||
+                           existingProfileData?.platformRole === 'super_admin' ||
                            existingProfileData?.isPlatformAdmin === true;
 
       const isEduStudent = (existingProfileData?.role === 'aluno' || existingProfileData?.role === 'student' || existingProfileData?.userType === 'education_student');
 
-      if (!foundClinicId && !isSuperAdmin && (isEduStudent || (firebaseUser.email && !foundClinicId))) {
+      if (!foundClinicId && !isSuperAdmin && isEduStudent) {
         if (existingProfileData?.defaultClinicId !== 'onboarding') {
           console.error("[EDUCATION_ACCESS_DENIED] Authentication was successful but student profile is offline in database.");
           throw new Error("Login realizado, mas seu cadastro de aluno não foi localizado. Fale com a instituição.");
@@ -322,6 +480,50 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           }
         }
 
+        // Operational identity always wins when an active membership exists —
+        // self-heals a profile that a previous version of this function may
+        // have overwritten with the academic role (the exact bug this
+        // checkpoint fixes), and is a no-op for every profile that was
+        // already correct (foundRole/foundClinicId already match).
+        if (isStaffMember) {
+          if (existingProfileData.role !== foundRole) {
+            updatePayload.role = foundRole;
+            needsUpdate = true;
+          }
+          if (existingProfileData.clinicId !== foundClinicId) {
+            updatePayload.clinicId = foundClinicId;
+            needsUpdate = true;
+          }
+          if (existingProfileData.defaultClinicId !== foundClinicId) {
+            updatePayload.defaultClinicId = foundClinicId;
+            needsUpdate = true;
+          }
+          if (existingProfileData.userType === 'education_student') {
+            updatePayload.userType = null;
+            needsUpdate = true;
+          }
+        }
+
+        // Academic access layered additively — granting/revoking it never
+        // touches role/clinicId above.
+        if (academicPatch) {
+          for (const [key, value] of Object.entries(academicPatch)) {
+            if (existingProfileData[key] !== value) {
+              updatePayload[key] = value;
+              needsUpdate = true;
+            }
+          }
+        } else if (isStaffMember && existingProfileData.hasEducationAccess === true) {
+          // Academic link was removed/deactivated since the last sync — clear
+          // the stale flag so the Academy nav entry disappears. Operational
+          // membership above is untouched either way.
+          updatePayload.hasEducationAccess = false;
+          updatePayload.educationStudentId = null;
+          updatePayload.educationCourseId = null;
+          updatePayload.educationClassId = null;
+          needsUpdate = true;
+        }
+
         if (needsUpdate) {
           updatePayload.updatedAt = serverTimestamp();
           await updateDoc(profileRef, removeUndefinedFields(updatePayload));
@@ -340,6 +542,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           role: foundRole || undefined,
           platformRole: superAdminEmails.includes(emailLower) ? 'super_admin' : undefined,
           isPlatformAdmin: superAdminEmails.includes(emailLower) ? true : undefined,
+          ...(academicPatch || {}),
           createdAt: serverTimestamp() as any,
           updatedAt: serverTimestamp() as any
         };
@@ -358,6 +561,15 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   useEffect(() => {
     let unsubscribeProfile: (() => void) | null = null;
     let unsubscribeClinic: (() => void) | null = null;
+
+    // Surfaces errors from the signInWithRedirect fallback in loginWithGoogle
+    // (e.g. account-exists-with-different-credential). On success this
+    // resolves to the same user onAuthStateChanged below already picks up —
+    // this call exists only for the error path, not to drive sign-in itself.
+    getRedirectResult(auth).catch((error: any) => {
+      console.error("[ELIZA] Google Redirect Login Error:", error.message);
+      setAuthError(error.message);
+    });
 
     const unsubscribeAuth = onAuthStateChanged(auth, async (firebaseUser) => {
       console.log(`[ELIZA] Auth state changed: ${firebaseUser ? 'LOGGED_IN (' + firebaseUser.email + ')' : 'LOGGED_OUT'}`);
@@ -509,7 +721,24 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     setLoading(true);
     setAuthError(null);
     try {
-      await signInWithPopup(auth, googleProvider);
+      try {
+        await signInWithPopup(auth, googleProvider);
+      } catch (popupErr: any) {
+        // Popups are unreliable in the wild — in-app browsers (WhatsApp,
+        // Instagram), Safari's stricter defaults, and some corporate/privacy
+        // extensions block them outright with no way for the user to allow
+        // it retroactively. A full-page redirect has no such restriction;
+        // onAuthStateChanged below picks up the result automatically once
+        // Firebase navigates back. Only auth/popup-blocked falls back here —
+        // auth/popup-closed-by-user means the person deliberately canceled,
+        // and forcing a redirect in that case would be surprising, not helpful.
+        if (popupErr.code === 'auth/popup-blocked') {
+          console.warn('[ELIZA] Google popup blocked — falling back to redirect.');
+          await signInWithRedirect(auth, googleProvider);
+          return;
+        }
+        throw popupErr;
+      }
     } catch (error: any) {
       console.error("[ELIZA] Google Login Error:", error.message);
       setAuthError(error.message);
@@ -569,6 +798,12 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       console.log(`[ELIZA] Checking if email belongs to an education student...`);
       let studentDoc: any = null;
       let studentRef: any = null;
+      // Dual role (Clinic + Academy): populated below if an active clinic
+      // membership exists for this uid, independently of the education
+      // student doc. Scoped here (not inside the try block) so both the
+      // blocked/expired gate above AND the profile-write guard further down
+      // can read the same result instead of querying twice or drifting.
+      let dualRoleMembership: { clinicId: string; role: string } | null = null;
 
       try {
         const studentQ = query(collectionGroup(db, 'education_students'), where('emailLowercase', '==', email));
@@ -578,20 +813,29 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           studentRef = studentSnap.docs[0].ref;
           console.log(`[EDUCATION_STUDENT_PROFILE_FOUND] Found education student profile for: ${email}`);
 
-          // Check if blocked
-          if (studentDoc.status === 'bloqueado' || studentDoc.status === 'inativo') {
-            console.warn(`[EDUCATION_ACCESS_BLOCKED] Access blocked for student: ${email}`);
-            await signOut(auth);
-            throw new Error("Seu acesso está bloqueado. Fale com a instituição.");
-          }
+          // Dual role (Clinic + Academy): a blocked/expired ACADEMIC status
+          // must never lock a person out of the app entirely if they also
+          // hold an active clinic membership — that membership is a fully
+          // independent identity. Only gate login on the academic-only path.
+          dualRoleMembership = await findActiveMembership(authUser.uid);
+          if (!dualRoleMembership) {
+            // Check if blocked
+            if (studentDoc.status === 'bloqueado' || studentDoc.status === 'inativo') {
+              console.warn(`[EDUCATION_ACCESS_BLOCKED] Access blocked for student: ${email}`);
+              await signOut(auth);
+              throw new Error("Seu acesso está bloqueado. Fale com a instituição.");
+            }
 
-          // Check if expired
-          const todayStr = new Date().toISOString().slice(0, 10);
-          const isExpired = studentDoc.accessExpirationDate && (todayStr > studentDoc.accessExpirationDate) && !studentDoc.permAccessAfterEnd;
-          if (isExpired) {
-            console.warn(`[EDUCATION_ACCESS_EXPIRED] Access expired for student: ${email}`);
-            await signOut(auth);
-            throw new Error("Seu acesso ao curso expirou.");
+            // Check if expired
+            const todayStr = new Date().toISOString().slice(0, 10);
+            const isExpired = studentDoc.accessExpirationDate && (todayStr > studentDoc.accessExpirationDate) && !studentDoc.permAccessAfterEnd;
+            if (isExpired) {
+              console.warn(`[EDUCATION_ACCESS_EXPIRED] Access expired for student: ${email}`);
+              await signOut(auth);
+              throw new Error("Seu acesso ao curso expirou.");
+            }
+          } else if (studentDoc.status === 'bloqueado' || studentDoc.status === 'inativo') {
+            console.warn(`[EDUCATION_ACCESS_BLOCKED] Academic access blocked for ${email}, but an active clinic membership exists — allowing login as staff.`);
           }
         } else {
           console.log(`[EDUCATION_STUDENT_PROFILE_MISSING] No student profile matching emailLowercase: ${email}`);
@@ -638,14 +882,28 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           }
         }
         
-        // Ensure they also have high-level users profile with Aluno role
+        // Fail-safe: no hardcoded fallback clinic. Resolved and checked
+        // BEFORE the try/catch below — that catch only swallows benign,
+        // transient Firestore errors, and must never also swallow this
+        // (see syncProfile() above for the same fix and rationale).
+        const clinicId = studentRef.parent.parent?.id || studentDoc.clinicId;
+        if (!clinicId) {
+          console.error("[EDUCATION_ACCESS_DENIED] Student doc missing resolvable clinicId — refusing to guess.", { uid: currentUid, studentRefPath: studentRef?.path });
+          await signOut(auth);
+          throw new Error("Aluno encontrado, mas sem clínica vinculada corretamente. Contate a secretaria da clínica.");
+        }
+
+        // Ensure they also have high-level users profile with Aluno role.
+        // Skipped entirely when an active clinic membership also exists for
+        // this uid (dual role) — writing role:'student' here would clobber
+        // the staff identity. syncProfile() (run right after, via
+        // onAuthStateChanged) is the single place that resolves the dual-role
+        // profile correctly, additively, without this shortcut.
         try {
           const profileRef = doc(db, 'users', currentUid);
           const pSnap = await getDoc(profileRef);
-          
-          const clinicId = studentRef.parent.parent?.id || studentDoc.clinicId || "l9GzEcXT7uhcYHgRVVhe";
-          
-          if (!pSnap.exists() || (pSnap.data()?.role !== 'aluno' && pSnap.data()?.role !== 'student')) {
+
+          if (!dualRoleMembership && (!pSnap.exists() || (pSnap.data()?.role !== 'aluno' && pSnap.data()?.role !== 'student'))) {
             const baselineProfile = {
               uid: currentUid,
               name: studentDoc.name || authUser.displayName || email.split('@')[0],
@@ -676,10 +934,42 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     }
   };
 
+  // Cadastro → Checkout: the actual account-creation half of `registerWithEmail`
+  // + `createUserWithEmailAndPassword` was imported but never called anywhere
+  // in this file before — this is that gap being filled. Doesn't write
+  // `signups/{uid}` itself (that's server.ts-only, see firestore.rules) —
+  // CheckoutView creates it lazily on mount via a server endpoint.
+  const registerWithEmail = async (name: string, emailRaw: string, pass: string) => {
+    setLoading(true);
+    setAuthError(null);
+    const email = emailRaw.trim().toLowerCase();
+    try {
+      const cred = await createUserWithEmailAndPassword(auth, email, pass);
+      await updateProfile(cred.user, { displayName: name.trim() });
+      // Explicit write instead of relying on syncProfile's onAuthStateChanged
+      // race to pick up the right displayName — timing between updateProfile
+      // and the listener firing isn't guaranteed.
+      await setDoc(doc(db, 'users', cred.user.uid), removeUndefinedFields({
+        uid: cred.user.uid, name: name.trim(), email, updatedAt: serverTimestamp(),
+      }), { merge: true });
+    } catch (error: any) {
+      console.error('[ELIZA] Email registration error:', error.message);
+      let friendlyMsg = error.message;
+      if (error.code === 'auth/email-already-in-use') friendlyMsg = 'Este e-mail já tem uma conta — tente entrar em vez de cadastrar.';
+      else if (error.code === 'auth/weak-password') friendlyMsg = 'Senha muito fraca — use pelo menos 6 caracteres.';
+      else if (error.code === 'auth/invalid-email') friendlyMsg = 'E-mail inválido.';
+      setAuthError(friendlyMsg);
+      throw new Error(friendlyMsg);
+    } finally {
+      setLoading(false);
+    }
+  };
+
   const logout = async () => {
     setLoading(true);
     try {
       await signOut(auth);
+      setSupportMode({ active: false, clinicId: null, clinicData: null });
     } finally {
       setLoading(false);
     }
@@ -689,21 +979,51 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     if (user) await syncProfile(user);
   };
 
+  // Mandatory first-login password change for students created with a
+  // temporary password (inviteService.ts's createEducationStudent). Clears
+  // mustChangePassword on both the education_students doc (source of truth,
+  // re-read on every profile sync above) and the mirrored users/ profile, so
+  // a stale cached profile can't leave the gate open.
+  const changeStudentPassword = async (newPassword: string) => {
+    if (!user) throw new Error('Sessão não carregada.');
+    if (!newPassword || newPassword.length < 6) throw new Error('A nova senha precisa ter pelo menos 6 caracteres.');
+    await updatePassword(user, newPassword);
+    const clinicId = profile?.clinicId || profile?.defaultClinicId;
+    const studentId = (profile as any)?.educationStudentId || user.uid;
+    if (clinicId) {
+      await updateDoc(doc(db, 'clinics', clinicId, 'education_students', studentId), {
+        mustChangePassword: false,
+        updatedAt: serverTimestamp(),
+      }).catch((err) => console.warn('[AuthContext] Failed to clear mustChangePassword on education_students:', err));
+    }
+    await updateDoc(doc(db, 'users', user.uid), {
+      mustChangePassword: false,
+      updatedAt: serverTimestamp(),
+    }).catch((err) => console.warn('[AuthContext] Failed to clear mustChangePassword on users profile:', err));
+    await refreshProfile();
+  };
+
   return (
-    <AuthContext.Provider value={{ 
-      user, 
-      profile, 
-      clinic, 
+    <AuthContext.Provider value={{
+      user,
+      profile,
+      clinic: effectiveClinic,
+      signup,
       isPlatformAdmin,
       platformRole,
-      loading, 
+      loading,
       isQuotaExceeded,
       authError,
       bootstrapTime,
+      supportMode,
+      enterSupportMode,
+      exitSupportMode,
       loginWithGoogle,
       loginWithEmail,
+      registerWithEmail,
       logout,
-      refreshProfile 
+      refreshProfile,
+      changeStudentPassword
     }}>
       {children}
     </AuthContext.Provider>

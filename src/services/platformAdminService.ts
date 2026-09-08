@@ -14,6 +14,7 @@ import {
   addDoc
 } from 'firebase/firestore';
 import { db, handleFirestoreError, OperationType } from '../lib/firebase';
+import type { PlanRole, PlanCapabilities } from '../lib/planCapabilities';
 
 export interface PlatformMetric {
   id?: string;
@@ -222,13 +223,13 @@ export const PlatformAdminService = {
    * Plan Management
    */
   subscribeToPlans: (onData: (plans: any[]) => void) => {
-    const q = query(collection(db, 'platform_plans'), orderBy('price', 'asc'));
+    const q = query(collection(db, 'platform_plans'), orderBy('regularPriceCents', 'asc'));
     return onSnapshot(q, (snap) => {
       onData(snap.docs.map(d => ({ id: d.id, ...d.data() })));
     }, (err) => handleFirestoreError(err, OperationType.LIST, 'platform_plans'));
   },
 
-  createPlan: async (planData: { name: string; price: number; description?: string; maxUsers?: number | null; active: boolean }, adminId: string) => {
+  createPlan: async (planData: { name: string; planRole: PlanRole; regularPriceCents: number; founderPriceCents: number; description?: string; maxUsers?: number | null; capabilities: PlanCapabilities; salesEnabled: boolean; active: boolean }, adminId: string) => {
     const ref = await addDoc(collection(db, 'platform_plans'), {
       ...planData,
       createdAt: serverTimestamp(),
@@ -244,7 +245,7 @@ export const PlatformAdminService = {
     return ref.id;
   },
 
-  updatePlan: async (planId: string, patch: Partial<{ name: string; price: number; description: string; maxUsers: number | null; active: boolean }>, adminId: string) => {
+  updatePlan: async (planId: string, patch: Partial<{ name: string; planRole: PlanRole; regularPriceCents: number; founderPriceCents: number; description: string; maxUsers: number | null; capabilities: PlanCapabilities; salesEnabled: boolean; active: boolean }>, adminId: string) => {
     await updateDoc(doc(db, 'platform_plans', planId), { ...patch, updatedAt: serverTimestamp() });
     await PlatformAdminService.logAdminAction(
       adminId,
@@ -263,6 +264,33 @@ export const PlatformAdminService = {
       planId,
       'plan',
       {}
+    );
+  },
+
+  /**
+   * Founding-clinics promo — single config doc (platform_config/founding_promo).
+   * `slotsClaimed` is transaction-owned by server.ts's checkout endpoint —
+   * intentionally not part of the admin-editable patch shape here, so the
+   * admin UI can never desync the counter from what was actually claimed.
+   */
+  subscribeToFoundingPromo: (onData: (promo: { totalSlots: number; slotsClaimed: number; active: boolean; updatedAt?: any } | null) => void) => {
+    return onSnapshot(doc(db, 'platform_config', 'founding_promo'), (snap) => {
+      onData(snap.exists() ? (snap.data() as any) : null);
+    }, (err) => handleFirestoreError(err, OperationType.GET, 'platform_config/founding_promo'));
+  },
+
+  updateFoundingPromo: async (patch: Partial<{ totalSlots: number; active: boolean }>, adminId: string) => {
+    await setDoc(doc(db, 'platform_config', 'founding_promo'), {
+      ...patch,
+      updatedAt: serverTimestamp(),
+      updatedBy: adminId,
+    }, { merge: true });
+    await PlatformAdminService.logAdminAction(
+      adminId,
+      `[SUPER_ADMIN_PROMO_UPDATED] Cota de clínicas fundadoras atualizada`,
+      'founding_promo',
+      'promo',
+      patch
     );
   },
 

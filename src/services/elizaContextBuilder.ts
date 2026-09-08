@@ -13,6 +13,7 @@ import { ElizaContext, ElizaIntelligenceRequest, ElizaError, ElizaErrorCode, Cli
 import { getFirestore, Timestamp } from "firebase-admin/firestore";
 import { DocumentData, QueryDocumentSnapshot } from "firebase-admin/firestore";
 import { getAdminDb } from "../lib/adminFirebase";
+import { verifyAndDecodeJWT, validateClinicIdConsistency } from "../lib/elizaAuthService";
 
 // ============================================================================
 // CONFIGURATION CACHE

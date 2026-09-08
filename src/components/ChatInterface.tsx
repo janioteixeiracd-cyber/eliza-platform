@@ -42,6 +42,7 @@ import {
   addDoc
 } from 'firebase/firestore';
 import { useAuth } from '../contexts/AuthContext';
+import { isClinicOwnerOrAdmin } from '../lib/clinicRole';
 
 interface Message {
   id: string;
@@ -85,11 +86,18 @@ interface IntegrationLog {
 }
 
 export function ChatInterface() {
-  const { clinic, user } = useAuth();
-  
-  // Real-time integration status
-  const [integration, setIntegration] = useState<any | null>(null);
+  const { clinic, user, profile } = useAuth();
+  const isOwnerOrAdmin = isClinicOwnerOrAdmin({ profileRole: profile?.role, clinicOwnerId: clinic?.ownerId, userId: user?.uid });
+
+  // Real-time integration status — lido de integrations/whatsapp_status
+  // (sanitizado, legível por qualquer membro), nunca do doc completo
+  // (rodada final de fechamento — Seção 12 do plano). O painel de
+  // diagnóstico com phoneNumberId/wabaId (mais abaixo) é owner/admin-only
+  // e busca a config completa via /api/whatsapp/manual-config.
+  const [integrationDisplayPhone, setIntegrationDisplayPhone] = useState<string | null>(null);
   const [integrationStatus, setIntegrationStatus] = useState<'conectado' | 'não conectado' | 'erro'>('não conectado');
+  const [diagConfig, setDiagConfig] = useState<{ phoneNumberId?: string; wabaId?: string } | null>(null);
+  const [diagLoading, setDiagLoading] = useState(false);
   
   // Active Conversation Lists
   const [conversations, setConversations] = useState<WhatsAppConversation[]>([]);
@@ -104,6 +112,33 @@ export function ChatInterface() {
   // Automation Dashboard Modal
   const [showAutomationModal, setShowAutomationModal] = useState(false);
   const [recentLogs, setRecentLogs] = useState<IntegrationLog[]>([]);
+
+  // Painel de diagnóstico (phoneNumberId/wabaId) — owner/admin-only,
+  // buscado sob demanda só quando o modal abre, via /api/whatsapp/
+  // manual-config (Admin SDK, authenticateOwnerOrAdmin), nunca por leitura
+  // direta do Firestore (rodada final de fechamento, Seção 12 do plano).
+  useEffect(() => {
+    if (!showAutomationModal || !isOwnerOrAdmin || !clinic?.id || !user) return;
+    let cancelled = false;
+    setDiagLoading(true);
+    (async () => {
+      try {
+        const idToken = await user.getIdToken();
+        const res = await fetch(`/api/whatsapp/manual-config?clinicId=${encodeURIComponent(clinic.id)}`, {
+          headers: { Authorization: `Bearer ${idToken}` },
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!cancelled && res.ok) {
+          setDiagConfig({ phoneNumberId: data.phoneNumberId, wabaId: data.wabaId });
+        }
+      } catch (err) {
+        console.warn('[ChatInterface] Failed to load WhatsApp diagnostics:', err);
+      } finally {
+        if (!cancelled) setDiagLoading(false);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [showAutomationModal, isOwnerOrAdmin, clinic?.id, user]);
   
   // UI helper for manual token test sending inside modal
   const [testPhone, setTestPhone] = useState('');
@@ -266,27 +301,22 @@ export function ChatInterface() {
   useEffect(() => {
     if (!clinic) return;
 
-    // A. Subscribe to integration document
-    const integrationPath = `clinics/${clinic.id}/integrations/whatsapp`;
-    console.log("[ELIZA_DIAGNOSES] Initializing onSnapshot listener:", {
-      uid: user?.uid,
-      clinicId: clinic.id,
-      path: integrationPath,
-      operation: "listen"
-    });
-
-    const intRef = doc(db, 'clinics', clinic.id, 'integrations', 'whatsapp');
-    const unsubIntegration = onSnapshot(intRef, (snap) => {
+    // A. Subscribe to the SANITIZED status doc — nunca o doc completo
+    // (rodada final de fechamento, Seção 12 do plano). Legível por
+    // qualquer isClinicMember(), sem phoneNumberId/wabaId/token.
+    const statusPath = `clinics/${clinic.id}/integrations/whatsapp_status`;
+    const statusRef = doc(db, 'clinics', clinic.id, 'integrations', 'whatsapp_status');
+    const unsubIntegration = onSnapshot(statusRef, (snap) => {
       if (snap.exists()) {
         const data = snap.data();
-        setIntegration(data);
         setIntegrationStatus(data.status || 'não conectado');
+        setIntegrationDisplayPhone(data.displayPhoneNumber || null);
       } else {
-        setIntegration(null);
         setIntegrationStatus('não conectado');
+        setIntegrationDisplayPhone(null);
       }
     }, (error) => {
-      console.error(`[ELIZA_DIAGNOSES] ❌ PERMISSION_DENIED or other error on path: ${integrationPath}`, {
+      console.error(`[ELIZA_DIAGNOSES] ❌ PERMISSION_DENIED or other error on path: ${statusPath}`, {
         uid: user?.uid,
         clinicId: clinic.id,
         error: error.message || error
@@ -1367,37 +1397,36 @@ export function ChatInterface() {
                       <span className={`font-bold px-2 py-0.5 rounded text-[10px] uppercase ${
                         integrationStatus === 'conectado' ? 'bg-emerald-55 text-emerald-700' : 'bg-amber-55 text-amber-700'
                       }`}>
-                        {integrationStatus}
+                        {integrationStatus}{integrationDisplayPhone ? ` — ${integrationDisplayPhone}` : ''}
                       </span>
                     </div>
 
-                    <div className="flex items-center justify-between border-b border-slate-150 pb-1.5">
-                      <span className="text-slate-500 font-medium">Phone Number ID:</span>
-                      <span className="font-mono text-slate-700 text-[10px] break-all max-w-[150px] text-right truncate" title={integration?.phoneNumberId || 'Pendente'}>
-                        {integration?.phoneNumberId || 'Não Cadastrado'}
-                      </span>
-                    </div>
+                    {isOwnerOrAdmin ? (
+                      <>
+                        <div className="flex items-center justify-between border-b border-slate-150 pb-1.5">
+                          <span className="text-slate-500 font-medium">Phone Number ID:</span>
+                          <span className="font-mono text-slate-700 text-[10px] break-all max-w-[150px] text-right truncate" title={diagConfig?.phoneNumberId || 'Pendente'}>
+                            {diagLoading ? '...' : (diagConfig?.phoneNumberId || 'Não Cadastrado')}
+                          </span>
+                        </div>
 
-                    <div className="flex items-center justify-between border-b border-slate-150 pb-1.5">
-                      <span className="text-slate-500 font-medium">Meta WABA ID:</span>
-                      <span className="font-mono text-slate-700 text-[10px] break-all max-w-[150px] text-right truncate" title={integration?.wabaId || 'Pendente'}>
-                        {integration?.wabaId || 'Não Cadastrado'}
-                      </span>
-                    </div>
+                        <div className="flex items-center justify-between border-b border-slate-150 pb-1.5">
+                          <span className="text-slate-500 font-medium">Meta WABA ID:</span>
+                          <span className="font-mono text-slate-700 text-[10px] break-all max-w-[150px] text-right truncate" title={diagConfig?.wabaId || 'Pendente'}>
+                            {diagLoading ? '...' : (diagConfig?.wabaId || 'Não Cadastrado')}
+                          </span>
+                        </div>
 
-                    <div className="flex items-center justify-between border-b border-slate-155 pb-1.5">
-                      <span className="text-slate-500 font-medium">Verify Token:</span>
-                      <span className="font-mono text-slate-700 text-[10px] font-bold text-right">
-                        {integration?.verifyToken || 'eliza_secret_token'}
-                      </span>
-                    </div>
-
-                    <div className="flex items-center justify-between">
-                      <span className="text-slate-500 font-medium">Webhook URL:</span>
-                      <span className="font-mono text-slate-600 text-[9px] break-all max-w-[160px] text-right truncate" title={integration?.webhookUrl}>
-                        {integration?.webhookUrl || '/api/whatsapp/webhook'}
-                      </span>
-                    </div>
+                        <div className="flex items-center justify-between">
+                          <span className="text-slate-500 font-medium">Webhook URL:</span>
+                          <span className="font-mono text-slate-600 text-[9px] break-all max-w-[160px] text-right truncate">
+                            {window.location.origin + '/api/whatsapp/webhook'}
+                          </span>
+                        </div>
+                      </>
+                    ) : (
+                      <p className="text-[10px] text-slate-400 leading-relaxed">Detalhes técnicos (Phone Number ID, WABA ID) visíveis só para administradores da clínica.</p>
+                    )}
                   </div>
                 </div>
 

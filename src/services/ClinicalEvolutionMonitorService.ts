@@ -11,6 +11,7 @@ import {
   limit 
 } from 'firebase/firestore';
 import { db } from '../lib/firebase';
+import { logStatusEvent } from '../next/services/statusEvents';
 
 export interface ClinicEvolution {
   id?: string;
@@ -193,7 +194,7 @@ export const ClinicalEvolutionMonitorService = {
         severity: "high",
         status: "pending",
         targetRoles: ["owner", "admin", "manager", "secretary", "recepcao"],
-        createdAt: new Date().toISOString(),
+        createdAt: serverTimestamp(),
         createdBySystem: true
        });
 
@@ -207,7 +208,7 @@ export const ClinicalEvolutionMonitorService = {
         professionalName: professionalName,
         dueDate: appointment.date,
         status: "pending",
-        createdAt: new Date().toISOString()
+        createdAt: serverTimestamp()
       });
     } catch (err) {
       console.error('[EvolutionMonitor] Error in createMissingEvolutionAlert:', err);
@@ -234,7 +235,7 @@ export const ClinicalEvolutionMonitorService = {
       for (const docSnap of notifSnapByAppt.docs) {
         await updateDoc(doc(db, 'clinics', clinicId, 'notifications', docSnap.id), {
           status: 'resolved',
-          resolvedAt: new Date().toISOString()
+          resolvedAt: serverTimestamp()
         });
       }
 
@@ -244,21 +245,22 @@ export const ClinicalEvolutionMonitorService = {
       for (const docSnap of notifSnapByDate.docs) {
         await updateDoc(doc(db, 'clinics', clinicId, 'notifications', docSnap.id), {
           status: 'resolved',
-          resolvedAt: new Date().toISOString()
+          resolvedAt: serverTimestamp()
         });
       }
 
       // 2. Resolve clinics/{id}/pending_items
       const pendingRef = collection(db, 'clinics', clinicId, 'pending_items');
-      
+
       const qPendingByAppt = query(pendingRef, where('appointmentId', '==', appointmentId), where('status', '==', 'pending'));
       const pendingSnapByAppt = await getDocs(qPendingByAppt);
 
       for (const docSnap of pendingSnapByAppt.docs) {
         await updateDoc(doc(db, 'clinics', clinicId, 'pending_items', docSnap.id), {
           status: 'resolved',
-          resolvedAt: new Date().toISOString()
+          resolvedAt: serverTimestamp()
         });
+        logStatusEvent(clinicId, { entityType: 'pending_item', entityId: docSnap.id, eventType: 'pending_item_resolved', patientId, fromStatus: 'pending', toStatus: 'resolved', metadata: { type: 'missing_clinical_evolution', resolvedBy: 'Sistema (Auto)' } });
       }
 
       const qPendingByDate = query(pendingRef, where('patientId', '==', patientId), where('dueDate', '==', date), where('type', '==', 'missing_clinical_evolution'), where('status', '==', 'pending'));
@@ -267,8 +269,9 @@ export const ClinicalEvolutionMonitorService = {
       for (const docSnap of pendingSnapByDate.docs) {
         await updateDoc(doc(db, 'clinics', clinicId, 'pending_items', docSnap.id), {
           status: 'resolved',
-          resolvedAt: new Date().toISOString()
+          resolvedAt: serverTimestamp()
         });
+        logStatusEvent(clinicId, { entityType: 'pending_item', entityId: docSnap.id, eventType: 'pending_item_resolved', patientId, fromStatus: 'pending', toStatus: 'resolved', metadata: { type: 'missing_clinical_evolution', resolvedBy: 'Sistema (Auto)' } });
       }
     } catch (err) {
       console.error('[EvolutionMonitor] Error in resolveMissingEvolutionAlert:', err);
@@ -304,7 +307,7 @@ export const ClinicalEvolutionMonitorService = {
             professionalName: notif.professionalName || '',
             date: notif.date || '',
             description: "Evolução clínica registrada na ficha do paciente",
-            createdAt: new Date().toISOString(),
+            createdAt: serverTimestamp(),
             createdBy: "Sistema (Auto)"
           });
         } catch (eErr) {
@@ -314,7 +317,7 @@ export const ClinicalEvolutionMonitorService = {
         // Resolve notification
         await updateDoc(doc(db, 'clinics', clinicId, 'notifications', docSnap.id), {
           status: 'resolved',
-          resolvedAt: new Date().toISOString()
+          resolvedAt: serverTimestamp()
         });
       }
 
@@ -324,8 +327,9 @@ export const ClinicalEvolutionMonitorService = {
       for (const docSnap of snapPending.docs) {
         await updateDoc(doc(db, 'clinics', clinicId, 'pending_items', docSnap.id), {
           status: 'resolved',
-          resolvedAt: new Date().toISOString()
+          resolvedAt: serverTimestamp()
         });
+        logStatusEvent(clinicId, { entityType: 'pending_item', entityId: docSnap.id, eventType: 'pending_item_resolved', patientId, fromStatus: 'pending', toStatus: 'resolved', metadata: { type: 'missing_clinical_evolution', resolvedBy: 'Sistema (Auto)' } });
       }
     } catch (err) {
       console.error('[EvolutionMonitor] Error in resolveEvolutionsForPatient:', err);
@@ -360,7 +364,7 @@ export const ClinicalEvolutionMonitorService = {
                 professionalName: item.professionalName || '',
                 date: date,
                 description: "Evolução clínica registrada via tarefas pendentes",
-                createdAt: new Date().toISOString(),
+                createdAt: serverTimestamp(),
                 createdBy: "Sistema (Auto via Tarefas)"
               });
             } catch (eErr) {
@@ -370,26 +374,27 @@ export const ClinicalEvolutionMonitorService = {
             // Also resolve any associated notifications for this specific appointment/patient
             const notifRef = collection(db, 'clinics', clinicId, 'notifications');
             const qNotif = query(
-              notifRef, 
-              where('patientId', '==', patientId), 
-              where('appointmentId', '==', apptId), 
+              notifRef,
+              where('patientId', '==', patientId),
+              where('appointmentId', '==', apptId),
               where('status', '==', 'pending')
             );
             const snapNotif = await getDocs(qNotif);
             for (const docSnap of snapNotif.docs) {
               await updateDoc(doc(db, 'clinics', clinicId, 'notifications', docSnap.id), {
                 status: 'resolved',
-                resolvedAt: new Date().toISOString()
+                resolvedAt: serverTimestamp()
               });
             }
           }
         }
-      }
 
-      await updateDoc(pendingDocRef, {
-        status: 'resolved',
-        resolvedAt: new Date().toISOString()
-      });
+        await updateDoc(pendingDocRef, {
+          status: 'resolved',
+          resolvedAt: serverTimestamp()
+        });
+        logStatusEvent(clinicId, { entityType: 'pending_item', entityId: taskId, eventType: 'pending_item_resolved', patientId: item.patientId || null, fromStatus: item.status || 'pending', toStatus: 'resolved', metadata: { type: item.type, resolvedBy: 'Sistema (Auto via Tarefas)' } });
+      }
     } catch (err) {
       console.error('[EvolutionMonitor] Error in resolveSpecificPendingItem:', err);
     }

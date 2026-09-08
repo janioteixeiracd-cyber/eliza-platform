@@ -46,6 +46,401 @@
 
   --radius-next-xl: 14px;
   --radius-next-2xl: 18px;
+
+  /* Redeclared at the real Tailwind default values so the light-theme
+     override block below can flip them via a CSS custom-property cascade
+     instead of touching every bg-slate-900/text-slate-400/border-slate-800
+     class across every src/next component file. Those hardcoded
+     slate-scale utilities are what most Next screens actually use for
+     surfaces, text and borders, not just the color-next tokens above, so
+     redefining the scale itself is what makes a real light mode possible
+     without a file-by-file rewrite. Values must stay exactly the Tailwind
+     defaults here; this only exists to make them var()-driven, without
+     changing how dark mode looks. */
+  --color-slate-50: #f8fafc;
+  --color-slate-100: #f1f5f9;
+  --color-slate-200: #e2e8f0;
+  --color-slate-300: #cbd5e1;
+  --color-slate-400: #94a3b8;
+  --color-slate-500: #64748b;
+  --color-slate-600: #475569;
+  --color-slate-700: #334155;
+  --color-slate-800: #1e293b;
+  --color-slate-900: #0f172a;
+  --color-slate-950: #020617;
+}
+
+/* ELIZA NEXT: Light Premium theme. Scoped to [data-theme="light"], set only
+   on the ElizaNextLayout root (dark mode and the public/legacy screens are
+   never touched by any rule below).
+
+   Three-layer composition: a permanently dark sidebar (its own local
+   variable re-scope further down) + an off-white workspace + white cards,
+   so Light Mode reads as a premium SaaS surface instead of a plain
+   inverted dark theme. The slate scale is still inverted at each lightness
+   step for everything OUTSIDE the sidebar (every existing
+   bg-slate-900/text-slate-400/border-slate-800 utility across every Next
+   screen keeps working with no file-by-file rewrite), but the target hex
+   values below are chosen to match the ELIZA Light Premium palette rather
+   than flat Tailwind defaults. */
+[data-theme="light"] {
+  /* Brand */
+  --eliza-primary: #6D28D9;
+  --eliza-primary-strong: #5B21B6;
+  --eliza-primary-bright: #7C3AED;
+  --eliza-violet: #8B5CF6;
+  --eliza-lilac: #C4B5FD;
+  --eliza-soft: #EDE9FE;
+  --eliza-ultra-soft: #F5F3FF;
+
+  /* Workspace */
+  --bg-app: #F7F8FC;
+  --bg-content: #FAFAFD;
+  --surface: #FFFFFF;
+  --surface-secondary: #F8F7FC;
+
+  /* Typography */
+  --text-primary: #111827;
+  --text-secondary: #475569;
+  --text-muted: #64748B;
+  --text-soft: #94A3B8;
+
+  /* Borders */
+  --border: #E5E7EB;
+  --border-soft: #EEEAF7;
+  --border-purple: #DDD6FE;
+
+  /* Semantic */
+  --success: #16A34A;
+  --success-bg: #ECFDF3;
+  --danger: #EF4444;
+  --danger-bg: #FFF1F2;
+  --warning: #F97316;
+  --warning-bg: #FFF7ED;
+  --info: #2563EB;
+  --info-bg: #EFF6FF;
+
+  /* Radius & shadow systems */
+  --radius-sm: 8px;
+  --radius-md: 12px;
+  --radius-card: 16px;
+  --radius-hero: 22px;
+  --radius-pill: 999px;
+  --shadow-xs: 0 2px 6px rgba(15, 23, 42, .04);
+  --shadow-sm: 0 4px 14px rgba(15, 23, 42, .05);
+  --shadow-md: 0 10px 30px rgba(15, 23, 42, .08);
+  --shadow-hero: 0 16px 40px rgba(31, 24, 55, .09);
+  --shadow-purple: 0 12px 30px rgba(109, 40, 217, .25);
+
+  /* App-wide slate scale, recalibrated to the palette above (backgrounds
+     white/off-white, text dark grays, borders soft lavender) instead of a
+     generic gray inversion. */
+  --color-slate-50: #0B1220;
+  --color-slate-100: #111827;
+  --color-slate-200: #1F2937;
+  --color-slate-300: #475569;
+  --color-slate-400: #64748B;
+  --color-slate-500: #94A3B8;
+  --color-slate-600: #CBD5E1;
+  --color-slate-700: #E5E7EB;
+  --color-slate-800: #EEEAF7;
+  --color-slate-900: #FFFFFF;
+  --color-slate-950: #F7F8FC;
+
+  --color-next-bg-deep: #F7F8FC;
+  --color-next-bg-card: #FFFFFF;
+  --color-next-bg-card-hover: #F8F7FC;
+  --color-next-border: #EEEAF7;
+  --color-next-border-glow: #DDD6FE;
+
+  /* Brand purples stay put: they are accent/CTA colors, not surfaces, and
+     read fine on both light and dark. Only the two tokens actually used as
+     text color on a dark background (purple-light, ia-blue-light) get
+     inverted; left as near-white lilac/blue, they would be invisible on a
+     white page. Re-scoped back to their light-lilac originals inside the
+     sidebar below, where the background stays dark. */
+  --color-next-purple-light: #6D28D9;
+  --color-next-ia-blue-light: #1D4ED8;
+
+  --shadow-next-glass: 0 16px 40px rgba(31, 24, 55, .09), 0 2px 8px rgba(31, 24, 55, .04);
+}
+
+/* Sidebar stays permanently dark in Light Mode — a local re-scope of the
+   same slate variables (and the two "light text on dark" brand tokens)
+   back to their dark-mode values, just for this subtree, so every existing
+   bg-slate-*/text-slate-*/border-slate-* utility already used throughout
+   the sidebar markup (nav items, hover states, footer) renders dark
+   exactly as in Dark Mode, without touching a single element by hand. */
+[data-theme="light"] .eliza-sidebar-shell {
+  --color-slate-50: #f8fafc;
+  --color-slate-100: #f1f5f9;
+  --color-slate-200: #e2e8f0;
+  --color-slate-300: #cbd5e1;
+  --color-slate-400: #94a3b8;
+  --color-slate-500: #64748b;
+  --color-slate-600: #475569;
+  --color-slate-700: #334155;
+  --color-slate-800: #1e293b;
+  --color-slate-900: #0e0b16;
+  --color-slate-950: #07050c;
+  --color-next-purple-light: #ddd6fe;
+}
+/* Separate selector from the rule above on purpose: the CSS minifier
+   (Lightning CSS, via Tailwind v4's Vite plugin) was silently dropping the
+   entire combined rule — a base ".eliza-sidebar-shell" rule followed by
+   several ".eliza-sidebar-shell <descendant>" rules confused its rule-merge
+   pass and the base rule's declarations (background/border/shadow) never
+   made it into the compiled CSS at all, even though every descendant rule
+   compiled fine. Splitting the background/border/shadow onto their own
+   class name (still applied to the same <aside>) sidesteps that selector
+   pattern entirely. Verified in the built dist/assets/*.css that this
+   version actually contains the gradient, where the previous one didn't. */
+[data-theme="light"] .eliza-sidebar-bg {
+  /* Navy/indigo dominant (70%), deep violet layered in (20%), lilac/white
+     as the accent (10%) — three stacked layers so violet reads as light
+     glowing ON the navy, not as its own solid color. Exact stops from the
+     approved reference — do not reinterpret. */
+  background:
+    radial-gradient(circle at 78% 18%, rgba(124, 58, 237, 0.18) 0%, rgba(124, 58, 237, 0.07) 24%, transparent 42%),
+    radial-gradient(circle at 35% 96%, rgba(109, 40, 217, 0.16) 0%, transparent 36%),
+    linear-gradient(180deg, #11143A 0%, #151643 42%, #1D1858 72%, #24156B 100%);
+  border-right: 1px solid rgba(139, 92, 246, 0.13);
+  box-shadow: 8px 0 30px rgba(15, 23, 42, 0.07);
+}
+[data-theme="light"] .eliza-sidebar-logo {
+  filter: drop-shadow(0 5px 14px rgba(139, 92, 246, .22));
+}
+
+/* Nav items: near-white text at full legibility, lilac icons at rest, a
+   soft violet-tinted hover, and an ELIZA gradient pill only for the active
+   item — this is the one place violet gets to dominate, everything else
+   stays navy. Text/icon opacity kept high on purpose — an earlier pass let
+   these fade too close to the background. */
+[data-theme="light"] .eliza-sidebar-shell .eliza-nav-item,
+[data-theme="light"] .eliza-sidebar-shell .eliza-nav-item span {
+  color: rgba(248, 247, 255, 0.90);
+  font-weight: 500;
+}
+[data-theme="light"] .eliza-sidebar-shell .eliza-nav-item svg {
+  color: #D8CCFF;
+  opacity: 1;
+}
+[data-theme="light"] .eliza-sidebar-shell .eliza-nav-item {
+  border: 1px solid transparent;
+  transition: background 180ms ease, color 180ms ease, transform 180ms ease, border-color 180ms ease, box-shadow 180ms ease;
+}
+[data-theme="light"] .eliza-sidebar-shell .eliza-nav-item:not(.eliza-nav-active):hover,
+[data-theme="light"] .eliza-sidebar-shell .eliza-nav-item:not(.eliza-nav-active):hover span {
+  color: #FFFFFF;
+}
+[data-theme="light"] .eliza-sidebar-shell .eliza-nav-item:not(.eliza-nav-active):hover {
+  background: rgba(139, 92, 246, 0.11);
+  border-color: rgba(196, 181, 253, 0.10);
+  transform: translateX(2px);
+}
+[data-theme="light"] .eliza-sidebar-shell .eliza-nav-item:not(.eliza-nav-active):hover svg {
+  color: #FFFFFF;
+}
+
+/* Active nav item: a violet-lit surface inside the navy — the most
+   important contrast moment in the sidebar. */
+[data-theme="light"] .eliza-sidebar-shell .eliza-nav-active {
+  position: relative;
+  background: linear-gradient(100deg, #6D28D9 0%, #7C3AED 52%, #5B21B6 100%);
+  border: 1px solid rgba(196, 181, 253, 0.22);
+  box-shadow: 0 10px 26px rgba(109, 40, 217, 0.32), inset 0 1px 0 rgba(255, 255, 255, 0.13);
+  border-radius: 12px;
+}
+[data-theme="light"] .eliza-sidebar-shell .eliza-nav-active::before {
+  content: "";
+  position: absolute;
+  inset: -8px;
+  background: radial-gradient(circle, rgba(124, 58, 237, 0.16), transparent 65%);
+  filter: blur(10px);
+  pointer-events: none;
+}
+[data-theme="light"] .eliza-sidebar-shell .eliza-nav-active,
+[data-theme="light"] .eliza-sidebar-shell .eliza-nav-active span {
+  color: #FFFFFF;
+}
+[data-theme="light"] .eliza-sidebar-shell .eliza-nav-active svg {
+  color: #FFFFFF;
+  filter: drop-shadow(0 2px 5px rgba(255, 255, 255, .15));
+}
+
+/* Theme toggle capsule — subtle glass on navy, gradient only on the active
+   pill (matches the nav "light on navy" language instead of a flat purple
+   fill). */
+[data-theme="light"] .eliza-sidebar-shell .eliza-theme-toggle {
+  background: rgba(255, 255, 255, .055);
+  border-color: rgba(255, 255, 255, .09);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, .04);
+}
+[data-theme="light"] .eliza-sidebar-shell .eliza-theme-toggle-active {
+  background: linear-gradient(135deg, #8B5CF6, #6D28D9);
+  box-shadow: 0 4px 14px rgba(109, 40, 217, .38);
+  color: #FFFFFF;
+}
+
+/* "Eliza 2.9" sidebar card — glassy and part of the sidebar surface itself,
+   not the opaque brand-gradient card the floating button elsewhere reuses. */
+[data-theme="light"] .eliza-sidebar-shell .eliza-consciousness-card {
+  background: linear-gradient(145deg, rgba(255, 255, 255, .075), rgba(124, 58, 237, .11));
+  border: 1px solid rgba(196, 181, 253, .14);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, .05);
+}
+
+/* Off-white workspace background — never pure white, so the white cards
+   read as elevated surfaces. Applied to the scrollable content area (not
+   --color-next-bg-deep itself, which the hero card also uses as a plain
+   gradient stop color and can't hold a gradient value). */
+[data-theme="light"] .eliza-main {
+  background: linear-gradient(180deg, #FBFBFE 0%, #F7F8FC 100%);
+}
+
+/* Topbar — precise glass values from the reference (close to, but more
+   exact than, what the recalibrated slate-900/40+blur combo alone gives). */
+[data-theme="light"] .eliza-topbar {
+  background: rgba(255, 255, 255, .94);
+  border-bottom-color: #E9E7F0;
+}
+
+/* Hero greeting: only the person's name gets the brand gradient text
+   treatment; everything else stays --text-primary via the recalibrated
+   slate scale above. Inert in Dark Mode (no [data-theme="light"] match). */
+[data-theme="light"] .eliza-name-gradient {
+  background: linear-gradient(90deg, #5B21B6, #7C3AED, #8B5CF6);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+/* Hero attention summary — darker than the generic muted-text-slate-400
+   used everywhere else in the app, just for this one paragraph. */
+[data-theme="light"] .eliza-attention-summary {
+  color: #1F2937;
+}
+
+/* Hero card radius — 22px per the reference, distinct from the default
+   --radius-next-2xl (18px) used elsewhere so this one change doesn't ripple
+   into every other rounded-next-2xl surface in the app. */
+[data-theme="light"] .eliza-consciousness-hero {
+  border-radius: 22px;
+}
+
+/* KPI card icon containers — hidden by default (zero visual change in Dark
+   Mode, which never used icons on these cards) and shown only in Light
+   Mode, colored per semantic meaning. */
+.eliza-metric-icon { display: none; }
+[data-theme="light"] .eliza-metric-icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 2.25rem;
+  height: 2.25rem;
+  border-radius: var(--radius-sm);
+  flex-shrink: 0;
+}
+[data-theme="light"] .eliza-metric-icon[data-tone="purple"] { background: #EDE9FE; color: #6D28D9; }
+[data-theme="light"] .eliza-metric-icon[data-tone="violet"] { background: #F3E8FF; color: #7C3AED; }
+[data-theme="light"] .eliza-metric-icon[data-tone="blue"]   { background: #DBEAFE; color: #2563EB; }
+[data-theme="light"] .eliza-metric-icon[data-tone="green"]  { background: #DCFCE7; color: #16A34A; }
+[data-theme="light"] .eliza-metric-icon[data-tone="red"]    { background: #FCE7F3; color: #E11D48; }
+
+/* Opportunity Deck cards — a uniform deep-violet "ELIZA identity" card
+   instead of four pastel-tinted backgrounds, with the severity accent
+   reserved for the tag, the icon circle and the CTA. Dark Mode keeps the
+   original translucent severity tint (untouched — this block only exists
+   under [data-theme="light"]). */
+[data-theme="light"] .eliza-insight-card {
+  background:
+    radial-gradient(circle at 88% 50%, rgba(139, 92, 246, .22), transparent 28%),
+    linear-gradient(105deg, #11143D 0%, #21145F 48%, #4217A8 100%);
+  border: 1px solid rgba(196, 181, 253, 0.15);
+  border-radius: 18px;
+  box-shadow: 0 18px 45px rgba(55, 31, 120, 0.20);
+  color: #F8F7FF;
+}
+[data-theme="light"] .eliza-insight-card:hover {
+  box-shadow: 0 20px 50px rgba(55, 31, 120, 0.28);
+  border-color: rgba(196, 181, 253, 0.30);
+}
+[data-theme="light"] .eliza-insight-card svg {
+  filter: drop-shadow(0 2px 5px rgba(139, 92, 246, .3));
+}
+[data-theme="light"] .eliza-insight-card .eliza-insight-icon {
+  background: rgba(139, 92, 246, 0.22);
+  color: #DDD6FE;
+}
+/* Tag text stays white/bold — only the icon (and the tag's own translucent
+   background) carries the severity color, per feedback: color goes on the
+   icon, not the label letters. */
+[data-theme="light"] .eliza-insight-card .eliza-insight-tag {
+  background: rgba(255, 255, 255, 0.12);
+  color: #FFFFFF;
+  text-decoration: none;
+}
+[data-theme="light"] .eliza-insight-card[data-severity="risco"] .eliza-insight-icon {
+  background: rgba(239, 68, 68, .28); color: #FCA5A5;
+}
+[data-theme="light"] .eliza-insight-card[data-severity="atencao"] .eliza-insight-icon {
+  background: rgba(249, 115, 22, .28); color: #FDBA74;
+}
+[data-theme="light"] .eliza-insight-card[data-severity="oportunidade"] .eliza-insight-icon {
+  background: rgba(34, 197, 94, .28); color: #86EFAC;
+}
+[data-theme="light"] .eliza-insight-card[data-severity="info"] .eliza-insight-icon {
+  background: rgba(59, 130, 246, .28); color: #93C5FD;
+}
+[data-theme="light"] .eliza-insight-card .eliza-insight-cta {
+  background: rgba(255, 255, 255, .12);
+  border-color: rgba(255, 255, 255, .2);
+  color: #FFFFFF;
+}
+[data-theme="light"] .eliza-insight-card .eliza-insight-cta:hover {
+  background: rgba(255, 255, 255, .22);
+}
+[data-theme="light"] .eliza-insight-cta-standalone {
+  color: #DDD6FE !important;
+  background: rgba(139, 92, 246, 0.12);
+}
+[data-theme="light"] .eliza-insight-cta-standalone:hover {
+  color: #FFFFFF !important;
+  background: rgba(139, 92, 246, 0.22);
+}
+
+/* "Oportunidades detectadas" right-column list — white cards, color only on
+   the icon/CTA (never the whole card), distinct from the single purple
+   insight-em-foco card above. */
+[data-theme="light"] .eliza-opportunity-card {
+  background: #FFFFFF;
+  border: 1px solid #E7E5EF;
+  border-radius: 16px;
+  padding: 16px;
+  box-shadow: 0 6px 20px rgba(15, 23, 42, .055);
+  transition: transform 180ms ease, box-shadow 180ms ease, border-color 180ms ease;
+}
+[data-theme="light"] .eliza-opportunity-card:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 12px 30px rgba(15, 23, 42, .09);
+  border-color: #DDD6FE;
+}
+[data-theme="light"] .eliza-opportunity-card .eliza-opportunity-title {
+  color: #0F172A;
+}
+[data-theme="light"] .eliza-opportunity-card .eliza-opportunity-desc {
+  color: #475569;
+}
+[data-theme="light"] .eliza-opportunity-card[data-tone="purple"] .eliza-opportunity-icon { background: #F3E8FF; color: #7C3AED; }
+[data-theme="light"] .eliza-opportunity-card[data-tone="blue"]   .eliza-opportunity-icon { background: #EAF2FF; color: #2563EB; }
+[data-theme="light"] .eliza-opportunity-card[data-tone="green"]  .eliza-opportunity-icon { background: #DCFCE7; color: #16A34A; }
+[data-theme="light"] .eliza-opportunity-card[data-tone="orange"] .eliza-opportunity-icon { background: #FFF1E6; color: #F97316; }
+[data-theme="light"] .eliza-opportunity-card[data-tone="purple"] .eliza-opportunity-cta { color: #7C3AED; }
+[data-theme="light"] .eliza-opportunity-card[data-tone="blue"]   .eliza-opportunity-cta { color: #2563EB; }
+[data-theme="light"] .eliza-opportunity-card[data-tone="green"]  .eliza-opportunity-cta { color: #16A34A; }
+[data-theme="light"] .eliza-opportunity-card[data-tone="orange"] .eliza-opportunity-cta { color: #F97316; }
+[data-theme="light"] .eliza-opportunity-card .eliza-opportunity-cta:hover {
+  text-decoration: underline;
 }
 
 /* Utilitários de marca reutilizáveis em qualquer tela de src/next */
@@ -64,21 +459,95 @@
   box-shadow: var(--shadow-next-glass);
 }
 
+/* Eliza "alive" loading state — a heartbeat-style pulse used wherever the
+   app needs a full-screen loading gate, instead of a generic spinner. */
+@keyframes eliza-heartbeat-glow {
+  0%, 100% { transform: scale(1); opacity: 0.35; }
+  15% { transform: scale(1.14); opacity: 0.65; }
+  30% { transform: scale(1); opacity: 0.35; }
+  42% { transform: scale(1.22); opacity: 0.75; }
+  58%, 100% { transform: scale(1); opacity: 0.35; }
+}
+@keyframes eliza-heartbeat-mark {
+  0%, 100% { transform: scale(1); }
+  15% { transform: scale(1.06); }
+  30% { transform: scale(1); }
+  42% { transform: scale(1.1); }
+  58%, 100% { transform: scale(1); }
+}
+@keyframes eliza-ecg-sweep {
+  0% { stroke-dashoffset: 600; }
+  100% { stroke-dashoffset: -300; }
+}
+.eliza-heartbeat-glow {
+  animation: eliza-heartbeat-glow 1.8s ease-in-out infinite;
+}
+.eliza-heartbeat-mark {
+  animation: eliza-heartbeat-mark 1.8s ease-in-out infinite;
+}
+.eliza-ecg-trace {
+  stroke-dasharray: 30 570;
+  animation: eliza-ecg-sweep 2.4s linear infinite;
+}
+
+/* Opportunity Deck carousel — subtle entrance each time the visible card
+   changes (manual nav or the auto-advance timer in NextHome.tsx). */
+@keyframes eliza-deck-in {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
 html, body {
   height: 100%;
+  /* 100dvh (dynamic viewport height) tracks the real visible area as
+     Safari's toolbar shows/hides, instead of the layout viewport that
+     100vh/100% use. --app-vh (set by the inline script in index.html,
+     measuring window.visualViewport.height directly) takes precedence
+     when available — some iOS Safari versions still misreport 100dvh
+     inside an installed standalone PWA, leaving a thin unfilled strip at
+     the bottom edge even with fixed:inset-0 everywhere. */
+  height: 100dvh;
+  height: var(--app-vh, 100dvh);
   overflow: hidden;
   overscroll-behavior-y: none;
   -webkit-tap-highlight-color: transparent;
 }
 
+#root {
+  height: 100%;
+  height: 100dvh;
+  height: var(--app-vh, 100dvh);
+}
+
 body {
-  @apply bg-surface-base text-text-main font-sans antialiased;
+  /* Fundo padrão sempre escuro (cor de marca), não bg-surface-base (claro):
+     login, landing, Next e Portal já são todos dark, e telas com fundo
+     fixed:inset-0 no iOS Safari podem expor brevemente o fundo do body nas
+     bordas (bounce/scroll elástico, mudança do viewport dinâmico) — melhor
+     esse flash ser escuro (combina com quase todo o app) do que branco. As
+     telas do app legado que ainda são claras já definem seu próprio fundo
+     explícito no container raiz (bg-slate-50/bg-white), então não dependem
+     do body para isso. */
+  @apply text-text-main font-sans antialiased;
+  background: #07050c;
   padding-top: env(safe-area-inset-top, 0);
   padding-bottom: env(safe-area-inset-bottom, 0);
 }
 
 .premium-card {
   @apply bg-surface-card border border-border-subtle shadow-sm rounded-2xl;
+}
+
+/* Utilities for fixed/sticky bars that sit at the very edge of the
+   viewport (mobile headers, bottom nav/action bars). Fixed-position
+   elements ignore the body's own safe-area padding above, since they're
+   positioned against the viewport, not the body box — these classes are
+   the real fix for that. */
+.safe-area-inset-top {
+  padding-top: env(safe-area-inset-top, 0);
+}
+.safe-area-inset-bottom {
+  padding-bottom: env(safe-area-inset-bottom, 0);
 }
 
 .label-tiny {

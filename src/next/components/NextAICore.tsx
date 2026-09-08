@@ -9,25 +9,24 @@ import {
   Brain,
   CornerDownRight,
   RefreshCw,
-  AlertTriangle,
-  Lightbulb,
-  CheckCircle2
+  AlertTriangle
 } from 'lucide-react';
 import { useAuth } from '../../contexts/AuthContext';
 import { useNextReadOnly } from '../context/NextReadOnlyContext';
 import { secureGetDocs } from '../services/next-db';
 import { collection, query, limit } from 'firebase/firestore';
 import { db } from '../../lib/firebase';
-import { getGenAI } from '../../lib/gemini';
 import { normalizeFinancialEntry } from '../../utils/financialHelpers';
+import { useElizaAsk } from '../hooks/useElizaAsk';
+import InsightCard from './eliza/InsightCard';
+import type { AssistantAnswer } from '../types/eliza';
 
 interface ChatMessage {
   id: string;
   sender: 'user' | 'eliza';
   text: string;
   time: string;
-  highlights?: string[];
-  recommendedActions?: string[];
+  answer?: AssistantAnswer;
 }
 
 interface ClinicContext {
@@ -58,6 +57,7 @@ function toDate(v: any): Date | null {
 export default function NextAICore() {
   const { clinic } = useAuth();
   const { addAuditLog } = useNextReadOnly();
+  const { ask } = useElizaAsk();
 
   const [messages, setMessages] = useState<ChatMessage[]>([
     {
@@ -81,7 +81,7 @@ export default function NextAICore() {
       setLoadingContext(true);
       try {
         const patientsRef = collection(db, 'clinics', clinic.id, 'patients');
-        const patientsSnap = await secureGetDocs(query(patientsRef, limit(300)), 'patients', { addAuditLog });
+        const patientsSnap = await secureGetDocs(query(patientsRef, limit(8000)), 'patients', { addAuditLog });
 
         const apptsRef = collection(db, 'clinics', clinic.id, 'appointments');
         const apptsSnap = await secureGetDocs(query(apptsRef, limit(300)), 'appointments', { addAuditLog });
@@ -163,59 +163,26 @@ export default function NextAICore() {
     setError(null);
 
     try {
-      const c = context;
-      const contextBlock = c
-        ? `Dados reais desta clínica:
-- Pacientes cadastrados: ${c.patientCount}
-- Agendamentos de hoje: ${c.todayAppointments.length}${c.todayAppointments.length > 0 ? ' — ' + c.todayAppointments.map(a => `${a.time} ${a.patientName} (${a.treatment || 'sem procedimento informado'}, ${a.status})`).join('; ') : ''}
-- Agendamentos nos próximos 7 dias: ${c.upcomingCount}
-- Recebido hoje: ${formatCurrency(c.receivedToday)}
-- Recebido no mês: ${formatCurrency(c.receivedMonth)}
-- A receber (pendente/parcial): ${formatCurrency(c.receivable)}
-- Contas vencidas: ${c.overdueCount} lançamento(s), totalizando ${formatCurrency(c.overdueAmount)}`
-        : 'Dados da clínica ainda carregando — responda com o que for possível e avise que não há contexto completo no momento.';
-
-      const memoryBlock = conversation.length > 0
-        ? `\nHistórico recente da conversa:\n${conversation.map((m, i) => `${i + 1}. Perguntou: "${m.question}" — Você respondeu: "${m.summary}"`).join('\n')}\n`
-        : '';
-
-      const prompt = `Você é a Eliza, assistente central de inteligência de uma clínica odontológica, correlacionando agenda, pacientes e financeiro. Use SOMENTE os dados reais abaixo — nunca invente números não informados.
-
-${contextBlock}
-${memoryBlock}
-Pergunta atual do usuário: "${queryText}"
-
-Responda ESTRITAMENTE em JSON válido, sem markdown, exatamente neste formato:
-{"summary":"resposta direta em 2-4 frases citando os dados reais relevantes","highlights":["ponto de atenção ou observação concreta 1"],"recommendedActions":["ação prática recomendada 1"]}
-Se a pergunta não tiver relação com os dados disponíveis, responda educadamente no "summary" e deixe highlights/recommendedActions vazios.`;
-
-      const ai = getGenAI();
-      const response = await ai.models.generateContent({
-        model: 'gemini-2.5-flash',
-        contents: [{ role: 'user', parts: [{ text: prompt }] }],
-        taskType: 'ai_core_chat',
-        clinicId: clinic?.id,
+      // Mesmo orquestrador real usado pelo assistente flutuante
+      // (NextElizaAssistant) — tools reais de agenda/financeiro/orçamento,
+      // motor de insights determinístico, personalidade e papel funcional já
+      // trabalhados. Este componente nunca deveria ter tido seu próprio
+      // caminho de IA em paralelo (ver types/eliza.ts, useElizaAsk.ts —
+      // ambos já citavam "Assistente Central" como consumidor pretendido).
+      const answer = await ask(queryText, {
+        screenType: 'geral',
+        conversationHistory: conversation.slice(-3),
       });
-
-      const rawText: string = response?.text || response?.candidates?.[0]?.content?.parts?.[0]?.text || '';
-      const jsonMatch = rawText.match(/\{[\s\S]*\}/);
-      if (!jsonMatch) throw new Error('A Eliza respondeu, mas não em formato reconhecível. Tente novamente.');
-      const parsed = JSON.parse(jsonMatch[0]);
-
-      const summary = String(parsed.summary || '');
-      const highlights = Array.isArray(parsed.highlights) ? parsed.highlights.map(String) : [];
-      const recommendedActions = Array.isArray(parsed.recommendedActions) ? parsed.recommendedActions.map(String) : [];
 
       const elizaMsg: ChatMessage = {
         id: `eliza-${Date.now()}`,
         sender: 'eliza',
-        text: summary,
+        text: answer.summary,
         time: new Date().toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' }),
-        highlights,
-        recommendedActions,
+        answer,
       };
       setMessages(prev => [...prev, elizaMsg]);
-      setConversation(prev => [...prev.slice(-5), { question: queryText, summary }]);
+      setConversation(prev => [...prev.slice(-5), { question: queryText, summary: answer.summary }]);
 
       addAuditLog({
         collection: 'eliza_ai_core',
@@ -306,24 +273,20 @@ Se a pergunta não tiver relação com os dados disponíveis, responda educadame
                     : 'bg-slate-950 border border-next-border text-slate-300 rounded-tl-none'
                 }`}>
                   {msg.text}
-
-                  {msg.sender === 'eliza' && ((msg.highlights && msg.highlights.length > 0) || (msg.recommendedActions && msg.recommendedActions.length > 0)) && (
-                    <div className="mt-3 pt-3 border-t border-next-border/60 space-y-2">
-                      {msg.highlights && msg.highlights.length > 0 && (
-                        <div className="space-y-1">
-                          <span className="text-[9px] font-mono text-next-orange-insight uppercase tracking-wide flex items-center gap-1"><AlertTriangle className="w-2.5 h-2.5" /> Pontos de atenção</span>
-                          {msg.highlights.map((h, i) => <p key={i} className="text-[10.5px] text-slate-300">• {h}</p>)}
-                        </div>
-                      )}
-                      {msg.recommendedActions && msg.recommendedActions.length > 0 && (
-                        <div className="space-y-1">
-                          <span className="text-[9px] font-mono text-next-green-success uppercase tracking-wide flex items-center gap-1"><CheckCircle2 className="w-2.5 h-2.5" /> Ações recomendadas</span>
-                          {msg.recommendedActions.map((a, i) => <p key={i} className="text-[10.5px] text-slate-300">• {a}</p>)}
-                        </div>
-                      )}
+                  {msg.sender === 'eliza' && msg.answer?.dataSufficiency === 'insufficient' && (
+                    <p className="mt-2 text-[10px] text-next-orange-insight flex items-center gap-1"><AlertTriangle className="w-2.5 h-2.5 flex-shrink-0" /> Dados parciais para esta pergunta.</p>
+                  )}
+                  {msg.sender === 'eliza' && msg.answer?.caveats && msg.answer.caveats.length > 0 && (
+                    <div className="mt-2 pt-2 border-t border-next-border/60 space-y-1">
+                      {msg.answer.caveats.map((c, i) => <p key={i} className="text-[10px] text-slate-500">• {c}</p>)}
                     </div>
                   )}
                 </div>
+                {msg.sender === 'eliza' && msg.answer?.insights && msg.answer.insights.length > 0 && (
+                  <div className="w-full space-y-2 mt-2">
+                    {msg.answer.insights.map((ins) => <InsightCard key={ins.id} insight={ins} />)}
+                  </div>
+                )}
                 <span className="text-[8px] text-slate-500 font-mono mt-1 px-1">{msg.time}</span>
               </div>
             ))}

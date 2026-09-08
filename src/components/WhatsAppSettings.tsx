@@ -1,26 +1,14 @@
 import React, { useState, useEffect } from 'react';
-import { doc, getDoc, setDoc, deleteDoc, collection, query, orderBy, limit, onSnapshot, addDoc, serverTimestamp } from 'firebase/firestore';
+import { doc, collection, query, orderBy, limit, onSnapshot } from 'firebase/firestore';
 import { db } from '../lib/firebase';
 import { useAuth } from '../contexts/AuthContext';
-import { Smartphone, CheckCircle, XCircle, AlertTriangle, RefreshCw, Copy, ShieldCheck, Play, Send, Check, X } from 'lucide-react';
+import { isClinicOwnerOrAdmin } from '../lib/clinicRole';
+import { Smartphone, CheckCircle, XCircle, AlertTriangle, RefreshCw, Copy, Send, Check, X, Lock } from 'lucide-react';
 
-interface WhatsAppIntegration {
+interface WhatsAppStatus {
   status: 'conectado' | 'não conectado' | 'erro';
   provider: 'meta' | 'twilio';
-  phoneNumberId: string;
-  wabaId: string;
-  businessName: string;
-  displayPhoneNumber: string;
-  verifyToken: string;
-  accessTokenSecretName: string;
-  twilioAccountSid: string;
-  twilioAuthToken: string;
-  twilioWhatsAppNumber: string;
-  aiEnabled: boolean;
-  humanApprovalRequired: boolean;
-  webhookUrl: string;
-  createdAt?: any;
-  updatedAt?: any;
+  displayPhoneNumber?: string;
 }
 
 const TWILIO_SANDBOX_NUMBER = '+14155238886';
@@ -34,8 +22,22 @@ interface IntegrationLog {
   createdAt: any;
 }
 
+// Rodada final de fechamento — nenhum setDoc/deleteDoc direto pra
+// configuração do WhatsApp (Seção 13 do plano, nunca implementada até
+// agora). A configuração COMPLETA (phoneNumberId, wabaId, tokens) só é
+// lida/gravada por quem é owner/admin, sempre via os endpoints
+// /api/whatsapp/manual-config e /api/whatsapp/manual-disconnect (Admin
+// SDK, authenticateOwnerOrAdmin no servidor — o gate abaixo é só UX,
+// nunca a garantia real). Qualquer outro membro só vê o card sanitizado
+// (clinics/{id}/integrations/whatsapp_status), legível por qualquer
+// isClinicMember() via firestore.rules.
 export default function WhatsAppSettings() {
-  const { clinic } = useAuth();
+  const { clinic, user, profile } = useAuth();
+  const isOwnerOrAdmin = isClinicOwnerOrAdmin({ profileRole: profile?.role, clinicOwnerId: clinic?.ownerId, userId: user?.uid });
+
+  const [statusDoc, setStatusDoc] = useState<WhatsAppStatus | null>(null);
+  const [statusLoading, setStatusLoading] = useState(true);
+
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [copied, setCopied] = useState(false);
@@ -45,13 +47,12 @@ export default function WhatsAppSettings() {
   const [testPhoneNumberInput, setTestPhoneNumberInput] = useState('');
 
   // Form State
-  const [status, setStatus] = useState<WhatsAppIntegration['status']>('não conectado');
-  const [provider, setProvider] = useState<WhatsAppIntegration['provider']>('meta');
+  const [status, setStatus] = useState<WhatsAppStatus['status']>('não conectado');
+  const [provider, setProvider] = useState<WhatsAppStatus['provider']>('meta');
   const [phoneNumberId, setPhoneNumberId] = useState('');
   const [wabaId, setWabaId] = useState('');
   const [businessName, setBusinessName] = useState('');
   const [displayPhoneNumber, setDisplayPhoneNumber] = useState('');
-  const [verifyToken, setVerifyToken] = useState('');
   const [accessToken, setAccessToken] = useState(''); // Access token saved
   const [twilioAccountSid, setTwilioAccountSid] = useState('');
   const [twilioAuthToken, setTwilioAuthToken] = useState('');
@@ -71,143 +72,96 @@ export default function WhatsAppSettings() {
   // Webhook URL generator
   const webhookUrl = window.location.origin + '/api/whatsapp/webhook';
 
+  async function whatsappManualFetch(path: string, method: 'GET' | 'POST', body?: Record<string, any>): Promise<{ status: number; body: any }> {
+    if (!user || !clinic?.id) throw new Error('session_not_loaded');
+    const idToken = await user.getIdToken();
+    const url = method === 'GET' ? `${path}?clinicId=${encodeURIComponent(clinic.id)}` : path;
+    const response = await fetch(url, {
+      method,
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${idToken}` },
+      ...(method === 'POST' ? { body: JSON.stringify({ clinicId: clinic.id, ...(body || {}) }) } : {}),
+    });
+    let json: any = null;
+    try { json = await response.json(); } catch { /* corpo vazio/não-JSON */ }
+    return { status: response.status, body: json || {} };
+  }
+
+  // Card sanitizado — visível pra QUALQUER membro da clínica, mesmo sem
+  // acesso à configuração completa.
   useEffect(() => {
     if (!clinic) return;
+    setStatusLoading(true);
+    const statusRef = doc(db, 'clinics', clinic.id, 'integrations', 'whatsapp_status');
+    const unsub = onSnapshot(statusRef, (snap) => {
+      setStatusDoc(snap.exists() ? (snap.data() as WhatsAppStatus) : null);
+      setStatusLoading(false);
+    }, () => setStatusLoading(false));
+    return () => unsub();
+  }, [clinic]);
 
+  const fetchFullConfig = async () => {
+    if (!clinic?.id) return;
     setLoading(true);
-
-    // 1. Fetch current integration info
-    const integrationRef = doc(db, 'clinics', clinic.id, 'integrations', 'whatsapp');
-    const unsubIntegration = onSnapshot(integrationRef, (docSnap) => {
-      if (docSnap.exists()) {
-        const data = docSnap.data() as WhatsAppIntegration;
+    try {
+      const { status: httpStatus, body: data } = await whatsappManualFetch('/api/whatsapp/manual-config', 'GET');
+      if (httpStatus === 200) {
         setStatus(data.status || 'não conectado');
         setProvider(data.provider === 'twilio' ? 'twilio' : 'meta');
         setPhoneNumberId(data.phoneNumberId || '');
         setWabaId(data.wabaId || '');
         setBusinessName(data.businessName || '');
         setDisplayPhoneNumber(data.displayPhoneNumber || '');
-        setVerifyToken(data.verifyToken || '');
-        setAccessToken(data.accessTokenSecretName ? '••••••••••••••••••••••••••••••••' : ''); // Show masked if exists
+        setAccessToken(data.hasAccessToken ? '••••••••••••••••••••••••••••••••' : '');
         setTwilioAccountSid(data.twilioAccountSid || '');
-        setTwilioAuthToken(data.twilioAuthToken ? '••••••••••••••••••••••••••••••••' : '');
+        setTwilioAuthToken(data.hasTwilioAuthToken ? '••••••••••••••••••••••••••••••••' : '');
         setTwilioWhatsAppNumber(data.twilioWhatsAppNumber || TWILIO_SANDBOX_NUMBER);
         setAiEnabled(data.aiEnabled !== false);
         setHumanApprovalRequired(data.humanApprovalRequired !== false);
-      } else {
-        setStatus('não conectado');
-        // Set a random verify token initially for convenience
-        setVerifyToken(Math.random().toString(36).substring(2, 10).toUpperCase());
+        setApiNumber(data.apiNumber || '');
+        setLegacyClinicNumber(data.legacyClinicNumber || '');
+        setDefaultSendMode(data.defaultSendMode || 'eliza_api');
+        setAllowOpenExternalWhatsApp(data.allowOpenExternalWhatsApp !== false);
       }
+    } catch (err) {
+      console.warn('[WhatsApp] Failed to load config:', err);
+    } finally {
       setLoading(false);
-    });
+    }
+  };
 
-    // 2. Fetch logs in real-time
+  useEffect(() => {
+    if (!clinic || !isOwnerOrAdmin) { setLoading(false); return; }
+    fetchFullConfig();
+
     const logsQuery = query(
       collection(db, 'clinics', clinic.id, 'integration_logs'),
       orderBy('createdAt', 'desc'),
       limit(25)
     );
     const unsubLogs = onSnapshot(logsQuery, (snap) => {
-      const logsList: IntegrationLog[] = snap.docs.map(d => ({
-        id: d.id,
-        ...d.data()
-      } as IntegrationLog));
-      setLogs(logsList);
+      setLogs(snap.docs.map(d => ({ id: d.id, ...d.data() } as IntegrationLog)));
     });
-
-    // 3. Fetch multi-number configurations
-    const configRef = doc(db, 'clinics', clinic.id, 'whatsapp_settings', 'config');
-    const unsubConfig = onSnapshot(configRef, (configSnap) => {
-      if (configSnap.exists()) {
-        const data = configSnap.data();
-        setApiNumber(data.apiNumber || '');
-        setLegacyClinicNumber(data.legacyClinicNumber || '');
-        setDefaultSendMode(data.defaultSendMode || 'eliza_api');
-        setAllowOpenExternalWhatsApp(data.allowOpenExternalWhatsApp !== false);
-      }
-    });
-
-    return () => {
-      unsubIntegration();
-      unsubLogs();
-      unsubConfig();
-    };
-  }, [clinic]);
+    return () => unsubLogs();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [clinic?.id, isOwnerOrAdmin]);
 
   const handleSave = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!clinic) return;
     setSaving(true);
     setTestResult(null);
-
     try {
-      const integrationRef = doc(db, 'clinics', clinic.id, 'integrations', 'whatsapp');
-      
-      // Keep or update access token. If user didn't modify masked dots, use old token
-      let tokenToSave = accessToken;
-      const isMasked = accessToken.includes('••••');
-      let twilioTokenToSave = twilioAuthToken;
-      const isTwilioTokenMasked = twilioAuthToken.includes('••••');
-
-      let existingData: any = {};
-      if (isMasked || isTwilioTokenMasked) {
-        const snap = await getDoc(integrationRef);
-        existingData = snap.data() || {};
-        if (isMasked) tokenToSave = existingData.accessTokenSecretName || '';
-        if (isTwilioTokenMasked) twilioTokenToSave = existingData.twilioAuthToken || '';
-      }
-
-      const isConnected = provider === 'twilio'
-        ? !!(twilioAccountSid && twilioTokenToSave && twilioWhatsAppNumber)
-        : !!(phoneNumberId && wabaId && tokenToSave);
-
-      const payload: WhatsAppIntegration = {
-        status: isConnected ? 'conectado' : 'não conectado',
-        provider,
-        phoneNumberId,
-        wabaId,
-        businessName,
-        displayPhoneNumber,
-        verifyToken,
-        accessTokenSecretName: tokenToSave,
-        twilioAccountSid,
-        twilioAuthToken: twilioTokenToSave,
-        twilioWhatsAppNumber,
-        aiEnabled,
-        humanApprovalRequired,
-        webhookUrl,
-        updatedAt: serverTimestamp()
-      };
-
-      if (!existingData.createdAt) {
-        payload.createdAt = serverTimestamp();
-      }
-
-      await setDoc(integrationRef, payload, { merge: true });
-
-      // Save multi-number configuration (Part 5)
-      const configRef = doc(db, 'clinics', clinic.id, 'whatsapp_settings', 'config');
-      await setDoc(configRef, {
-        apiNumber,
-        legacyClinicNumber,
-        defaultSendMode,
-        allowOpenExternalWhatsApp,
-        updatedAt: serverTimestamp()
-      }, { merge: true });
-
-      // Add audit log
-      await addDoc(collection(db, 'clinics', clinic.id, 'integration_logs'), {
-        type: 'whatsapp',
-        action: 'save_config',
-        status: 'success',
-        message: 'Configurações de integração atualizadas e salvas pela equipe.',
-        createdAt: serverTimestamp()
+      const { status: httpStatus, body: resBody } = await whatsappManualFetch('/api/whatsapp/manual-config', 'POST', {
+        provider, phoneNumberId, wabaId, businessName, displayPhoneNumber,
+        accessToken, twilioAccountSid, twilioAuthToken, twilioWhatsAppNumber,
+        aiEnabled, humanApprovalRequired,
+        apiNumber, legacyClinicNumber, defaultSendMode, allowOpenExternalWhatsApp,
       });
-
+      if (httpStatus !== 200) throw new Error(resBody?.error || `http_${httpStatus}`);
+      await fetchFullConfig();
     } catch (err: any) {
       console.error("[WhatsApp] Error saving config:", err);
-      alert('Erro ao salvar configurações: ' + err.message);
+      alert('Erro ao salvar configurações: ' + (err.message || err));
     } finally {
       setSaving(false);
     }
@@ -216,37 +170,19 @@ export default function WhatsAppSettings() {
   const handleDisconnect = async () => {
     if (!clinic) return;
     if (!confirm('Deseja realmente desconectar e limpar os dados de integração com WhatsApp Cloud API?')) return;
-
     setSaving(true);
     setTestResult(null);
     try {
-      const integrationRef = doc(db, 'clinics', clinic.id, 'integrations', 'whatsapp');
-      await deleteDoc(integrationRef);
+      const { status: httpStatus, body: resBody } = await whatsappManualFetch('/api/whatsapp/manual-disconnect', 'POST');
+      if (httpStatus !== 200) throw new Error(resBody?.error || `http_${httpStatus}`);
 
-      // Reset form variables
-      setPhoneNumberId('');
-      setWabaId('');
-      setBusinessName('');
-      setDisplayPhoneNumber('');
-      setAccessToken('');
-      setTwilioAccountSid('');
-      setTwilioAuthToken('');
+      setPhoneNumberId(''); setWabaId(''); setBusinessName(''); setDisplayPhoneNumber('');
+      setAccessToken(''); setTwilioAccountSid(''); setTwilioAuthToken('');
       setTwilioWhatsAppNumber(TWILIO_SANDBOX_NUMBER);
-      setVerifyToken(Math.random().toString(36).substring(2, 10).toUpperCase());
       setStatus('não conectado');
-
-      // Add audit log
-      await addDoc(collection(db, 'clinics', clinic.id, 'integration_logs'), {
-        type: 'whatsapp',
-        action: 'disconnect',
-        status: 'success',
-        message: 'A integração com WhatsApp foi desativada e desconectada manualmente.',
-        createdAt: serverTimestamp()
-      });
-
     } catch (err: any) {
       console.error("[WhatsApp] Error disconnecting:", err);
-      alert('Erro ao desconectar: ' + err.message);
+      alert('Erro ao desconectar: ' + (err.message || err));
     } finally {
       setSaving(false);
     }
@@ -290,24 +226,8 @@ export default function WhatsAppSettings() {
       if (response.ok) {
         setTestResult({ success: true, message: 'Mensagem de teste enviada com sucesso! Verifique o telefone.' });
         setIsTestModalOpen(false);
-        
-        await addDoc(collection(db, 'clinics', clinic.id, 'integration_logs'), {
-          type: 'whatsapp',
-          action: 'test_send',
-          status: 'success',
-          message: `Envio de teste efetuado com sucesso para ${testPhone}.`,
-          createdAt: serverTimestamp()
-        });
       } else {
         setTestResult({ success: false, message: `Falha no envio: ${resData.error || 'Erro desconhecido'}` });
-        
-        await addDoc(collection(db, 'clinics', clinic.id, 'integration_logs'), {
-          type: 'whatsapp',
-          action: 'test_send',
-          status: 'error',
-          message: `Falha operacional no envio de teste para ${testPhone}: ${resData.error || 'Erro interno'}`,
-          createdAt: serverTimestamp()
-        });
       }
     } catch (err: any) {
       console.error("[WhatsApp Test] Error:", err);
@@ -316,6 +236,48 @@ export default function WhatsAppSettings() {
       setTestSending(false);
     }
   };
+
+  // Não é owner/admin: card sanitizado só de leitura, nunca tenta ler a
+  // configuração completa (nem via Firestore direto, nem via o endpoint
+  // owner/admin-only, que devolveria 403 de qualquer forma).
+  if (!isOwnerOrAdmin) {
+    return (
+      <div className="p-4 sm:p-8 space-y-6">
+        <div className="flex items-center justify-between gap-4 border-b border-slate-100 pb-5">
+          <div>
+            <h3 className="text-sm font-black text-slate-800 uppercase tracking-wider flex items-center gap-2">
+              <Smartphone className="w-5 h-5 text-emerald-600" />
+              Integração com WhatsApp
+            </h3>
+            <p className="text-xs text-slate-500 mt-1">Configuração completa disponível só para administradores da clínica.</p>
+          </div>
+        </div>
+        <div className="bg-white p-6 rounded-3xl border border-slate-200 shadow-sm flex items-start gap-4">
+          <div className="w-10 h-10 rounded-2xl bg-slate-50 border border-slate-100 flex items-center justify-center text-slate-400 shrink-0">
+            <Lock className="w-5 h-5" />
+          </div>
+          <div className="space-y-2">
+            {statusLoading ? (
+              <p className="text-xs text-slate-400">Carregando status...</p>
+            ) : statusDoc?.status === 'conectado' ? (
+              <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-[10px] font-black uppercase tracking-wider bg-emerald-50 text-emerald-700 border border-emerald-100">
+                <CheckCircle className="w-3.5 h-3.5" /> Conectado {statusDoc.displayPhoneNumber ? `— ${statusDoc.displayPhoneNumber}` : ''}
+              </span>
+            ) : statusDoc?.status === 'erro' ? (
+              <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-[10px] font-black uppercase tracking-wider bg-rose-50 text-rose-700 border border-rose-100">
+                <AlertTriangle className="w-3.5 h-3.5" /> Erro na conexão
+              </span>
+            ) : (
+              <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-[10px] font-black uppercase tracking-wider bg-slate-100 text-slate-600">
+                <XCircle className="w-3.5 h-3.5" /> Não conectado
+              </span>
+            )}
+            <p className="text-[11px] text-slate-400 leading-relaxed">Peça a um administrador da clínica pra configurar ou revisar os dados de conexão.</p>
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   if (loading) {
     return (
@@ -328,7 +290,7 @@ export default function WhatsAppSettings() {
 
   return (
     <div className="p-4 sm:p-8 space-y-6 sm:space-y-8">
-      
+
       {/* Intro Header */}
       <div className="flex items-center justify-between gap-4 border-b border-slate-100 pb-5">
         <div>
@@ -340,7 +302,7 @@ export default function WhatsAppSettings() {
             Conecte sua conta oficial empresarial do Meta Business Suite para receber e responder pacientes de forma 100% legalizada e escalável.
           </p>
         </div>
-        
+
         <div className="flex items-center gap-2 shrink-0">
           {status === 'conectado' ? (
             <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-[10px] font-black uppercase tracking-wider bg-emerald-50 text-emerald-700 border border-emerald-100">
@@ -362,7 +324,7 @@ export default function WhatsAppSettings() {
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
-        
+
         {/* Settings Form */}
         <div className="lg:col-span-2 space-y-6">
           <form onSubmit={handleSave} className="bg-white p-6 rounded-3xl border border-slate-200 shadow-sm space-y-5">
@@ -499,13 +461,10 @@ export default function WhatsAppSettings() {
             )}
 
             {provider === 'meta' ? (
-              <div className="bg-slate-50 border border-slate-100 p-4 rounded-2xl flex flex-col md:flex-row md:items-center justify-between gap-4 mt-6">
-                <div className="space-y-1">
-                  <span className="text-[10px] font-black text-slate-400 uppercase tracking-widest block">Segurança do Webhook (Verify Token)</span>
-                  <span className="font-mono text-xs text-slate-600 font-bold bg-white px-2.5 py-1 border border-slate-150 rounded">{verifyToken}</span>
-                </div>
-                <p className="text-[9px] text-slate-400 font-bold max-w-sm md:text-right leading-relaxed">
-                  Este token é gerado aleatoriamente e deve ser copiado para o painel da Meta ao configurar o Webhook para autenticar a conexão.
+              <div className="bg-slate-50 border border-slate-100 p-4 rounded-2xl mt-6">
+                <span className="text-[10px] font-black text-slate-400 uppercase tracking-widest block mb-1">Segurança do Webhook (Verify Token)</span>
+                <p className="text-[9px] text-slate-400 font-bold leading-relaxed">
+                  O verify token do webhook Meta é global (uma única URL de webhook cadastrada uma vez no painel do app, não por clínica) — configurado como variável de ambiente do servidor, nunca gerado ou editado por aqui.
                 </p>
               </div>
             ) : (
@@ -520,12 +479,12 @@ export default function WhatsAppSettings() {
             {/* Multi-números & Encaminhamento de Ficha */}
             <div className="pt-4 border-t border-slate-100 space-y-4">
               <h5 className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Multi-números & Comportamento de Ficha</h5>
-              
+
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                 <div className="space-y-1">
                   <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest block">Número Oficial API WhatsApp (DDI + DDD)</label>
-                  <input 
-                    type="text" 
+                  <input
+                    type="text"
                     value={apiNumber}
                     onChange={(e) => setApiNumber(e.target.value)}
                     placeholder="Ex: 5511999999999"
@@ -535,8 +494,8 @@ export default function WhatsAppSettings() {
 
                 <div className="space-y-1">
                   <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest block">Número Conectado Legado / Antigo (DDI + DDD)</label>
-                  <input 
-                    type="text" 
+                  <input
+                    type="text"
                     value={legacyClinicNumber}
                     onChange={(e) => setLegacyClinicNumber(e.target.value)}
                     placeholder="Ex: 5511988888888"
@@ -558,7 +517,7 @@ export default function WhatsAppSettings() {
               </div>
 
               <div className="flex items-start gap-3 pt-2">
-                <input 
+                <input
                   type="checkbox"
                   id="allowOpenExternalWhatsApp"
                   checked={allowOpenExternalWhatsApp}
@@ -575,9 +534,9 @@ export default function WhatsAppSettings() {
             {/* AI Settings inside configuration */}
             <div className="pt-4 border-t border-slate-100 space-y-4">
               <h5 className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Automação de IA (Elisa)</h5>
-              
+
               <div className="flex items-start gap-3">
-                <input 
+                <input
                   type="checkbox"
                   id="aiEnabled"
                   checked={aiEnabled}
@@ -591,7 +550,7 @@ export default function WhatsAppSettings() {
               </div>
 
               <div className="flex items-start gap-3">
-                <input 
+                <input
                   type="checkbox"
                   id="humanApprovalRequired"
                   checked={humanApprovalRequired}
@@ -608,7 +567,7 @@ export default function WhatsAppSettings() {
             {/* Form Actions */}
             <div className="pt-5 border-t border-slate-100 flex items-center justify-between gap-4">
               {status === 'conectado' && (
-                <button 
+                <button
                   type="button"
                   onClick={handleDisconnect}
                   className="px-4 py-2 text-xs font-black bg-rose-50 text-rose-600 border border-rose-100 hover:bg-rose-100 rounded-xl transition-all uppercase tracking-wider"
@@ -617,7 +576,7 @@ export default function WhatsAppSettings() {
                 </button>
               )}
               <div className="ml-auto flex items-center gap-2">
-                <button 
+                <button
                   type="submit"
                   disabled={saving}
                   className="flex items-center gap-2 px-5 py-2.5 text-xs font-black text-white bg-teal-600 hover:bg-teal-700 rounded-xl shadow-lg shadow-teal-600/10 disabled:opacity-50 transition-all uppercase tracking-wider"
@@ -640,7 +599,7 @@ export default function WhatsAppSettings() {
               <p className="text-xs text-slate-500 leading-relaxed">
                 Envie uma mensagem instantânea do sistema WhatsApp Cloud API diretamente para um número qualquer de testes cadastrado.
               </p>
-              
+
               <div className="flex flex-wrap items-center gap-3">
                 <button
                   type="button"
@@ -666,7 +625,7 @@ export default function WhatsAppSettings() {
 
         {/* Info Right Rails */}
         <div className="space-y-6">
-          
+
           {/* Meta Endpoints info panel */}
           <div className="bg-slate-900 text-slate-100 p-6 rounded-3xl space-y-4 shadow-xl">
             <h4 className="text-xs font-black uppercase tracking-wider text-teal-400 border-b border-slate-800 pb-2.5">Endereço Webhook Oficial</h4>
@@ -677,8 +636,8 @@ export default function WhatsAppSettings() {
             <div className="bg-slate-800/85 p-3 border border-slate-700/50 rounded-xl space-y-2 relative">
               <span className="text-[8px] font-black uppercase text-teal-500 tracking-wider">Callback URL</span>
               <p className="font-mono text-[9px] text-slate-200 break-all select-all font-semibold leading-normal">{webhookUrl}</p>
-              <button 
-                onClick={copyWebhookUrl} 
+              <button
+                onClick={copyWebhookUrl}
                 className="absolute top-2.5 right-2 text-slate-400 hover:text-white p-1 rounded"
               >
                 {copied ? <Check className="w-3.5 h-3.5 text-emerald-500" /> : <Copy className="w-3.5 h-3.5" />}
@@ -691,9 +650,9 @@ export default function WhatsAppSettings() {
                 - messages
               </div>
             </div>
-            
+
             <div className="text-[10px] text-slate-400 leading-relaxed pt-2">
-              <strong className="text-white">Instruções Meta:</strong> Use a validação hub.challange e utilize o seu Verify Token exposto no formulário da esquerda.
+              <strong className="text-white">Instruções Meta:</strong> use a validação hub.challenge; o Verify Token é global e configurado no servidor (fale com quem administra a infraestrutura).
             </div>
           </div>
 
@@ -735,10 +694,10 @@ export default function WhatsAppSettings() {
       {isTestModalOpen && (
         <div className="fixed inset-0 bg-slate-950/40 backdrop-blur-sm z-50 flex items-center justify-center p-4 animate-fade-in">
           <div className="bg-white rounded-[2.5rem] border border-slate-100 shadow-2xl w-full max-w-md overflow-hidden relative">
-            
+
             {/* Ambient pattern */}
             <div className="absolute top-0 right-0 w-32 h-32 bg-emerald-500/5 rounded-full blur-2xl pointer-events-none" />
-            
+
             {/* Header */}
             <div className="p-6 pb-0 flex items-start justify-between">
               <div className="flex gap-3">
@@ -754,7 +713,7 @@ export default function WhatsAppSettings() {
                   </p>
                 </div>
               </div>
-              <button 
+              <button
                 onClick={() => setIsTestModalOpen(false)}
                 className="w-8 h-8 rounded-full bg-slate-50 hover:bg-slate-150 transition-all flex items-center justify-center text-slate-400 hover:text-slate-600"
               >

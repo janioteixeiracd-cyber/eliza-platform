@@ -110,7 +110,7 @@ export function validateClinicIdConsistency(
   if (bodyClinicId) {
     if (bodyClinicId !== tokenClinicId) {
       throw new ElizaError(
-        ElizaErrorCode.SECURITY_MISMATCH,
+        ElizaErrorCode.UNAUTHORIZED,
         "SECURITY: clinicId no body não corresponde ao JWT.",
         403,
         { tokenClinicId, bodyClinicId }
@@ -121,7 +121,7 @@ export function validateClinicIdConsistency(
   // Context clinicId must match JWT
   if (contextClinicId !== tokenClinicId) {
     throw new ElizaError(
-      ElizaErrorCode.SECURITY_MISMATCH,
+      ElizaErrorCode.UNAUTHORIZED,
       "SECURITY: clinicId no contexto não corresponde ao JWT.",
       403,
       { tokenClinicId, contextClinicId }

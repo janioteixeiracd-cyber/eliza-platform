@@ -1,19 +1,54 @@
 {
-  "name": "ELIZA — sua plataforma inteligente",
+  "id": "/",
+  "name": "Eliza Clínica Inteligente",
   "short_name": "ELIZA",
   "description": "Plataforma inteligente que administra, organiza e impulsiona a clínica odontológica moderna com IA nativa.",
-  "start_url": "/",
+  "start_url": "/?source=pwa",
+  "scope": "/",
   "display": "standalone",
-  "background_color": "#f8fafc",
-  "theme_color": "#0d9488",
+  "display_override": ["standalone", "minimal-ui", "browser"],
+  "background_color": "#07050c",
+  "theme_color": "#07050c",
   "orientation": "portrait-primary",
+  "lang": "pt-BR",
+  "dir": "ltr",
+  "categories": ["medical", "business", "productivity"],
   "icons": [
-    {
-      "src": "/brand/eliza-mark.png",
-      "type": "image/png",
-      "sizes": "73x84",
-      "purpose": "any maskable"
-    }
+    { "src": "/icons/icon-16.png", "sizes": "16x16", "type": "image/png", "purpose": "any" },
+    { "src": "/icons/icon-32.png", "sizes": "32x32", "type": "image/png", "purpose": "any" },
+    { "src": "/icons/icon-48.png", "sizes": "48x48", "type": "image/png", "purpose": "any" },
+    { "src": "/icons/icon-72.png", "sizes": "72x72", "type": "image/png", "purpose": "any" },
+    { "src": "/icons/icon-96.png", "sizes": "96x96", "type": "image/png", "purpose": "any" },
+    { "src": "/icons/icon-128.png", "sizes": "128x128", "type": "image/png", "purpose": "any" },
+    { "src": "/icons/icon-144.png", "sizes": "144x144", "type": "image/png", "purpose": "any" },
+    { "src": "/icons/icon-152.png", "sizes": "152x152", "type": "image/png", "purpose": "any" },
+    { "src": "/icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "/icons/icon-256.png", "sizes": "256x256", "type": "image/png", "purpose": "any" },
+    { "src": "/icons/icon-384.png", "sizes": "384x384", "type": "image/png", "purpose": "any" },
+    { "src": "/icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "/icons/icon-512-maskable.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
   ],
-  "categories": ["medical", "business", "productivity"]
+  "shortcuts": [
+    {
+      "name": "Agenda",
+      "short_name": "Agenda",
+      "description": "Abrir a Agenda Inteligente",
+      "url": "/next?tab=agenda",
+      "icons": [{ "src": "/icons/icon-192.png", "sizes": "192x192" }]
+    },
+    {
+      "name": "Prontuário",
+      "short_name": "Prontuário",
+      "description": "Abrir o Prontuário Vivo",
+      "url": "/next?tab=prontuario",
+      "icons": [{ "src": "/icons/icon-192.png", "sizes": "192x192" }]
+    },
+    {
+      "name": "Portal do Paciente",
+      "short_name": "Portal",
+      "description": "Atividade do Portal do Paciente",
+      "url": "/next?tab=portalActivity",
+      "icons": [{ "src": "/icons/icon-192.png", "sizes": "192x192" }]
+    }
+  ]
 }

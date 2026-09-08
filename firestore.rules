@@ -9,13 +9,47 @@ service cloud.firestore {
 
     // --- Collection Group Security Rules ---
     // (Required for collectionGroup queries to function on nested paths under clinics)
+    // FIRESTORE RULES HARDENING 2 (checkpoint, see CEREBRO): was
+    // `allow read: if isSignedIn()` — let any signed-in user read any
+    // clinic's members docs just by knowing/guessing the path. Restricted
+    // to self-only. This collectionGroup query has exactly one real
+    // consumer (AuthContext.tsx's staff-login clinic resolution, which
+    // doesn't know clinicId yet and queries `where('uid','==', own uid)`
+    // across all clinics) plus a server-side Admin-SDK equivalent in
+    // authController.ts (bypasses rules entirely, unaffected either way).
+    // Every other "list my team" feature in this app already uses a
+    // clinic-scoped collection() query, not this collectionGroup — so this
+    // restriction has no other consumer to break.
+    //
+    // Checks resource.data.uid, NOT the memberId path variable — confirmed
+    // empirically that Firestore rejects a collectionGroup `list` outright
+    // ("Null value error") when the rule depends on a path wildcard the
+    // query itself doesn't filter by; it can only statically prove the
+    // query safe when the rule condition mirrors the query's own `where`
+    // field. AuthContext.tsx (and this file's own writers — uid field is
+    // always set equal to the doc's own id at creation) already guarantee
+    // resource.data.uid == the doc's id, so this is equivalent in practice
+    // to the memberId check, just expressed in the form Firestore can
+    // actually verify against the real query shape.
     match /{path=**}/members/{memberId} {
-      allow read: if isSignedIn();
+      allow read: if isSignedIn() && resource.data.uid == request.auth.uid;
     }
 
     match /{path=**}/education_students/{studentId} {
       allow read: if isSignedIn();
     }
+
+    // Deliberately NO {path=**}/staff/{staffUid} collection-group rule here.
+    // Firestore evaluates every matching `match` block with OR semantics —
+    // a broad wildcard rule (even `isSignedIn()`) would override the tightly
+    // scoped nested rule under education_turmas/{turmaId}/staff below and
+    // let any signed-in user (including a student) read any staff doc
+    // directly, defeating Ajuste 2 of the Slice 2 homologation. Because of
+    // this, listing "which turmas is this professor staff of" cannot use
+    // collectionGroup('staff') safely yet — deferred; see the Slice 2 design
+    // doc and AcademyEnrollmentService for the scoped-query alternative used
+    // instead (per-turma membership checks, not a cross-turma collection
+    // group scan).
 
     // Needed for the Super Admin panel's cross-clinic AI usage rollup
     // (collectionGroup('ai_usage_logs')). A rule nested only under
@@ -74,6 +108,16 @@ service cloud.firestore {
       );
     }
 
+    // Planejamento → Execução: only a member flagged as a real clinical
+    // provider (or a clinic admin/owner) may start/confirm a ClinicalExecution
+    // — reuses the existing `isClinicalProvider` member flag (already the
+    // real "attends patients" signal used to filter the Agenda professional
+    // list) instead of inventing a parallel permission just for this.
+    function isClinicalProvider(clinicId) {
+      return isClinicMember(clinicId) &&
+             getMember(clinicId, request.auth.uid).data.get('isClinicalProvider', false) == true;
+    }
+
     function isStudentOfClinic(clinicId) {
       return isSignedIn() && (
         exists(/databases/$(database)/documents/clinics/$(clinicId)/education_students/$(request.auth.uid)) ||
@@ -82,6 +126,57 @@ service cloud.firestore {
          get(/databases/$(database)/documents/users/$(request.auth.uid)).data.get('defaultClinicId', '') == clinicId)
       );
     }
+
+    // Slice 2A — Fundação Acadêmica (Turma + Matrícula). Kept separate from
+    // isClinicMember/isStudentOfClinic on purpose: neither "any staff member"
+    // nor "any student of the clinic" is authorized to read/manage a turma —
+    // access is scoped to the specific turma via staff assignment or a valid
+    // enrollment. See CEREBRO / Slice 2 design doc for the homologation that
+    // required this narrowing.
+    function isAdminCurso(clinicId) {
+      return isClinicMember(clinicId) &&
+             getMember(clinicId, request.auth.uid).data.get('courseRole', '') == 'admin_curso';
+    }
+
+    function isTurmaStaff(clinicId, turmaId) {
+      return isSignedIn() &&
+        exists(/databases/$(database)/documents/clinics/$(clinicId)/education_turmas/$(turmaId)/staff/$(request.auth.uid)) &&
+        get(/databases/$(database)/documents/clinics/$(clinicId)/education_turmas/$(turmaId)/staff/$(request.auth.uid)).data.active == true;
+    }
+
+    // Deterministic enrollment id (`${turmaId}_${studentId}`) means this is a
+    // single exists()+get() instead of a query — same trick used to resolve
+    // a student's clinic by path elsewhere in this file.
+    function hasValidEnrollment(clinicId, turmaId) {
+      return isSignedIn() &&
+        exists(/databases/$(database)/documents/clinics/$(clinicId)/education_enrollments/$(turmaId + '_' + request.auth.uid)) &&
+        get(/databases/$(database)/documents/clinics/$(clinicId)/education_enrollments/$(turmaId + '_' + request.auth.uid)).data.status != 'cancelada';
+    }
+
+    // FIRESTORE RULES HARDENING 1 — the generic wildcard below matches ANY
+    // path under clinics/{clinicId}, including deeply nested ones like
+    // patients/{id}/clinical_plans/{id}/executions/{id}(/addenda/{id}).
+    // subcollection[0] alone (used for the flat exclusions below) can't
+    // express "patients/**, except this one specific nested subtree" — this
+    // helper does the positional check for exactly that case, so the rest
+    // of patients/** (base doc, images, quotations, etc. — deliberately
+    // untouched by this hardening, see CEREBRO) keeps its current wildcard
+    // access.
+    // subcollection.size(), `x in subcollection`, and .join() are all
+    // unsupported on the captured {subcollection=**} wildcard variable
+    // ("Function not found", confirmed empirically) — but request.path
+    // No isClinicalExecutionPath() function — every attempt (subcollection
+    // .size(), `in`, .join(), has(), request.path.size(), ternary
+    // short-circuiting) either isn't a supported operation on this path
+    // type ("Function not found"/"Invalid function name") or still throws
+    // on genuine out-of-range indexing once the shallower segments already
+    // matched (a 4-segment clinical_plans doc read legitimately needs to
+    // check index 4, which doesn't exist for it). None of these give a safe
+    // arbitrary-depth check. Solved instead below by restructuring
+    // patients/** into nested matches, where Firestore's own path routing
+    // (not a CEL boolean expression) distinguishes depth — every check that
+    // remains only ever needs index 0 of ITS OWN nesting level, which is
+    // always safe for a non-empty ** capture.
 
     // --- Collections ---
 
@@ -103,7 +198,49 @@ service cloud.firestore {
     match /platform_audit_logs/{id} { allow read, write: if isPlatformAdmin(); }
     match /platform_clinics/{id} { allow read, write: if isPlatformAdmin(); }
     match /platform_users/{id} { allow read, write: if isPlatformAdmin(); }
-    match /platform_plans/{id} { allow read, write: if isPlatformAdmin(); }
+    // Read relaxed to any signed-in user (not just platform admins) —
+    // CheckoutView needs to show real plan pricing to a paying candidate who
+    // isn't an admin. Nothing sensitive lives here (unlike
+    // platform_config/founding_promo, which stays admin-only since
+    // slotsClaimed shouldn't leak — the price a candidate should pay comes
+    // from a server.ts endpoint, not a client read of that doc).
+    match /platform_plans/{id} { allow read: if isSignedIn(); allow write: if isPlatformAdmin(); }
+    // Founding-clinics promo config (single doc, e.g. platform_config/founding_promo).
+    // Client never reads this directly — the price shown at checkout comes from
+    // a server.ts endpoint (adminDb), so slotsClaimed/totalSlots never leak to
+    // an unauthenticated or non-admin client.
+    match /platform_config/{id} { allow read, write: if isPlatformAdmin(); }
+
+    // Cadastro → Checkout (Asaas): "authenticated but hasn't paid yet" state.
+    // Deliberately NOT stored on users/{uid} — that doc's write rule below is
+    // unqualified for the owner (isOwner(userId) with no field guard), so any
+    // signed-in user could self-write a fake paid status there via the client
+    // SDK. This collection is write-locked to isPlatformAdmin() — in practice
+    // only server.ts (Admin SDK, bypasses rules) ever writes it; the owning
+    // user can only read their own doc to know what step they're on.
+    match /signups/{uid} {
+      allow read: if isOwner(uid) || isPlatformAdmin();
+      allow write: if isPlatformAdmin();
+    }
+
+    // WhatsApp Embedded Signup (2026-08-31, plano vast-yawning-hamster.md
+    // v4) — índice de roteamento phoneNumberId -> clinicId, top-level
+    // (o webhook inbound só sabe o phoneNumberId, precisa achar a clínica
+    // sem saber o clinicId de antemão). Só Admin SDK toca isso.
+    match /whatsapp_phone_index/{phoneNumberId} {
+      allow read, write: if false;
+    }
+
+    // Quarentena de roteamento inbound (rodada final de fechamento) —
+    // inconsistências PERSISTENTES do índice acima (nunca falha
+    // recuperável, essa vira 503 sem gravar nada) ficam aqui, sanitizadas
+    // (só phoneNumberId + motivo + contagem, nunca payload). Top-level
+    // porque o roteamento ainda não sabe a que clínica o phoneNumberId
+    // deveria pertencer — é exatamente essa incerteza que está sendo
+    // registrada. Só Admin SDK toca isso.
+    match /whatsapp_routing_quarantine/{hash} {
+      allow read, write: if false;
+    }
 
     // Support for Legacy Patients under root collection for clinical continuity
     match /patients/{patientId} {
@@ -139,10 +276,29 @@ service cloud.firestore {
       allow create: if isSignedIn();
       allow update: if isClinicOwner(clinicId) || isClinicAdmin(clinicId) || isPlatformAdmin();
 
+      // FIRESTORE RULES HARDENING 2 (checkpoint, see CEREBRO): `update` used
+      // to allow request.auth.uid == memberId with NO field restriction —
+      // a member could self-write role/courseRole/permission
+      // flags/active/status, i.e. self-promote to admin or reactivate a
+      // removed membership. Audited the real schema (every actual writer:
+      // inviteService.ts, AcceptInviteView.tsx, NextAdmin.tsx,
+      // FinancialView.tsx, CommissionSettingsView.tsx) — found ZERO
+      // existing "edit my own profile" flow that writes this collection at
+      // all; the only self-writes are one-time, at accept-invite/onboarding
+      // time, and those are CREATE operations (already admin/owner-only,
+      // no self-create branch — untouched here). Allowlist below is
+      // deliberately minimal (name/photoURL only, matching the same
+      // cosmetic-only precedent already used for users/{uid} self-updates
+      // elsewhere) rather than guessing at a broader "probably fine" set.
+      function isSelfEditableMemberUpdate() {
+        return request.resource.data.diff(resource.data).affectedKeys().hasOnly(['name', 'photoURL', 'updatedAt']);
+      }
+
       match /members/{memberId} {
         allow read: if (isSignedIn() && request.auth.uid == memberId) || isClinicMember(clinicId) || isClinicAdmin(clinicId) || isPlatformAdmin();
         allow create: if isClinicAdmin(clinicId) || isClinicOwner(clinicId) || isPlatformAdmin();
-        allow update: if isClinicAdmin(clinicId) || isClinicOwner(clinicId) || request.auth.uid == memberId || isPlatformAdmin();
+        allow update: if isClinicAdmin(clinicId) || isClinicOwner(clinicId) || isPlatformAdmin()
+                      || (isSignedIn() && request.auth.uid == memberId && isSelfEditableMemberUpdate());
         allow delete: if isClinicAdmin(clinicId) || isClinicOwner(clinicId) || isPlatformAdmin();
       }
 
@@ -165,9 +321,103 @@ service cloud.firestore {
         allow delete: if isClinicAdmin(clinicId) || isPlatformAdmin();
       }
 
+      // FIRESTORE RULES — appointments/financial_entries `list` fix (2026-08-29,
+      // found live in production during the post-deploy smoke test, not by the
+      // local emulator — the emulator doesn't enforce this Firestore behavior).
+      // Both collections were relying entirely on the generic `{subcollection=**}`
+      // wildcard below, same as several other collections — but unlike those
+      // (pending_items, patients/clinical_plans), which already have their own
+      // explicit named rule, appointments/financial_entries had none. A
+      // recursive `**` wildcard rule can authorize `get` reliably but does NOT
+      // reliably authorize a `list` (collection query) on a direct child
+      // collection — confirmed live: every `list` on these two failed with
+      // "Missing or insufficient permissions" (browser) / "Variable  is not
+      // bound in path template" (emulator with verbose logging), even for a
+      // Platform Admin. Same permission logic as the wildcard already granted
+      // (isClinicMember/isClinicOwner/isPlatformAdmin) — this is not a new
+      // grant, just making the SAME access explicit so Firestore can prove it
+      // for `list`, exactly like pending_items already does.
+      match /appointments/{appointmentId} {
+        allow read, write: if isClinicMember(clinicId) || isClinicOwner(clinicId) || isPlatformAdmin();
+      }
+
+      match /financial_entries/{entryId} {
+        allow read, write: if isClinicMember(clinicId) || isClinicOwner(clinicId) || isPlatformAdmin();
+      }
+
+      // Explicit rule (not the generic {subcollection=**} wildcard below) —
+      // same reason as appointments/financial_entries above: a recursive
+      // wildcard can authorize get() but not list(), and the WhatsApp inbox
+      // (NextWhatsApp.tsx) needs to query both the conversation list and
+      // each conversation's message thread.
+      match /whatsapp_conversations/{conversationId} {
+        allow read, write: if isClinicMember(clinicId) || isClinicOwner(clinicId) || isPlatformAdmin();
+
+        match /messages/{messageId} {
+          allow read, write: if isClinicMember(clinicId) || isClinicOwner(clinicId) || isPlatformAdmin();
+        }
+      }
+
       match /treatment_catalog/{treatmentId} {
         allow read: if isClinicMember(clinicId) || isPlatformAdmin();
         allow write: if isClinicAdmin(clinicId) || isClinicOwner(clinicId) || isPlatformAdmin();
+      }
+
+      // Same shape as treatment_catalog just above — PlanningCore's procedure
+      // picker (NextPlanningAI.tsx) list()-queries this by category/active,
+      // which the generic `{subcollection=**}` wildcard below can never
+      // authorize (recursive wildcards can't back a list() query — same
+      // limitation already documented for appointments/financial_entries).
+      // Found while testing the Clinical Learning Workspace's real-patient
+      // wiring (2026-08-29): this collection had no named rule at all, so
+      // every procedure picker list() was silently permission-denied.
+      match /procedure_catalog/{procedureId} {
+        allow read: if isClinicMember(clinicId) || isPlatformAdmin();
+        allow write: if isClinicAdmin(clinicId) || isClinicOwner(clinicId) || isPlatformAdmin();
+      }
+
+      // Same list()-safety gap, found in the same review pass: NextContracts.tsx
+      // and NextPrescriptions.tsx both list()-query this by `type` for their
+      // template pickers — no named rule existed, same silent permission-denied.
+      match /templates/{templateId} {
+        allow read: if isClinicMember(clinicId) || isPlatformAdmin();
+        allow write: if isClinicAdmin(clinicId) || isClinicOwner(clinicId) || isPlatformAdmin();
+      }
+
+      // Same list()-safety gap, found auditing the rest of the Next module for
+      // the same pattern (2026-08-29): every one of these is list()-queried by
+      // NextInventory.tsx / NextFinancial.tsx / NextReports.tsx / financeService.ts
+      // and had no named rule — same access level the wildcard already granted
+      // for get()/write, just made list()-capable. Not a new permission.
+      match /inventory/{itemId} { allow read, write: if isClinicMember(clinicId) || isClinicOwner(clinicId) || isPlatformAdmin(); }
+      match /inventory_movements/{movementId} { allow read, write: if isClinicMember(clinicId) || isClinicOwner(clinicId) || isPlatformAdmin(); }
+      match /commission_records/{recordId} { allow read, write: if isClinicMember(clinicId) || isClinicOwner(clinicId) || isPlatformAdmin(); }
+      match /daily_closings/{closingId} { allow read, write: if isClinicMember(clinicId) || isClinicOwner(clinicId) || isPlatformAdmin(); }
+      match /team_members/{teamMemberId} { allow read, write: if isClinicMember(clinicId) || isClinicOwner(clinicId) || isPlatformAdmin(); }
+      match /commission_settings/{settingId} { allow read, write: if isClinicMember(clinicId) || isClinicOwner(clinicId) || isPlatformAdmin(); }
+      match /commissions/{commissionId} { allow read, write: if isClinicMember(clinicId) || isClinicOwner(clinicId) || isPlatformAdmin(); }
+      match /commercial_sale_commissions/{commissionId} { allow read, write: if isClinicMember(clinicId) || isClinicOwner(clinicId) || isPlatformAdmin(); }
+      match /financial_ai_reports/{reportId} { allow read, write: if isClinicMember(clinicId) || isClinicOwner(clinicId) || isPlatformAdmin(); }
+      match /commission_rules/{ruleId} { allow read, write: if isClinicMember(clinicId) || isClinicOwner(clinicId) || isPlatformAdmin(); }
+      // Preferências do Clinical Learning Workspace (paleta cor-por-dose +
+      // dose sugerida por músculo), doc único clinics/{clinicId}/settings/
+      // toxinaWorkspacePrefs (2026-08-30) — mesmo padrão list()-safe acima.
+      // Leitura também para aluno (a legenda de cor aparece na tentativa dele
+      // no Academy, só leitura — só staff edita a paleta), igual ao padrão
+      // já usado em education_courses logo abaixo.
+      match /settings/{settingId} {
+        allow read: if isClinicMember(clinicId) || isStudentOfClinic(clinicId) || isClinicOwner(clinicId) || isPlatformAdmin();
+        allow write: if isClinicMember(clinicId) || isClinicOwner(clinicId) || isPlatformAdmin();
+      }
+
+      // Same gap, own nested tree (not under patients/) — NextPortalActivity.tsx
+      // list()-queries the messages subcollection for the staff-facing Portal
+      // do Paciente chat view.
+      match /portal_conversations/{convoId} {
+        allow read, write: if isClinicMember(clinicId) || isClinicOwner(clinicId) || isPlatformAdmin();
+        match /messages/{messageId} {
+          allow read, write: if isClinicMember(clinicId) || isClinicOwner(clinicId) || isPlatformAdmin();
+        }
       }
 
       // --- Student/Education Access Rules ---
@@ -209,6 +459,107 @@ service cloud.firestore {
         allow read, write: if isClinicMember(clinicId) || isStudentOfClinic(clinicId) || isPlatformAdmin();
       }
 
+      // Slice 2A — Fundação Acadêmica. Deliberately NOT isClinicMember() or
+      // isStudentOfClinic() here (homologação Ajuste 1): a random clinic
+      // staff member with no course role, or a student not enrolled in THIS
+      // specific turma, has no reason to read it.
+      match /education_turmas/{turmaId} {
+        allow read: if isPlatformAdmin() || isClinicAdmin(clinicId) || isAdminCurso(clinicId)
+                       || isTurmaStaff(clinicId, turmaId) || hasValidEnrollment(clinicId, turmaId);
+        allow create: if isAdminCurso(clinicId) || isClinicAdmin(clinicId) || isPlatformAdmin();
+        allow update: if isAdminCurso(clinicId) || isClinicAdmin(clinicId) || isPlatformAdmin();
+        allow delete: if isAdminCurso(clinicId) || isClinicAdmin(clinicId) || isPlatformAdmin();
+
+        // Ajuste 2: a student NEVER reads this, even for her own turma — it
+        // carries assignedBy/assignment history, not just a display name.
+        // A future public-facing "who's my professor" surface needs its own
+        // projected field/doc, not access to this subcollection.
+        match /staff/{staffUid} {
+          allow read: if isPlatformAdmin() || isClinicAdmin(clinicId) || isAdminCurso(clinicId)
+                         || isTurmaStaff(clinicId, turmaId);
+          allow create: if (isAdminCurso(clinicId) || isClinicAdmin(clinicId) || isPlatformAdmin())
+                        && request.resource.data.uid == staffUid
+                        && request.resource.data.assignedBy == request.auth.uid;
+          allow update, delete: if isAdminCurso(clinicId) || isClinicAdmin(clinicId) || isPlatformAdmin();
+        }
+      }
+
+      // Ajuste 3: isTurmaStaff() deliberately excluded from create/update —
+      // only Clinic Admin / Admin Curso enroll/manage a student in this
+      // version, even though turma staff CAN read (next block) to see their
+      // own roster and grade attempts later. Ajuste 4: no delete at all,
+      // ever, not even Platform Admin — enrollment history is never removed
+      // by the application; an extraordinary correction is a manual,
+      // audited Admin-SDK operation outside the app, never a rule-permitted
+      // path.
+      match /education_enrollments/{enrollmentId} {
+        allow read: if isPlatformAdmin() || isClinicAdmin(clinicId) || isAdminCurso(clinicId)
+                       || isTurmaStaff(clinicId, resource.data.turmaId)
+                       || (isSignedIn() && resource.data.studentId == request.auth.uid);
+
+        allow create: if (isAdminCurso(clinicId) || isClinicAdmin(clinicId) || isPlatformAdmin())
+                      && exists(/databases/$(database)/documents/clinics/$(clinicId)/education_students/$(request.resource.data.studentId))
+                      && exists(/databases/$(database)/documents/clinics/$(clinicId)/education_turmas/$(request.resource.data.turmaId))
+                      && request.resource.data.courseId ==
+                           get(/databases/$(database)/documents/clinics/$(clinicId)/education_turmas/$(request.resource.data.turmaId)).data.courseId
+                      && request.resource.data.enrolledBy == request.auth.uid
+                      && request.resource.data.enrolledBy != request.resource.data.studentId;
+
+        allow update: if (isAdminCurso(clinicId) || isClinicAdmin(clinicId) || isPlatformAdmin())
+                      && request.resource.data.studentId == resource.data.studentId
+                      && request.resource.data.turmaId  == resource.data.turmaId
+                      && request.resource.data.courseId == resource.data.courseId;
+
+        allow delete: if false;
+      }
+
+      // Educational Activities MVP (2026-08-29) — professor publishes an
+      // activity to a turma, a student creates her own attempt against it.
+      // Named rule (takes precedence over the generic wildcard below), same
+      // reasoning as executions/billing: role gating and attempt immutability
+      // need to be enforced by Firestore itself, not just hidden in the UI.
+      match /education_activities/{activityId} {
+        allow read: if isClinicAdmin(clinicId) || isAdminCurso(clinicId) || isPlatformAdmin()
+                       || isTurmaStaff(clinicId, resource.data.get('turmaId', ''))
+                       || (resource.data.get('status', '') == 'published' && hasValidEnrollment(clinicId, resource.data.get('turmaId', '')));
+        allow create: if (isAdminCurso(clinicId) || isClinicAdmin(clinicId) || isPlatformAdmin()
+                          || isTurmaStaff(clinicId, request.resource.data.turmaId))
+                      && exists(/databases/$(database)/documents/clinics/$(clinicId)/education_turmas/$(request.resource.data.turmaId));
+        allow update: if isAdminCurso(clinicId) || isClinicAdmin(clinicId) || isPlatformAdmin()
+                         || isTurmaStaff(clinicId, resource.data.get('turmaId', ''));
+        allow delete: if false;
+
+        // A student's own attempt. Draft is hers to edit freely; once
+        // submitted, only `professorReview`/`status` may ever change again
+        // (by staff), and only while status is 'submitted' — once reviewed
+        // (approved/revision_requested), the doc is fully frozen. A
+        // requested revision is a NEW attempt doc (attemptNumber+1) created
+        // by the student, never an edit to this one.
+        match /attempts/{attemptId} {
+          allow read: if (isSignedIn() && resource.data.get('studentId', '') == request.auth.uid)
+                         || isClinicAdmin(clinicId) || isAdminCurso(clinicId) || isPlatformAdmin()
+                         || isTurmaStaff(clinicId, resource.data.get('turmaId', ''));
+
+          allow create: if isSignedIn()
+                        && request.resource.data.studentId == request.auth.uid
+                        && request.resource.data.status == 'draft'
+                        && hasValidEnrollment(clinicId, request.resource.data.turmaId);
+
+          allow update: if
+                        (isSignedIn() && resource.data.studentId == request.auth.uid
+                         && resource.data.status == 'draft'
+                         && request.resource.data.studentId == resource.data.studentId
+                         && request.resource.data.status in ['draft', 'submitted']
+                         && !('professorReview' in request.resource.data.diff(resource.data).affectedKeys()))
+                        ||
+                        ((isTurmaStaff(clinicId, resource.data.turmaId) || isAdminCurso(clinicId) || isClinicAdmin(clinicId) || isPlatformAdmin())
+                         && resource.data.status == 'submitted'
+                         && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['professorReview', 'status', 'updatedAt']));
+
+          allow delete: if false;
+        }
+      }
+
       // Explicit match (not the generic {subcollection=**} wildcard below):
       // Firestore's recursive wildcard doesn't grant collectionGroup 'list'
       // queries, so the Super Admin panel's cross-clinic AI usage rollup
@@ -219,8 +570,200 @@ service cloud.firestore {
         allow read: if isClinicMember(clinicId) || isClinicOwner(clinicId) || isPlatformAdmin();
       }
 
+      // Planejamento → Execução: named rule (takes precedence over the
+      // generic wildcard below) so clinical-role gating and immutability are
+      // enforced by Firestore itself, not just hidden in the UI. Once a
+      // ClinicalExecution is confirmed, update/delete are blocked outright —
+      // corrections only ever go through the append-only `addenda`
+      // subcollection, which itself can never be updated or deleted.
+      match /patients/{patientId}/clinical_plans/{planningId}/executions/{executionId} {
+        allow read: if isClinicMember(clinicId) || isPlatformAdmin();
+        allow create: if (isClinicalProvider(clinicId) || isClinicAdmin(clinicId)) && request.resource.data.startedBy == request.auth.uid;
+        allow update: if (isClinicalProvider(clinicId) || isClinicAdmin(clinicId)) && resource.data.status != 'confirmed';
+        allow delete: if (isClinicalProvider(clinicId) || isClinicAdmin(clinicId)) && resource.data.status != 'confirmed';
+
+        match /addenda/{addendumId} {
+          allow read: if isClinicMember(clinicId) || isPlatformAdmin();
+          allow create: if isClinicalProvider(clinicId) || isClinicAdmin(clinicId);
+          allow update, delete: if false;
+        }
+      }
+
+      // Cadastro → Checkout (Asaas): the clinic's own subscription record.
+      // Named rule (takes precedence over the generic wildcard below) —
+      // read-only for the clinic owner/admin, write-locked to the platform
+      // (server.ts webhook via Admin SDK). This is deliberate: clinics/{id}
+      // itself has `allow update: if isClinicOwner(clinicId) || ...` with no
+      // per-field guard, so if billing status lived as a bare field on the
+      // clinic doc a clinic's own owner could self-grant an active
+      // subscription via the client SDK. Keeping it in this locked
+      // subcollection closes that hole.
+      match /billing/{docId} {
+        allow read: if isClinicOwner(clinicId) || isClinicAdmin(clinicId) || isPlatformAdmin();
+        allow write: if isPlatformAdmin();
+      }
+
+      // Slice 2A: education_turmas/education_enrollments (and everything
+      // nested under education_turmas, e.g. its staff subcollection) are
+      // deliberately EXCLUDED from this generic grant. Firestore evaluates
+      // every `match` block whose pattern matches a path with OR semantics —
+      // a more specific named rule elsewhere in this file does NOT
+      // override/restrict what this wildcard already allows, it only adds
+      // to it. Without this exclusion, isClinicMember(clinicId) here would
+      // silently grant every clinic member (any staff role, no course
+      // relationship at all) full read/write on turmas and enrollments,
+      // defeating the whole point of the scoped rules above. Nothing else
+      // that already relies on this wildcard is affected — the exclusion
+      // list only names collections that didn't exist before this slice.
+      // FIRESTORE RULES HARDENING 1 (checkpoint, see CEREBRO): expanded the
+      // exclusion list to every collection where a named rule elsewhere in
+      // this file is DELIBERATELY more restrictive than plain
+      // isClinicMember() — this wildcard was silently re-granting the
+      // broader access on top of those, confirmed empirically before this
+      // change (see scripts/verifyWildcardAudit.mjs). Deliberately NOT
+      // touching generic operational collections (patients' own subtree
+      // outside executions, appointments, quotations, financial_entries,
+      // treatments, images, etc.) — those still rely on this wildcard as
+      // designed; broadening this into a full allowlist is a separate,
+      // larger initiative (documented, not done here — see CEREBRO).
       match /{subcollection=**} {
+        allow read, write: if (isClinicMember(clinicId) || isClinicOwner(clinicId) || isPlatformAdmin())
+                            && !(subcollection[0] in [
+                                  'education_turmas', 'education_enrollments', 'education_activities',
+                                  'billing', 'members', 'invites', 'education_students',
+                                  'ai_usage_logs', 'treatment_catalog', 'procedure_catalog', 'templates',
+                                  'inventory', 'inventory_movements', 'commission_records', 'daily_closings',
+                                  'team_members', 'commission_settings', 'commissions', 'commercial_sale_commissions',
+                                  'financial_ai_reports', 'commission_rules', 'portal_conversations', 'settings',
+                                  'education_courses', 'education_modules', 'education_procedures', 'education_patients',
+                                  'patients', 'appointments', 'financial_entries', 'whatsapp_conversations',
+                                  'integrations', 'whatsapp_connection_attempts', 'whatsapp_processed_events',
+                                  'whatsapp_orphaned_secret_versions', 'whatsapp_pending_waba_cleanup',
+                                  'whatsapp_settings'
+                                ]);
+      }
+
+      // WhatsApp Embedded Signup (2026-08-31, plano vast-yawning-hamster.md v4)
+      // — excluídas do coringa acima (auditoria read-only de produção
+      // confirmou: 'whatsapp' é o único doc que já existiu sob
+      // clinics/{clinicId}/integrations/, zero efeito colateral). Nenhuma
+      // escrita client-side em nenhum caso — só o Admin SDK grava, tanto no
+      // fluxo do Embedded Signup quanto na configuração manual legada.
+      //
+      // CORREÇÃO DE DOCUMENTAÇÃO (rodada final de fechamento, item 7): "só
+      // o Admin SDK grava" descreve o que o CLIENT SDK não consegue fazer
+      // — não descreve nem controla o que o Admin SDK PODE fazer. O
+      // Firebase Admin SDK (server.ts, `adminDb`) ignora completamente
+      // estas regras — regra de Firestore não é avaliada nenhuma vez pra
+      // uma chamada feita com credenciais de serviço/Admin SDK, é uma
+      // camada que só existe entre um CLIENT SDK e o Firestore. Publicar
+      // estas regras protege contra escrita direta vinda do navegador
+      // (client SDK) — não impede, não detecta, e não é nenhum tipo de
+      // segunda linha de defesa contra um bug em `server.ts` (ex.: um
+      // endpoint novo que esqueça de chamar `authenticateOwnerOrAdmin`
+      // antes de escrever). A autorização real de tudo que passa por
+      // `adminDb` é 100% responsabilidade do CÓDIGO do backend
+      // (`authenticateElizaRequest`/`authenticateOwnerOrAdmin` em
+      // server.ts) — nunca deste arquivo. Sempre que uma nota deste
+      // arquivo disser "só Admin SDK grava/lê", leia como "o client SDK
+      // não consegue", nunca como "está protegido/controlado".
+      match /integrations/whatsapp {
+        allow read: if isClinicOwner(clinicId) || isClinicAdmin(clinicId) || isPlatformAdmin();
+        allow write: if false;
+      }
+      match /integrations/whatsapp_status {
+        allow read: if isClinicMember(clinicId) || isClinicOwner(clinicId) || isPlatformAdmin();
+        allow write: if false;
+      }
+      match /whatsapp_connection_attempts/{attemptId} {
+        allow read, write: if false;
+      }
+      match /whatsapp_processed_events/{eventKey} {
+        allow read, write: if false;
+      }
+      // Registro de versões órfãs de secret (rodada de paridade, mesma
+      // data) — nunca lido/escrito pelo client; só a limpeza
+      // administrativa (identidade separada, nunca o runtime do
+      // exchange) toca isto.
+      match /whatsapp_orphaned_secret_versions/{versionRef} {
+        allow read, write: if false;
+      }
+      // Rollback nunca mais chama DELETE na assinatura da WABA
+      // automaticamente (rodada final de fechamento) — só flag aqui pra
+      // revisão administrativa, mesma disciplina da versão órfã acima.
+      match /whatsapp_pending_waba_cleanup/{attemptRef} {
+        allow read, write: if false;
+      }
+      // Preferências não-sensíveis do painel manual (apiNumber,
+      // legacyClinicNumber, defaultSendMode, allowOpenExternalWhatsApp) —
+      // rodada final de fechamento: escrita direta pelo coringa acima
+      // permitia QUALQUER membro (não só owner/admin) sobrescrever, sem
+      // nenhuma validação; agora só o endpoint /api/whatsapp/manual-config
+      // (Admin SDK, authenticateOwnerOrAdmin) grava. LEITURA continua
+      // isClinicMember (não restrita a owner/admin): `defaultSendMode`
+      // aqui é consumido por QUALQUER membro em MedicalRecordView.tsx
+      // (`isWhatsAppApiActive`) pra decidir entre enviar pela API ou abrir
+      // o WhatsApp externo — restringir a leitura a owner/admin quebraria
+      // esse botão pra toda a equipe operacional, não é o mesmo caso do
+      // doc completo de integrations/whatsapp (que tem credencial).
+      match /whatsapp_settings/{settingId} {
+        allow read: if isClinicMember(clinicId) || isClinicOwner(clinicId) || isPlatformAdmin();
+        allow write: if false;
+      }
+
+      // 'patients' excluded above and fully re-declared here as its own
+      // nested tree — the ONLY reason is the executions subtree a few
+      // levels down (see the long comment further up).
+      //
+      // CORRECTION (2026-08-29, found while testing the Clinical Learning
+      // Workspace's real-patient wiring): the comment that used to be here
+      // claimed images/quotations/treatments/documents/evolutions/anamnesis/
+      // facial_planning "keep EXACTLY the same broad isClinicMember() access
+      // as before, via the catch-all `{x=**}` blocks" below — that was never
+      // actually true. A recursive wildcard match (`{x=**}`) structurally
+      // cannot authorize a list() query (same limitation already documented
+      // for appointments/financial_entries in Hardening 2 — see CEREBRO's
+      // Firestore-list-query-precisa-regra-provavel-estaticamente). Every
+      // one of those collections was silently permission-denied on list()
+      // under this rules file — confirmed empirically (get() on a doc you
+      // already know the id of still worked, masking it). Each now has its
+      // own named rule below granting the exact same access the wildcard was
+      // already supposed to grant — this is a bugfix, not a new permission.
+      match /patients/{patientId} {
         allow read, write: if isClinicMember(clinicId) || isClinicOwner(clinicId) || isPlatformAdmin();
+
+        match /clinical_plans/{planningId} {
+          allow read, write: if isClinicMember(clinicId) || isClinicOwner(clinicId) || isPlatformAdmin();
+
+          // Everything under a clinical_plan except executions (e.g.
+          // Planejamento IA's `versions`) — index 0 here is always safe,
+          // this capture starts fresh right after clinical_plans/{id}/.
+          match /{clinicalPlanSub=**} {
+            allow read, write: if (isClinicMember(clinicId) || isClinicOwner(clinicId) || isPlatformAdmin())
+                                && !(clinicalPlanSub[0] == 'executions');
+          }
+        }
+
+        match /images/{imageId} { allow read, write: if isClinicMember(clinicId) || isClinicOwner(clinicId) || isPlatformAdmin(); }
+        match /quotations/{quotationId} { allow read, write: if isClinicMember(clinicId) || isClinicOwner(clinicId) || isPlatformAdmin(); }
+        match /treatments/{treatmentId} { allow read, write: if isClinicMember(clinicId) || isClinicOwner(clinicId) || isPlatformAdmin(); }
+        // Same list()-safety fix as the siblings above — NextMedicalRecord.tsx
+        // list()-queries this too (IA Clínica tab's saved AI treatment plans).
+        match /ai_treatment_plans/{planId} { allow read, write: if isClinicMember(clinicId) || isClinicOwner(clinicId) || isPlatformAdmin(); }
+        match /documents/{documentId} { allow read, write: if isClinicMember(clinicId) || isClinicOwner(clinicId) || isPlatformAdmin(); }
+        match /evolutions/{evolutionId} { allow read, write: if isClinicMember(clinicId) || isClinicOwner(clinicId) || isPlatformAdmin(); }
+        match /anamnesis/{anamnesisId} { allow read, write: if isClinicMember(clinicId) || isClinicOwner(clinicId) || isPlatformAdmin(); }
+        match /facial_planning/{facialPlanningId} { allow read, write: if isClinicMember(clinicId) || isClinicOwner(clinicId) || isPlatformAdmin(); }
+
+        // Everything else directly under a patient (not yet hit by a named
+        // rule above) — same safe index-0 guard, capture starts fresh after
+        // patients/{patientId}/. Kept as a fallback for any subcollection
+        // not explicitly named; only truly list()-safe for get()-only
+        // access patterns, same caveat as the top-level wildcard.
+        match /{patientSub=**} {
+          allow read, write: if (isClinicMember(clinicId) || isClinicOwner(clinicId) || isPlatformAdmin())
+                              && !(patientSub[0] in ['clinical_plans', 'images', 'quotations', 'treatments', 'documents', 'evolutions', 'anamnesis', 'facial_planning', 'ai_treatment_plans']);
+        }
       }
     }
   }

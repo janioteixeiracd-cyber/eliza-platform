@@ -150,6 +150,7 @@ export function useEliza(options: UseElizaOptions = {}) {
 // CONTEXT FOR PROVIDER PATTERN (OPTIONAL)
 // ============================================================================
 
+import * as React from "react";
 import { createContext, ReactNode } from "react";
 
 export const ElizaContext = createContext<ReturnType<typeof useEliza> | null>(null);
@@ -173,6 +174,3 @@ export function useElizaContext() {
   }
   return context;
 }
-
-// Fix React import
-import * as React from "react";

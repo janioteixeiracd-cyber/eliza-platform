@@ -109,6 +109,10 @@ export const InviteService = {
         createdAt: serverTimestamp(),
         updatedAt: serverTimestamp(),
         mustChangePassword: true,
+        // Persisted (not just shown once in the creation UI) so an admin who
+        // forgets the password later can still look it up instead of being
+        // stuck — the same reason a reset also rewrites this field.
+        tempPassword: password,
       });
       await setDoc(doc(db, 'users', newUid), {
         uid: newUid,

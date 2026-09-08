@@ -159,6 +159,10 @@ export function normalizeFinancialEntry(doc: any): any {
     clinicId: doc.clinicId || "",
     patientId: doc.patientId || doc.patient_id || null,
     patientName: doc.patientName || doc.patient_name || null,
+    // Optional, only ever set by explicit staff choice (see NextFinancial.tsx's
+    // entry form) — never inferred. Absent on entries created before this field existed.
+    professionalId: doc.professionalId || null,
+    professionalName: doc.professionalName || null,
     type,
     category,
     subcategory,
@@ -178,6 +182,9 @@ export function normalizeFinancialEntry(doc: any): any {
     installmentNumber: doc.installmentNumber ? Number(doc.installmentNumber) : (doc.installment_number ? Number(doc.installment_number) : null),
     totalInstallments: doc.totalInstallments ? Number(doc.totalInstallments) : (doc.total_installments ? Number(doc.total_installments) : null),
     archived: doc.archived || false,
-    archivedReason: doc.archivedReason || null
+    archivedReason: doc.archivedReason || null,
+    // Fase C — sempre a pessoa logada no momento da confirmação, nunca escolhível. Ausente em lançamentos recebidos antes desta fase.
+    receivedBy: doc.receivedBy || null,
+    receivedByName: doc.receivedByName || null
   };
 }

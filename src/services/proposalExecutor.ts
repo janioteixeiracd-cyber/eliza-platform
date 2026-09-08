@@ -51,6 +51,7 @@ export interface ActionProposal {
   // Execution state
   executedAt?: Timestamp;
   executionError?: string;
+  executionResult?: any;
   idempotencyKey?: string; // tracks successful executions
 
   // Audit

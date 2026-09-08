@@ -1,114 +1,100 @@
-import React, { useState, useEffect, useMemo } from 'react';
-import { motion, AnimatePresence } from 'motion/react';
+import React, { useState, useEffect } from 'react';
 import {
-  Sparkles,
   Brain,
-  Users,
-  Calendar,
-  ShieldAlert,
-  DollarSign,
-  ArrowRight,
-  Lock,
   Send,
   RefreshCw,
   Bot,
-  AlertTriangle,
-  CheckCircle2
+  Lock,
+  Sparkles,
+  ChevronLeft,
+  ChevronRight,
+  Target,
+  Calendar,
+  TrendingUp,
+  Star,
 } from 'lucide-react';
+
+// Right-column "Oportunidades detectadas" cards — purely decorative
+// icon/color variety (real insights don't carry a fixed category), cycled
+// by position so each card in the list reads distinctly, per the Light
+// Premium spec (§25-31).
+const OPPORTUNITY_ICONS = [Target, Calendar, TrendingUp, Star];
+const OPPORTUNITY_TONES = ['purple', 'blue', 'green', 'orange'] as const;
 import { useAuth } from '../../contexts/AuthContext';
 import { useNextReadOnly } from '../context/NextReadOnlyContext';
 import { secureGetDocs } from '../services/next-db';
 import { collection, query, limit } from 'firebase/firestore';
 import { db } from '../../lib/firebase';
-import { getGenAI } from '../../lib/gemini';
-import { normalizeFinancialEntry } from '../../utils/financialHelpers';
-
-interface AppointmentLite { patientName: string; date?: string; status?: string; }
+import { useElizaAsk } from '../hooks/useElizaAsk';
+import InsightCard from './eliza/InsightCard';
+import TemporalOverviewPanel from './eliza/TemporalOverviewPanel';
+import type { AssistantInsight } from '../types/eliza';
 
 interface ChatMessage {
   sender: 'ai' | 'user';
   text: string;
-  highlights?: string[];
-  recommendedActions?: string[];
-}
-
-function toDate(v: any): Date | null {
-  if (!v) return null;
-  try {
-    if (typeof v?.toDate === 'function') return v.toDate();
-    if (v?.seconds !== undefined) return new Date(v.seconds * 1000);
-    const match = typeof v === 'string' ? v.match(/^(\d{4})-(\d{2})-(\d{2})/) : null;
-    if (match) return new Date(Number(match[1]), Number(match[2]) - 1, Number(match[3]), 12, 0, 0);
-    const d = new Date(v);
-    return isNaN(d.getTime()) ? null : d;
-  } catch { return null; }
-}
-
-function formatCurrency(v: number): string {
-  return (v || 0).toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' });
+  insights?: AssistantInsight[];
 }
 
 export default function NextHome() {
   const { clinic, profile } = useAuth();
   const { addAuditLog } = useNextReadOnly();
+  const { ask } = useElizaAsk();
 
   const [patientsCount, setPatientsCount] = useState(0);
-  const [appointments, setAppointments] = useState<AppointmentLite[]>([]);
-  const [financialOverdue, setFinancialOverdue] = useState({ count: 0, amount: 0 });
+  const [appointmentsCount, setAppointmentsCount] = useState(0);
   const [loadingStats, setLoadingStats] = useState(true);
 
-  const [greeting, setGreeting] = useState('');
+  const [greetingPrefix, setGreetingPrefix] = useState('');
+  const [firstName, setFirstName] = useState('Doutor(a)');
   const [chatInput, setChatInput] = useState('');
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
   const [isTyping, setIsTyping] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [conversation, setConversation] = useState<{ question: string; summary: string }[]>([]);
+
+  // Opportunity Deck — real insights from the Insight Engine (via the
+  // shared orchestrator), not a fixed set of hardcoded cards. Loaded once
+  // on mount; "Atualizar" re-runs the same real call.
+  const [deckInsights, setDeckInsights] = useState<AssistantInsight[]>([]);
+  const [deckSummary, setDeckSummary] = useState('');
+  const [loadingDeck, setLoadingDeck] = useState(true);
+  const [deckError, setDeckError] = useState<string | null>(null);
+  // Carousel: one card visible at a time — "Perguntar à Eliza" resets the
+  // spot; the auto-advance timer below cycles when the user isn't looking.
+  const [deckIndex, setDeckIndex] = useState(0);
+  useEffect(() => {
+    if (deckInsights.length <= 1) return;
+    const timer = setInterval(() => {
+      setDeckIndex(i => (i + 1) % deckInsights.length);
+    }, 7000);
+    return () => clearInterval(timer);
+  }, [deckInsights.length]);
+  const goDeckPrev = () => setDeckIndex(i => (i - 1 + deckInsights.length) % deckInsights.length);
+  const goDeckNext = () => setDeckIndex(i => (i + 1) % deckInsights.length);
 
   useEffect(() => {
     const hour = new Date().getHours();
     let timeGreeting = 'Bom dia';
     if (hour >= 12 && hour < 18) timeGreeting = 'Boa tarde';
     else if (hour >= 18 || hour < 5) timeGreeting = 'Boa noite';
-    const firstName = profile?.name ? profile.name.split(' ')[0] : 'Doutor(a)';
-    setGreeting(`${timeGreeting}, ${firstName}.`);
+    setGreetingPrefix(timeGreeting);
+    setFirstName(profile?.name ? profile.name.split(' ')[0] : 'Doutor(a)');
   }, [profile?.name]);
 
+  // Lightweight instant counts for the "Varredura Real" header box — not
+  // the Insight Engine's job, just a fast visible confirmation that real
+  // data was read while the fuller orchestrator call runs below.
   useEffect(() => {
     async function loadTelemetry() {
       if (!clinic?.id) return;
       setLoadingStats(true);
       try {
-        const [patientsSnap, appointmentsSnap, financialSnap] = await Promise.all([
-          secureGetDocs(query(collection(db, 'clinics', clinic.id, 'patients'), limit(150)), 'patients', { addAuditLog }),
-          secureGetDocs(query(collection(db, 'clinics', clinic.id, 'appointments'), limit(200)), 'appointments', { addAuditLog }),
-          secureGetDocs(query(collection(db, 'clinics', clinic.id, 'financial_entries'), limit(300)), 'financial_entries', { addAuditLog }),
+        const [patientsSnap, appointmentsSnap] = await Promise.all([
+          secureGetDocs(query(collection(db, 'clinics', clinic.id, 'patients'), limit(8000)), 'patients', { addAuditLog }),
+          secureGetDocs(query(collection(db, 'clinics', clinic.id, 'appointments'), limit(2000)), 'appointments', { addAuditLog }),
         ]);
-
         setPatientsCount(patientsSnap.size);
-        setAppointments(appointmentsSnap.docs.map(d => {
-          const data: any = d.data();
-          return { patientName: data.patientName || '', date: data.date, status: data.status };
-        }));
-
-        const now = new Date();
-        let overdueCount = 0, overdueAmount = 0;
-        financialSnap.forEach(d => {
-          const n = normalizeFinancialEntry({ id: d.id, ...d.data() });
-          if (!n || n.type !== 'income' || (n.status !== 'pending' && n.status !== 'partial')) return;
-          const dueD = toDate(n.dueDate);
-          if (dueD && dueD < now && dueD.toDateString() !== now.toDateString()) {
-            overdueCount++;
-            overdueAmount += n.pendingAmount;
-          }
-        });
-        setFinancialOverdue({ count: overdueCount, amount: overdueAmount });
-
-        addAuditLog({
-          collection: 'intelligence',
-          action: 'QUERY',
-          status: 'SUCCESS',
-          details: 'Consciência da Eliza mapeou os dados reais do consultório.'
-        });
+        setAppointmentsCount(appointmentsSnap.size);
       } catch (e) {
         console.warn('Failed to load home telemetry:', e);
       } finally {
@@ -119,92 +105,57 @@ export default function NextHome() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [clinic?.id]);
 
-  const insights = useMemo(() => {
-    const now = new Date();
-    const in7d = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
+  async function loadDeck() {
+    if (!clinic?.id) return;
+    setLoadingDeck(true);
+    setDeckError(null);
+    try {
+      const answer = await ask('Quais são os principais pontos de atenção agora?', { screenType: 'home' });
+      setDeckInsights(answer.insights);
+      setDeckIndex(0);
+      setDeckSummary(answer.summary);
+      addAuditLog({
+        collection: 'ai_eliza_v2_audit',
+        action: 'QUERY',
+        status: 'SUCCESS',
+        details: `Opportunity Deck carregado com ${answer.insights.length} insight(s) real(is) do Insight Engine.`,
+      });
+    } catch (err: any) {
+      setDeckError(err?.message || 'Falha ao calcular os insights reais agora.');
+    } finally {
+      setLoadingDeck(false);
+    }
+  }
 
-    const lastApptByPatient = new Map<string, Date>();
-    const upcomingByPatient = new Set<string>();
-    let cancellations = 0;
-    let pendingConfirmations = 0;
-
-    appointments.forEach(a => {
-      const d = toDate(a.date);
-      if (a.status === 'cancelado') cancellations++;
-      if (!d) return;
-      if (d <= now) {
-        const prev = lastApptByPatient.get(a.patientName);
-        if (!prev || d > prev) lastApptByPatient.set(a.patientName, d);
-      } else {
-        upcomingByPatient.add(a.patientName);
-        if (a.status === 'pendente' && d <= in7d) pendingConfirmations++;
-      }
-    });
-
-    let recallCount = 0;
-    const recallNames: string[] = [];
-    lastApptByPatient.forEach((d, name) => {
-      if (upcomingByPatient.has(name)) return;
-      const days = (now.getTime() - d.getTime()) / (1000 * 60 * 60 * 24);
-      if (days > 90) { recallCount++; recallNames.push(name); }
-    });
-
-    return { recallCount, recallNames, cancellations, pendingConfirmations };
-  }, [appointments]);
+  useEffect(() => {
+    loadDeck();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [clinic?.id]);
 
   async function sendToEliza(text: string) {
     if (!text.trim() || isTyping) return;
+    // Last few answered turns of this chat — lets a follow-up like "quem
+    // você colocaria nesses horários?" resolve against what was just
+    // discussed (server.ts systemPrompt rule 9), built from the messages
+    // already on screen rather than a separate tracked history.
+    const conversationHistory: { question: string; summary: string }[] = [];
+    for (let i = 0; i < chatMessages.length - 1; i++) {
+      if (chatMessages[i].sender === 'user' && chatMessages[i + 1].sender === 'ai') {
+        conversationHistory.push({ question: chatMessages[i].text, summary: chatMessages[i + 1].text });
+      }
+    }
     setChatMessages(prev => [...prev, { sender: 'user', text }]);
     setChatInput('');
     setIsTyping(true);
     setError(null);
-
     try {
-      const contextBlock = `Dados reais desta clínica:
-- Pacientes cadastrados: ${patientsCount}
-- Pacientes sem retorno agendado há mais de 90 dias: ${insights.recallCount}${insights.recallNames.length > 0 ? ' (' + insights.recallNames.slice(0, 5).join(', ') + ')' : ''}
-- Cancelamentos registrados: ${insights.cancellations}
-- Confirmações pendentes nos próximos 7 dias: ${insights.pendingConfirmations}
-- Contas a receber vencidas: ${financialOverdue.count} lançamento(s), totalizando ${formatCurrency(financialOverdue.amount)}`;
-
-      const memoryBlock = conversation.length > 0
-        ? `\nHistórico recente da conversa:\n${conversation.map((m, i) => `${i + 1}. Perguntou: "${m.question}" — Você respondeu: "${m.summary}"`).join('\n')}\n`
-        : '';
-
-      const prompt = `Você é a Eliza, consciência cognitiva de uma clínica odontológica, dando um resumo do dia ao profissional na tela inicial. Use SOMENTE os dados reais abaixo — nunca invente números.
-
-${contextBlock}
-${memoryBlock}
-Pergunta atual: "${text}"
-
-Responda ESTRITAMENTE em JSON válido, sem markdown, exatamente neste formato:
-{"summary":"resposta direta em 2-4 frases citando os dados reais relevantes","highlights":["observação concreta 1"],"recommendedActions":["ação prática recomendada 1"]}`;
-
-      const ai = getGenAI();
-      const response = await ai.models.generateContent({
-        model: 'gemini-2.5-flash',
-        contents: [{ role: 'user', parts: [{ text: prompt }] }],
-        taskType: 'home_consciousness_chat',
-        clinicId: clinic?.id,
-      });
-
-      const rawText: string = response?.text || response?.candidates?.[0]?.content?.parts?.[0]?.text || '';
-      const jsonMatch = rawText.match(/\{[\s\S]*\}/);
-      if (!jsonMatch) throw new Error('A Eliza respondeu, mas não em formato reconhecível. Tente novamente.');
-      const parsed = JSON.parse(jsonMatch[0]);
-
-      const summary = String(parsed.summary || '');
-      const highlights = Array.isArray(parsed.highlights) ? parsed.highlights.map(String) : [];
-      const recommendedActions = Array.isArray(parsed.recommendedActions) ? parsed.recommendedActions.map(String) : [];
-
-      setChatMessages(prev => [...prev, { sender: 'ai', text: summary, highlights, recommendedActions }]);
-      setConversation(prev => [...prev.slice(-5), { question: text, summary }]);
-
+      const answer = await ask(text, { screenType: 'home', conversationHistory: conversationHistory.slice(-3) });
+      setChatMessages(prev => [...prev, { sender: 'ai', text: answer.summary, insights: answer.insights }]);
       addAuditLog({
-        collection: 'eliza_home_chat',
+        collection: 'ai_eliza_v2_audit',
         action: 'QUERY',
         status: 'SUCCESS',
-        details: `Eliza (IA real) respondeu à consulta na Home: "${text}" (conversa não é persistida no Firestore).`
+        details: `Eliza (orquestrador real) respondeu à consulta na Home: "${text}".`
       });
     } catch (err: any) {
       setError(err?.message || 'Falha ao consultar a Eliza AI.');
@@ -213,58 +164,48 @@ Responda ESTRITAMENTE em JSON válido, sem markdown, exatamente neste formato:
     }
   }
 
-  const cards = [
-    {
-      key: 'recall',
-      icon: Users,
-      color: 'purple',
-      label: 'ENGAGEMENT',
-      title: 'Ativação de Pacientes',
-      description: `${insights.recallCount} paciente(s) sem retorno agendado há mais de 90 dias.`,
-      footer: insights.recallCount > 0 ? `${insights.recallCount} PARA REATIVAR` : 'EM DIA',
-      prompt: 'Quais pacientes precisam de reativação e o que eu faço primeiro?',
-    },
-    {
-      key: 'agenda',
-      icon: Calendar,
-      color: 'blue',
-      label: 'SCHEDULING',
-      title: 'Confirmações Pendentes',
-      description: `${insights.pendingConfirmations} agendamento(s) pendente(s) de confirmação nos próximos 7 dias.`,
-      footer: `${insights.cancellations} CANCELAMENTO(S)`,
-      prompt: 'O que tenho pendente de confirmação na agenda?',
-    },
-    {
-      key: 'cancelamentos',
-      icon: ShieldAlert,
-      color: 'orange',
-      label: 'AGENDA',
-      title: 'Cancelamentos Registrados',
-      description: `${insights.cancellations} cancelamento(s) entre os agendamentos lidos.`,
-      footer: insights.cancellations > 0 ? 'REVISAR' : 'SEM CANCELAMENTOS',
-      prompt: 'Tivemos muitos cancelamentos? O que pode estar acontecendo?',
-    },
-    {
-      key: 'financeiro',
-      icon: DollarSign,
-      color: 'purple',
-      label: 'CONVERSION',
-      title: 'Contas Vencidas',
-      description: `${financialOverdue.count} lançamento(s) vencido(s), totalizando ${formatCurrency(financialOverdue.amount)}.`,
-      footer: financialOverdue.count > 0 ? `${formatCurrency(financialOverdue.amount)} EM ATRASO` : 'EM DIA',
-      prompt: 'Quais contas estão vencidas e como devo priorizar a cobrança?',
-    },
-  ];
-
   return (
-    <div className="space-y-10 max-w-5xl font-sans pb-16">
+    <div className="max-w-5xl xl:max-w-7xl font-sans pb-16">
+    <div className="xl:grid xl:grid-cols-[1fr_280px] xl:gap-6 xl:items-start">
+    <div className="space-y-10 min-w-0">
 
       {/* 1. WELCOME */}
-      <div className="relative overflow-hidden bg-gradient-to-br from-next-bg-card to-next-bg-deep border border-next-border rounded-next-2xl p-6 md:p-8 shadow-next-glass">
+      <div className="eliza-consciousness-hero relative overflow-hidden bg-gradient-to-br from-next-bg-card to-next-bg-deep border border-next-border rounded-next-2xl p-6 md:p-8 shadow-next-glass">
         <div className="absolute top-0 right-0 w-80 h-80 bg-next-purple-neon/5 rounded-full blur-3xl pointer-events-none" />
         <div className="absolute bottom-0 left-0 w-64 h-64 bg-next-ia-blue/5 rounded-full blur-3xl pointer-events-none" />
 
-        <div className="relative flex flex-col md:flex-row items-start md:items-center justify-between gap-6 z-10">
+        {/* ELIZA cognitive brain — assinatura visual da Consciência ELIZA.
+            Camada de fundo absoluta (fora do fluxo, atrás do conteúdo via
+            z-10 no wrapper abaixo), nunca uma 3ª coluna real — por isso não
+            afeta a altura do hero. Centralizado verticalmente (top-1/2 +
+            -translate-y-1/2) e dimensionado só pela largura (h-auto, mantém
+            a proporção real do PNG) em vez de esticar a caixa entre
+            top-0/bottom-0 — é isso que fazia a imagem ler como "cortada no
+            canto" antes. Máscara em gradiente dissolve a borda esquerda no
+            fundo do card; a própria imagem já traz sua iluminação, por isso
+            nenhum glow novo é somado aqui. Oculta abaixo de lg. */}
+        <img
+          src="/brand/eliza-cognitive-brain.png"
+          alt=""
+          aria-hidden="true"
+          className="hidden lg:block absolute top-1/2 -translate-y-1/2 lg:right-[-3%] xl:right-[-4%] lg:w-[30%] xl:w-[34%] h-auto lg:opacity-[0.65] xl:opacity-[0.88] object-contain pointer-events-none select-none"
+          style={{
+            WebkitMaskImage: 'linear-gradient(to right, transparent 0%, rgba(0,0,0,.55) 14%, rgba(0,0,0,1) 34%)',
+            maskImage: 'linear-gradient(to right, transparent 0%, rgba(0,0,0,.55) 14%, rgba(0,0,0,1) 34%)',
+          }}
+        />
+
+        {/* At lg+, explicit grid columns (56% texto / 18% Varredura / 26%
+            zona reservada pro cérebro) replace the old padding-right hack.
+            That hack shrank the whole flex row first and only THEN split
+            it between texto+Varredura, so texto was getting ~60% of an
+            already-reduced 64% — compounding into a much narrower column
+            than intended. A grid template defines each column against the
+            FULL hero width directly, so texto keeps its real 56% no matter
+            what Varredura or the (empty, unused — the brain is a separate
+            absolute layer, not a grid item) 3rd column do. Below lg,
+            unchanged flex behavior. */}
+        <div className="relative flex flex-col md:flex-row items-start md:items-center justify-between gap-6 z-10 lg:grid lg:grid-cols-[56%_18%_26%] lg:items-center">
           <div className="space-y-3">
             <div className="inline-flex items-center gap-2 bg-next-purple-neon/10 border border-next-purple-neon/20 px-3 py-1 rounded-full text-next-purple-light text-[10.5px] font-mono tracking-wider">
               <Bot className="w-3.5 h-3.5 text-next-purple-neon animate-pulse" />
@@ -272,76 +213,93 @@ Responda ESTRITAMENTE em JSON válido, sem markdown, exatamente neste formato:
             </div>
 
             <h1 className="text-3xl md:text-4xl font-extrabold text-slate-100 tracking-tight font-sans">
-              {greeting}
+              {greetingPrefix}, <span className="eliza-name-gradient">{firstName}</span>.
+              <Sparkles className="inline-block w-5 h-5 md:w-6 md:h-6 ml-1 -mt-2 text-next-purple-neon" />
             </h1>
 
-            <p className="text-slate-400 text-xs md:text-sm max-w-2xl leading-relaxed">
-              Li os dados reais da sua clínica agora. Abaixo estão as oportunidades calculadas a partir de pacientes,
-              agenda e financeiro — sem números inventados.
+            <p className="eliza-attention-summary text-slate-400 text-xs md:text-sm max-w-2xl leading-relaxed">
+              {deckSummary || 'Li os dados reais da sua clínica agora. Abaixo estão as oportunidades calculadas a partir de pacientes, agenda e financeiro — sem números inventados.'}
             </p>
           </div>
 
-          <div className="bg-slate-900/80 border border-next-border rounded-next-xl p-4 flex-shrink-0 flex flex-col space-y-1.5 md:min-w-[180px]">
+          <div className="bg-slate-900/80 border border-next-border rounded-next-xl p-4 flex-shrink-0 flex flex-col space-y-1.5 md:min-w-[180px] lg:min-w-0 lg:w-full">
             <span className="text-[10px] font-mono text-slate-500">VARREDURA REAL</span>
             <div className="flex items-center gap-2 text-next-green-success font-semibold text-xs">
               <span className="w-2 h-2 rounded-full bg-next-green-success animate-pulse" />
               <span>Dados Clínicos Lidos</span>
             </div>
             <p className="text-[11px] text-slate-400 font-mono whitespace-pre-line">
-              {loadingStats ? 'Mapeando...' : `• ${patientsCount} pacientes\n• ${appointments.length} agendamentos lidos`}
+              {loadingStats ? 'Mapeando...' : `• ${patientsCount} pacientes\n• ${appointmentsCount} agendamentos lidos`}
             </p>
           </div>
         </div>
       </div>
 
-      {/* 2. OPPORTUNITY DECK */}
+      {/* 1.5 TEMPORAL — deterministic 30d vs previous-30d comparison + detected changes */}
+      <TemporalOverviewPanel />
+
+      {/* 2. OPPORTUNITY DECK — real insights from the Insight Engine */}
       <div className="space-y-4">
         <div className="flex items-center justify-between">
           <div className="space-y-1">
             <h2 className="text-md font-bold text-slate-200 flex items-center gap-2">
               <Brain className="w-4 h-4 text-next-purple-neon" />
-              <span>Opportunity Deck (Mapeamento Real)</span>
+              <span>Insight em Foco</span>
             </h2>
-            <p className="text-[11px] text-slate-500">Calculado a partir dos dados reais desta clínica.</p>
+            <p className="text-[11px] text-slate-500">Calculado a partir dos dados reais desta clínica pelo Insight Engine.</p>
           </div>
-          <span className="text-[10px] font-mono text-slate-500 bg-slate-900 px-2 py-0.5 rounded border border-next-border">4 INSIGHTS</span>
+          <div className="flex items-center gap-2">
+            {deckInsights.length > 0 && (
+              <span className="text-[10px] font-mono text-slate-500 bg-slate-900 px-2 py-0.5 rounded border border-next-border">{deckIndex + 1}/{deckInsights.length}</span>
+            )}
+            <button onClick={loadDeck} disabled={loadingDeck} title="Atualizar" className="p-1.5 rounded-lg border border-next-border text-slate-400 hover:text-slate-200 hover:border-next-border-glow disabled:opacity-50">
+              <RefreshCw className={`w-3.5 h-3.5 ${loadingDeck ? 'animate-spin' : ''}`} />
+            </button>
+          </div>
         </div>
 
-        {loadingStats ? (
+        {loadingDeck ? (
           <div className="text-center py-10 font-mono text-xs text-slate-500"><RefreshCw className="w-5 h-5 animate-spin mx-auto mb-2" />Calculando insights reais...</div>
+        ) : deckError ? (
+          <div className="text-center py-10 text-xs text-next-red-alert">{deckError}</div>
+        ) : deckInsights.length === 0 ? (
+          <div className="text-center py-10 text-xs text-slate-500">Nenhum ponto de atenção real encontrado agora — tudo em dia.</div>
         ) : (
-          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-            {cards.map(card => {
-              const Icon = card.icon;
-              const colorClasses = card.color === 'purple'
-                ? { bg: 'bg-next-purple-neon/10', text: 'text-next-purple-neon', footer: 'text-next-purple-light' }
-                : card.color === 'blue'
-                ? { bg: 'bg-next-ia-blue/10', text: 'text-next-ia-blue', footer: 'text-next-ia-blue' }
-                : { bg: 'bg-next-orange-insight/10', text: 'text-next-orange-insight', footer: 'text-next-orange-insight' };
-              return (
-                <motion.button
-                  key={card.key}
-                  whileHover={{ y: -3 }}
-                  onClick={() => sendToEliza(card.prompt)}
-                  className="text-left cursor-pointer rounded-next-xl border p-5 flex flex-col justify-between h-[180px] transition-all duration-300 relative overflow-hidden bg-next-bg-card/90 border-next-border hover:border-next-border-glow"
-                >
-                  <div className="flex justify-between items-start">
-                    <span className={`p-2 rounded-lg ${colorClasses.bg} ${colorClasses.text}`}>
-                      <Icon className="w-4 h-4" />
-                    </span>
-                    <span className="text-[9px] font-mono text-slate-500">{card.label}</span>
-                  </div>
-                  <div className="space-y-1">
-                    <h3 className="text-xs font-bold text-slate-200">{card.title}</h3>
-                    <p className="text-[11px] text-slate-400 leading-snug">{card.description}</p>
-                  </div>
-                  <div className={`flex justify-between items-center text-[10px] font-mono font-bold ${colorClasses.footer}`}>
-                    <span>{card.footer}</span>
-                    <ArrowRight className="w-3 h-3" />
-                  </div>
-                </motion.button>
-              );
-            })}
+          <div className="flex items-center gap-2 md:gap-3">
+            {deckInsights.length > 1 && (
+              <button onClick={goDeckPrev} title="Anterior" className="flex-shrink-0 p-2 rounded-full border border-next-border text-slate-400 hover:text-slate-100 hover:border-next-border-glow hover:bg-slate-800/60 transition-all">
+                <ChevronLeft className="w-4 h-4" />
+              </button>
+            )}
+
+            <div key={deckInsights[deckIndex].id} className="flex-1 min-w-0 flex flex-col gap-2 animate-[eliza-deck-in_.3s_ease]">
+              <InsightCard insight={deckInsights[deckIndex]} />
+              <button
+                onClick={() => sendToEliza(`Me explique mais sobre: ${deckInsights[deckIndex].title}`)}
+                className="eliza-insight-cta eliza-insight-cta-standalone self-end text-[10px] font-bold uppercase tracking-wide text-next-purple-light hover:text-next-purple-mid px-2.5 py-1 rounded-md"
+              >
+                Perguntar à Eliza →
+              </button>
+            </div>
+
+            {deckInsights.length > 1 && (
+              <button onClick={goDeckNext} title="Próximo" className="flex-shrink-0 p-2 rounded-full border border-next-border text-slate-400 hover:text-slate-100 hover:border-next-border-glow hover:bg-slate-800/60 transition-all">
+                <ChevronRight className="w-4 h-4" />
+              </button>
+            )}
+          </div>
+        )}
+
+        {deckInsights.length > 1 && (
+          <div className="flex items-center justify-center gap-1.5">
+            {deckInsights.map((insight, i) => (
+              <button
+                key={insight.id}
+                onClick={() => setDeckIndex(i)}
+                title={insight.title}
+                className={`h-1.5 rounded-full transition-all ${i === deckIndex ? 'w-5 bg-next-purple-neon' : 'w-1.5 bg-slate-700 hover:bg-slate-600'}`}
+              />
+            ))}
           </div>
         )}
       </div>
@@ -365,20 +323,15 @@ Responda ESTRITAMENTE em JSON válido, sem markdown, exatamente neste formato:
               {msg.sender === 'ai' && (
                 <div className="w-7 h-7 rounded-full bg-next-purple-neon/10 border border-next-purple-neon/20 flex items-center justify-center flex-shrink-0 text-next-purple-light text-xs font-bold">E</div>
               )}
-              <div className={`p-3.5 rounded-next-xl text-xs leading-relaxed ${
+              <div className={`p-3.5 rounded-next-xl text-xs leading-relaxed max-w-full ${
                 msg.sender === 'user'
                   ? 'bg-next-purple-neon text-white rounded-tr-none shadow-next-glow-purple'
                   : 'bg-slate-900/80 text-slate-300 rounded-tl-none border border-next-border'
               }`}>
                 <p>{msg.text}</p>
-                {((msg.highlights && msg.highlights.length > 0) || (msg.recommendedActions && msg.recommendedActions.length > 0)) && (
+                {msg.insights && msg.insights.length > 0 && (
                   <div className="mt-2.5 pt-2.5 border-t border-next-border/60 space-y-1.5">
-                    {msg.highlights?.map((h, i) => (
-                      <p key={`h-${i}`} className="text-[10.5px] text-next-orange-insight flex items-start gap-1"><AlertTriangle className="w-3 h-3 flex-shrink-0 mt-0.5" />{h}</p>
-                    ))}
-                    {msg.recommendedActions?.map((a, i) => (
-                      <p key={`a-${i}`} className="text-[10.5px] text-next-green-success flex items-start gap-1"><CheckCircle2 className="w-3 h-3 flex-shrink-0 mt-0.5" />{a}</p>
-                    ))}
+                    {msg.insights.map((ins) => <InsightCard key={ins.id} insight={ins} />)}
                   </div>
                 )}
               </div>
@@ -432,6 +385,51 @@ Responda ESTRITAMENTE em JSON válido, sem markdown, exatamente neste formato:
         </div>
       </div>
 
+    </div>
+
+    {/* OPORTUNIDADES DETECTADAS — right column on large screens, stacked
+        below the main content on smaller ones (same real insights as
+        "Insight em Foco" above, just all shown at once in a compact list
+        instead of one at a time). */}
+    <aside className="mt-10 xl:mt-0 space-y-4">
+      <div className="flex items-start gap-2">
+        <Sparkles className="w-4 h-4 text-next-purple-neon flex-shrink-0 mt-0.5" />
+        <div>
+          <h2 className="text-sm font-bold text-slate-100">Oportunidades detectadas</h2>
+          <p className="text-[11px] text-slate-500 mt-0.5">Insights gerados pela ELIZA para impulsionar sua clínica.</p>
+        </div>
+      </div>
+
+      {!loadingDeck && !deckError && deckInsights.length > 0 && (
+        <div className="space-y-3">
+          {deckInsights.map((insight, i) => {
+            const Icon = OPPORTUNITY_ICONS[i % OPPORTUNITY_ICONS.length];
+            const tone = OPPORTUNITY_TONES[i % OPPORTUNITY_TONES.length];
+            return (
+              <div key={insight.id} data-tone={tone} className="eliza-opportunity-card next-glass-panel rounded-2xl p-4">
+                <div className="flex items-start gap-3">
+                  <div className="eliza-opportunity-icon w-9 h-9 rounded-xl flex items-center justify-center flex-shrink-0 bg-next-purple-neon/10 text-next-purple-light">
+                    <Icon className="w-4 h-4" />
+                  </div>
+                  <div className="min-w-0 flex-1">
+                    <p className="eliza-opportunity-title text-xs font-bold leading-snug text-slate-100">{insight.title}</p>
+                    <p className="eliza-opportunity-desc text-[11px] leading-snug mt-1 text-slate-400">{insight.description}</p>
+                    <button
+                      onClick={() => { setDeckIndex(i); sendToEliza(`Me explique mais sobre: ${insight.title}`); }}
+                      className="eliza-opportunity-cta text-[10.5px] font-bold mt-2 inline-flex items-center gap-1 text-next-purple-light hover:text-next-purple-mid"
+                    >
+                      Ver detalhes →
+                    </button>
+                  </div>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </aside>
+
+    </div>
     </div>
   );
 }

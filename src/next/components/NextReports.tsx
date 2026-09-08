@@ -83,8 +83,8 @@ export default function NextReports() {
       setLoading(true);
       try {
         const [apptsSnap, finSnap, commSnap] = await Promise.all([
-          secureGetDocs(query(collection(db, 'clinics', clinic.id, 'appointments'), limit(500)), 'appointments', { addAuditLog }),
-          secureGetDocs(query(collection(db, 'clinics', clinic.id, 'financial_entries'), limit(500)), 'financial_entries', { addAuditLog }),
+          secureGetDocs(query(collection(db, 'clinics', clinic.id, 'appointments'), limit(2000)), 'appointments', { addAuditLog }),
+          secureGetDocs(query(collection(db, 'clinics', clinic.id, 'financial_entries'), limit(3000)), 'financial_entries', { addAuditLog }),
           secureGetDocs(query(collection(db, 'clinics', clinic.id, 'commission_records'), limit(500)), 'commission_records', { addAuditLog }),
         ]);
 

@@ -1,18 +1,35 @@
 import React, { useState } from 'react';
 import { useAdmin } from '../../contexts/AdminContext';
-import { CreditCard, TrendingUp, DollarSign, Calendar, ChevronRight, Award, Edit3, Settings, Plus, X, Loader2, Trash2 } from 'lucide-react';
+import { CreditCard, TrendingUp, DollarSign, Calendar, ChevronRight, Award, Edit3, Settings, Plus, X, Loader2, Trash2, Sparkles, ToggleLeft, ToggleRight } from 'lucide-react';
+import { PLAN_ROLE_LABELS, getPlanCapabilities, type PlanRole } from '../../lib/planCapabilities';
+
+const PLAN_ROLE_OPTIONS: PlanRole[] = ['assistant', 'secretary', 'manager', 'ceo'];
+
+function centsToInput(cents: number | null | undefined): string {
+  return cents != null ? String(cents / 100) : '';
+}
+function inputToCents(v: string): number {
+  return Math.round((Number(v) || 0) * 100);
+}
+function formatCents(cents: number | null | undefined): string {
+  return cents != null ? `R$ ${(cents / 100).toLocaleString('pt-BR', { minimumFractionDigits: 2 })}` : '—';
+}
 
 export default function PlatformFinance() {
-  const { clinics, plans, updateClinicPlan, createPlan, updatePlan, deactivatePlan, isLoading } = useAdmin();
+  const { clinics, plans, updateClinicPlan, createPlan, updatePlan, deactivatePlan, foundingPromo, updateFoundingPromo, isLoading } = useAdmin();
   const [selectedClinic, setSelectedClinic] = useState<any | null>(null);
   const [newPlan, setNewPlan] = useState('');
   const [isUpdating, setIsUpdating] = useState(false);
 
   const [isPlanModalOpen, setIsPlanModalOpen] = useState(false);
   const [editingPlanId, setEditingPlanId] = useState<string | null>(null);
-  const [planForm, setPlanForm] = useState({ name: '', price: '', description: '', maxUsers: '', active: true });
+  const [planForm, setPlanForm] = useState({ name: '', planRole: 'assistant' as PlanRole, regularPrice: '', founderPrice: '', description: '', maxUsers: '', salesEnabled: true, active: true });
   const [savingPlan, setSavingPlan] = useState(false);
   const [planError, setPlanError] = useState<string | null>(null);
+
+  const [promoForm, setPromoForm] = useState({ totalSlots: '' });
+  const [isPromoEditOpen, setIsPromoEditOpen] = useState(false);
+  const [savingPromo, setSavingPromo] = useState(false);
 
   const activePlans = plans.filter((p: any) => p.active !== false);
 
@@ -36,21 +53,26 @@ export default function PlatformFinance() {
 
   const openNewPlan = () => {
     setEditingPlanId(null);
-    setPlanForm({ name: '', price: '', description: '', maxUsers: '', active: true });
+    setPlanForm({ name: '', planRole: 'assistant', regularPrice: '', founderPrice: '', description: '', maxUsers: '', salesEnabled: true, active: true });
     setPlanError(null);
     setIsPlanModalOpen(true);
   };
   const openEditPlan = (plan: any) => {
     setEditingPlanId(plan.id);
     setPlanForm({
-      name: plan.name || '', price: plan.price != null ? String(plan.price) : '',
+      name: plan.name || '', planRole: (plan.planRole || 'assistant') as PlanRole,
+      regularPrice: centsToInput(plan.regularPriceCents), founderPrice: centsToInput(plan.founderPriceCents),
       description: plan.description || '', maxUsers: plan.maxUsers != null ? String(plan.maxUsers) : '',
-      active: plan.active !== false,
+      salesEnabled: plan.salesEnabled !== false, active: plan.active !== false,
     });
     setPlanError(null);
     setIsPlanModalOpen(true);
   };
 
+  // `capabilities` on the doc mirrors PLAN_CAPABILITIES[planRole] for
+  // auditability — the app's actual gating (ElizaNextLayout.tsx) reads the
+  // shared PLAN_CAPABILITIES constant by clinic.planRole, not this field, so
+  // there's no separate per-capability checkbox UI to keep in sync by hand.
   const handleSavePlan = async () => {
     if (!planForm.name.trim()) return;
     setSavingPlan(true);
@@ -58,9 +80,13 @@ export default function PlatformFinance() {
     try {
       const payload = {
         name: planForm.name.trim(),
-        price: Number(planForm.price) || 0,
+        planRole: planForm.planRole,
+        regularPriceCents: inputToCents(planForm.regularPrice),
+        founderPriceCents: inputToCents(planForm.founderPrice),
         description: planForm.description.trim() || undefined,
         maxUsers: planForm.maxUsers ? Number(planForm.maxUsers) : null,
+        capabilities: getPlanCapabilities(planForm.planRole),
+        salesEnabled: planForm.salesEnabled,
         active: planForm.active,
       };
       if (editingPlanId) {
@@ -79,6 +105,25 @@ export default function PlatformFinance() {
   const handleDeactivatePlan = async (planId: string) => {
     if (!confirm('Desativar este plano? Clínicas já vinculadas continuam vinculadas, mas ele some das opções para novas atribuições.')) return;
     await deactivatePlan(planId);
+  };
+
+  const handleToggleFoundingPromo = async () => {
+    await updateFoundingPromo({ active: !(foundingPromo?.active ?? false) });
+  };
+
+  const openPromoEdit = () => {
+    setPromoForm({ totalSlots: foundingPromo ? String(foundingPromo.totalSlots) : '150' });
+    setIsPromoEditOpen(true);
+  };
+
+  const handleSavePromo = async () => {
+    setSavingPromo(true);
+    try {
+      await updateFoundingPromo({ totalSlots: Number(promoForm.totalSlots) || 150 });
+      setIsPromoEditOpen(false);
+    } finally {
+      setSavingPromo(false);
+    }
   };
 
   return (
@@ -112,7 +157,14 @@ export default function PlatformFinance() {
                 <Award className="w-4 h-4 text-teal-600 shrink-0" />
               </div>
               <h3 className="text-xl font-black text-slate-900">{planCounts[plan.id] || 0}</h3>
-              <p className="text-[9px] text-slate-400 font-bold uppercase mt-1">unidades · R$ {(plan.price || 0).toLocaleString('pt-BR')}/mês</p>
+              <p className="text-[9px] text-slate-400 font-bold uppercase mt-1">unidades</p>
+              <div className="mt-2 space-y-0.5">
+                <p className="text-xs font-black text-slate-800">{formatCents(plan.regularPriceCents)}<span className="text-[9px] font-bold text-slate-400 normal-case">/mês normal</span></p>
+                <p className="text-xs font-black text-teal-600">{formatCents(plan.founderPriceCents)}<span className="text-[9px] font-bold text-slate-400 normal-case"> lançamento</span></p>
+              </div>
+              {plan.salesEnabled === false && (
+                <span className="inline-block mt-2 px-2 py-0.5 bg-amber-50 text-amber-700 text-[8px] font-black uppercase rounded-md border border-amber-100">Em breve — sem venda</span>
+              )}
               <div className="flex gap-2 mt-3">
                 <button onClick={() => openEditPlan(plan)} className="flex-1 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-600 text-[8.5px] font-black uppercase rounded-lg transition-colors">Editar</button>
                 <button onClick={() => handleDeactivatePlan(plan.id)} className="py-1.5 px-2 bg-rose-50 hover:bg-rose-100 text-rose-600 rounded-lg transition-colors"><Trash2 className="w-3 h-3" /></button>
@@ -121,6 +173,52 @@ export default function PlatformFinance() {
           ))}
         </div>
       )}
+
+      {/* Founding Clinics quota */}
+      <div className="bg-white rounded-[2.5rem] border border-slate-200 shadow-sm p-6 space-y-4">
+        <div className="flex items-center justify-between flex-wrap gap-3">
+          <div className="flex items-center gap-2">
+            <Sparkles className="w-4 h-4 text-teal-600" />
+            <h3 className="text-xs font-black text-slate-900 uppercase tracking-widest">Clínicas Fundadoras</h3>
+          </div>
+          <div className="flex items-center gap-3">
+            <button onClick={openPromoEdit} className="px-3 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-600 text-[9px] font-black uppercase tracking-widest rounded-lg transition-colors flex items-center gap-1.5">
+              <Edit3 className="w-3 h-3" /> Editar vagas
+            </button>
+            <button onClick={handleToggleFoundingPromo} className="flex items-center gap-1.5 text-[9px] font-black uppercase tracking-widest">
+              {foundingPromo?.active ? <ToggleRight className="w-7 h-7 text-teal-600" /> : <ToggleLeft className="w-7 h-7 text-slate-300" />}
+              <span className={foundingPromo?.active ? 'text-teal-700' : 'text-slate-400'}>{foundingPromo?.active ? 'Ativa' : 'Inativa'}</span>
+            </button>
+          </div>
+        </div>
+        {foundingPromo ? (
+          <div>
+            <div className="flex items-end justify-between mb-1.5">
+              <p className="text-2xl font-black text-slate-900">{foundingPromo.slotsClaimed} <span className="text-sm font-bold text-slate-400">/ {foundingPromo.totalSlots} vagas usadas</span></p>
+              <p className="text-[10px] font-black text-slate-400 uppercase">{Math.max(0, foundingPromo.totalSlots - foundingPromo.slotsClaimed)} restantes</p>
+            </div>
+            <div className="w-full h-2.5 bg-slate-100 rounded-full overflow-hidden">
+              <div className="h-full bg-teal-600 rounded-full transition-all" style={{ width: `${Math.min(100, (foundingPromo.slotsClaimed / Math.max(1, foundingPromo.totalSlots)) * 100)}%` }} />
+            </div>
+            <p className="text-[9px] text-slate-400 font-medium mt-2">O valor de lançamento é preservado por 12 meses para quem se cadastrar enquanto houver vaga. `slotsClaimed` é controlado só pela transação do checkout — não é editável aqui.</p>
+          </div>
+        ) : (
+          <p className="text-xs text-slate-400">Cota ainda não configurada.</p>
+        )}
+
+        {isPromoEditOpen && (
+          <div className="flex items-end gap-3 pt-2 border-t border-slate-100">
+            <div className="space-y-1">
+              <label className="text-[8px] font-black uppercase tracking-widest text-slate-400">Total de vagas</label>
+              <input type="number" value={promoForm.totalSlots} onChange={(e) => setPromoForm({ totalSlots: e.target.value })} className="w-28 bg-slate-50 border border-slate-200 rounded-xl px-3 py-2 text-xs font-semibold text-slate-700 outline-none focus:border-teal-500" />
+            </div>
+            <button onClick={handleSavePromo} disabled={savingPromo} className="px-4 py-2 bg-teal-600 hover:bg-teal-700 text-white rounded-xl text-[9px] font-black uppercase tracking-widest disabled:opacity-50">
+              {savingPromo ? 'Salvando...' : 'Salvar'}
+            </button>
+            <button onClick={() => setIsPromoEditOpen(false)} className="px-4 py-2 bg-slate-100 text-slate-500 rounded-xl text-[9px] font-black uppercase tracking-widest">Cancelar</button>
+          </div>
+        )}
+      </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
         {/* Clinics Plan management list */}
@@ -245,20 +343,35 @@ export default function PlatformFinance() {
               <label className="text-[8px] font-black uppercase tracking-widest text-slate-400">Nome do plano *</label>
               <input autoFocus value={planForm.name} onChange={(e) => setPlanForm(v => ({ ...v, name: e.target.value }))} className="w-full bg-slate-50 border border-slate-200 rounded-xl px-4 py-3 text-xs font-semibold text-slate-700 outline-none focus:border-teal-500 transition-all" />
             </div>
+            <div className="space-y-1">
+              <label className="text-[8px] font-black uppercase tracking-widest text-slate-400">Modalidade</label>
+              <select value={planForm.planRole} onChange={(e) => setPlanForm(v => ({ ...v, planRole: e.target.value as PlanRole }))} className="w-full bg-slate-50 border border-slate-200 rounded-xl px-4 py-3 text-xs font-semibold text-slate-700 outline-none focus:border-teal-500 transition-all">
+                {PLAN_ROLE_OPTIONS.map(role => <option key={role} value={role}>{PLAN_ROLE_LABELS[role]}</option>)}
+              </select>
+              <p className="text-[8.5px] text-slate-400">Define automaticamente quais recursos ficam liberados — cumulativo (cada modalidade inclui as anteriores).</p>
+            </div>
             <div className="grid grid-cols-2 gap-3">
               <div className="space-y-1">
-                <label className="text-[8px] font-black uppercase tracking-widest text-slate-400">Preço mensal (R$)</label>
-                <input type="number" value={planForm.price} onChange={(e) => setPlanForm(v => ({ ...v, price: e.target.value }))} className="w-full bg-slate-50 border border-slate-200 rounded-xl px-4 py-3 text-xs font-semibold text-slate-700 outline-none focus:border-teal-500 transition-all" />
+                <label className="text-[8px] font-black uppercase tracking-widest text-slate-400">Preço normal (R$/mês)</label>
+                <input type="number" value={planForm.regularPrice} onChange={(e) => setPlanForm(v => ({ ...v, regularPrice: e.target.value }))} className="w-full bg-slate-50 border border-slate-200 rounded-xl px-4 py-3 text-xs font-semibold text-slate-700 outline-none focus:border-teal-500 transition-all" />
               </div>
               <div className="space-y-1">
-                <label className="text-[8px] font-black uppercase tracking-widest text-slate-400">Limite de usuários</label>
-                <input type="number" value={planForm.maxUsers} onChange={(e) => setPlanForm(v => ({ ...v, maxUsers: e.target.value }))} placeholder="sem limite" className="w-full bg-slate-50 border border-slate-200 rounded-xl px-4 py-3 text-xs font-semibold text-slate-700 outline-none focus:border-teal-500 transition-all" />
+                <label className="text-[8px] font-black uppercase tracking-widest text-slate-400">Preço de lançamento (R$/mês)</label>
+                <input type="number" value={planForm.founderPrice} onChange={(e) => setPlanForm(v => ({ ...v, founderPrice: e.target.value }))} placeholder="150 fundadoras, 12 meses" className="w-full bg-slate-50 border border-slate-200 rounded-xl px-4 py-3 text-xs font-semibold text-slate-700 outline-none focus:border-teal-500 transition-all" />
               </div>
             </div>
             <div className="space-y-1">
-              <label className="text-[8px] font-black uppercase tracking-widest text-slate-400">Descrição</label>
+              <label className="text-[8px] font-black uppercase tracking-widest text-slate-400">Limite de usuários</label>
+              <input type="number" value={planForm.maxUsers} onChange={(e) => setPlanForm(v => ({ ...v, maxUsers: e.target.value }))} placeholder="sem limite" className="w-full bg-slate-50 border border-slate-200 rounded-xl px-4 py-3 text-xs font-semibold text-slate-700 outline-none focus:border-teal-500 transition-all" />
+            </div>
+            <div className="space-y-1">
+              <label className="text-[8px] font-black uppercase tracking-widest text-slate-400">Descrição / promessa principal</label>
               <textarea value={planForm.description} onChange={(e) => setPlanForm(v => ({ ...v, description: e.target.value }))} className="w-full bg-slate-50 border border-slate-200 rounded-xl px-4 py-3 text-xs font-semibold text-slate-700 outline-none focus:border-teal-500 transition-all h-16 resize-none" />
             </div>
+            <label className="flex items-center gap-2 cursor-pointer">
+              <input type="checkbox" checked={planForm.salesEnabled} onChange={(e) => setPlanForm(v => ({ ...v, salesEnabled: e.target.checked }))} className="w-4 h-4 accent-teal-600" />
+              <span className="text-[10px] font-bold text-slate-600 uppercase">Disponível pra venda no checkout</span>
+            </label>
             <label className="flex items-center gap-2 cursor-pointer">
               <input type="checkbox" checked={planForm.active} onChange={(e) => setPlanForm(v => ({ ...v, active: e.target.checked }))} className="w-4 h-4 accent-teal-600" />
               <span className="text-[10px] font-bold text-slate-600 uppercase">Plano ativo (disponível pra atribuir)</span>

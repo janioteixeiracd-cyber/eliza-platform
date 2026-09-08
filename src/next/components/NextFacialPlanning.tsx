@@ -6,6 +6,7 @@ import {
 } from 'lucide-react';
 import { useAuth } from '../../contexts/AuthContext';
 import { useNextReadOnly } from '../context/NextReadOnlyContext';
+import { useSetElizaScreenContext } from '../context/ElizaAssistantContext';
 import { secureGetDoc, secureGetDocs } from '../services/next-db';
 import { collection, query, limit, addDoc, setDoc, doc as fsDoc, serverTimestamp } from 'firebase/firestore';
 import { db } from '../../lib/firebase';
@@ -123,7 +124,7 @@ export default function NextFacialPlanning() {
       setLoadingPatients(true);
       try {
         const patRef = collection(db, 'clinics', clinic.id, 'patients');
-        const patSnap = await secureGetDocs(query(patRef, limit(300)), 'patients', { addAuditLog });
+        const patSnap = await secureGetDocs(query(patRef, limit(8000)), 'patients', { addAuditLog });
         setPatients(patSnap.docs.map(d => ({ id: d.id, ...(d.data() as any) })));
       } catch (err) {
         console.error('Failed to load patients:', err);
@@ -136,6 +137,15 @@ export default function NextFacialPlanning() {
   }, [clinic?.id]);
 
   const selectedPatient = patients.find(p => p.id === selectedPatientId) || null;
+
+  useSetElizaScreenContext(
+    'Planejamento Facial IA',
+    !selectedPatient ? '' : [
+      `Caso aberto: ${selectedPatient.name}.`,
+      plan ? `Já existe um plano gerado: queixa principal "${plan.queixaPrincipal}".` : 'Nenhum plano gerado ainda para este paciente.',
+    ].filter(Boolean).join('\n'),
+    selectedPatient?.id || null
+  );
 
   useEffect(() => {
     async function loadRecord() {

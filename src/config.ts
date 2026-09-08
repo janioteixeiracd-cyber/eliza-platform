@@ -4,7 +4,7 @@
 export const ENABLE_PLATFORM_ADMIN = true;
 
 export const APP_CONFIG = {
-  name: 'ELIZA Dental Platform',
+  name: 'ELIZA',
   version: '0.9.0-stable',
   debugLogs: true
 };

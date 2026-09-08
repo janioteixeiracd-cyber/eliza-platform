@@ -135,7 +135,9 @@ export function PatientAnalysisExample({
           <div className="border border-green-200 bg-green-50 rounded p-4">
             <h3 className="font-bold text-green-800 mb-2">Análise</h3>
             <div className="prose prose-sm max-w-none text-gray-800">
-              {eliza.analysisState.data.data.analysisResult.content}
+              {typeof eliza.analysisState.data.data.analysisResult.content === "string"
+                ? eliza.analysisState.data.data.analysisResult.content
+                : JSON.stringify(eliza.analysisState.data.data.analysisResult.content)}
             </div>
           </div>
 
